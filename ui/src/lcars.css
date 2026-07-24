@@ -1,0 +1,1611 @@
+/* LCARS styling — USS Titan-A (Picard S3). A cool, refined take on LCARS: a deep
+   blue-black bridge, azure primary panels with a soft teal glow, muted gold and
+   soft periwinkle accents, red reserved for alerts. Lots of negative space, thin
+   hairlines, pill-shaped controls. Variable names are generic so the component
+   styles stay palette-agnostic. */
+
+:root {
+  --bg: #050811; /* deep cool near-black */
+  --surface: #0e1826; /* raised panels & cards */
+  --surface-2: #0a1220; /* inset: inputs, code, wells */
+  --line: #1d2c40; /* hairline borders */
+  --line-strong: #2b3f59;
+
+  --panel: #4d86c6; /* Titan azure — primary panels / elbow / pills */
+  --amber: #d9a94e; /* muted gold */
+  --lilac: #9585cf; /* soft periwinkle — identity / title */
+  --blue: #57b7e0; /* bright teal-azure — accent, online, links */
+  --ink: #05080f; /* near-black text on bright panels */
+  --text: #d8e6f5; /* cool pale */
+  --dim: #7d90ab; /* secondary text */
+  --slate: #35485f; /* muted structural */
+
+  --sev-info: #57b7e0;
+  --sev-notice: #d9a94e;
+  --sev-warning: #e08a46;
+  --sev-critical: #e05a52;
+  --ok: #56c98d;
+
+  --radius: 16px;
+  --pill: 999px;
+  --gap: 10px;
+  --glow: 0 0 0 1px rgba(87, 183, 224, 0.15), 0 6px 20px rgba(0, 0, 0, 0.45);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  background: radial-gradient(1200px 800px at 70% -10%, #0b1524 0%, var(--bg) 60%);
+  color: var(--text);
+  font-family: system-ui, "Helvetica Neue", Arial, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Shared "LCARS chrome" typographic treatment: uppercase, tracked. */
+.title,
+.pill,
+.nav-pill,
+.count-label,
+.rail-sep,
+.panel h3,
+.card-head,
+.src,
+.state,
+.live-badge,
+.hint-head,
+.edge-kind,
+button {
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+}
+
+.lcars {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  padding: 12px;
+  gap: var(--gap);
+}
+
+/* ---- top bar ---- */
+.lcars-top {
+  display: flex;
+  align-items: stretch;
+  gap: var(--gap);
+  height: 56px;
+}
+
+.elbow {
+  width: 130px;
+  background: var(--panel);
+  border-radius: var(--radius) var(--radius) 4px 46px;
+}
+
+.title {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  padding: 0 26px;
+  background: var(--lilac);
+  color: var(--ink);
+  border-radius: var(--radius);
+  font-size: 24px;
+  font-weight: 700;
+}
+
+.bar {
+  flex: 1;
+  background: linear-gradient(90deg, var(--slate), var(--panel));
+  border-radius: var(--radius);
+  opacity: 0.5;
+}
+
+.status {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  padding: 0 22px;
+  background: var(--surface);
+  border: 1px solid var(--line-strong);
+  color: var(--dim);
+  border-radius: var(--pill);
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+}
+.status.online {
+  color: var(--ink);
+  background: var(--blue);
+  border-color: var(--blue);
+  box-shadow: 0 0 16px rgba(87, 183, 224, 0.4);
+}
+
+/* ---- body ---- */
+.lcars-body {
+  flex: 1;
+  display: flex;
+  gap: var(--gap);
+  min-height: 0;
+}
+
+.rail {
+  width: 168px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.pill {
+  background: var(--panel);
+  color: var(--ink);
+  border-radius: var(--pill);
+  padding: 12px 18px;
+  font-weight: 700;
+  font-size: 13px;
+}
+
+/* ---- navigation rail ---- */
+.nav-pill {
+  border: 1px solid transparent;
+  text-align: left;
+  cursor: pointer;
+  font-family: inherit;
+  background: var(--surface);
+  color: var(--text);
+  transition: background 0.15s, color 0.15s, box-shadow 0.15s;
+}
+.nav-pill:hover {
+  background: var(--surface-2);
+  border-color: var(--line-strong);
+}
+.nav-pill.active {
+  background: var(--panel);
+  color: var(--ink);
+  box-shadow: 0 0 18px rgba(77, 134, 198, 0.35);
+}
+
+.rail-sep {
+  color: var(--dim);
+  font-size: 10px;
+  padding: 12px 6px 2px;
+  letter-spacing: 0.18em;
+}
+/* Thin divider between nav groups (interactive views vs. reference views). */
+.rail-divider {
+  height: 1px;
+  margin: 8px 10px;
+  background: var(--line-strong);
+}
+.source-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 6px;
+  border-radius: var(--pill);
+  cursor: pointer;
+  border: 1px solid transparent;
+  transition: background 0.15s, border-color 0.15s;
+}
+.source-row:hover {
+  background: var(--surface);
+}
+/* Active board filter: this source is the one the board is filtered to. */
+.source-row.active {
+  background: var(--surface);
+  border-color: var(--line-strong);
+}
+.source-row .src {
+  font-size: 10px;
+}
+.dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: var(--slate);
+  flex: 0 0 auto;
+}
+.dot.on {
+  background: var(--ok);
+  box-shadow: 0 0 8px rgba(86, 201, 141, 0.6);
+}
+.dot.off {
+  background: var(--sev-critical);
+  box-shadow: 0 0 8px rgba(224, 90, 82, 0.6);
+}
+.dot.idle {
+  background: var(--slate);
+}
+
+.rail-spacer {
+  flex: 1;
+}
+.count {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-bottom: none;
+  color: var(--blue);
+  border-radius: var(--radius) var(--radius) 0 0;
+  padding: 10px 18px 2px;
+  font-size: 38px;
+  font-weight: 700;
+  text-align: right;
+  line-height: 1;
+}
+.count-label {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-top: none;
+  color: var(--dim);
+  border-radius: 0 0 var(--radius) 40px;
+  padding: 0 18px 4px;
+  font-size: 11px;
+  text-align: right;
+}
+.subcount {
+  color: var(--dim);
+  font-size: 11px;
+  text-align: right;
+  padding: 8px 4px 0;
+}
+
+/* ---- main region ---- */
+.main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.board,
+.page,
+.detail {
+  flex: 1;
+  /* Let this shrink to its flex slot so overflow-y actually scrolls — a flex
+     item defaults to min-height:auto and would otherwise grow past .main. */
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: var(--gap);
+  padding-right: 6px;
+}
+
+.empty {
+  color: var(--dim);
+  font-size: 18px;
+  padding: 60px;
+  text-align: center;
+  letter-spacing: 0.1em;
+}
+
+.board-toolbar {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+}
+.board-toolbar button.on {
+  background: var(--blue);
+  color: var(--ink);
+  border-color: var(--blue);
+}
+/* RESET BOARD sits apart on the left, styled as a guarded/destructive action. */
+.board-toolbar button.reset {
+  margin-right: auto;
+}
+.board-toolbar button.danger {
+  color: var(--sev-critical);
+  border-color: var(--sev-critical);
+}
+.board-toolbar button.danger:hover:not(:disabled) {
+  background: var(--sev-critical);
+  color: var(--ink);
+}
+.board-toolbar button.danger:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+.board-section {
+  color: var(--dim);
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.18em;
+  padding: 4px 2px;
+  border-top: 1px solid var(--line);
+  margin-top: 6px;
+}
+
+.muted {
+  color: var(--dim);
+  font-size: 12px;
+  line-height: 1.5;
+}
+.linkish {
+  background: none;
+  border: none;
+  color: var(--blue);
+  cursor: pointer;
+  font-family: inherit;
+  padding: 0;
+  text-decoration: none;
+  border-bottom: 1px dotted var(--blue);
+}
+
+/* ---- cards (board) ---- */
+.card {
+  /* Keep natural height: without this, cards are flex items in the scrolling
+     column and shrink to cram every thread into view instead of overflowing. */
+  flex: 0 0 auto;
+  display: flex;
+  background: var(--surface);
+  border-radius: var(--radius);
+  overflow: hidden;
+  border: 1px solid var(--line);
+  cursor: pointer;
+  transition: border-color 0.15s, transform 0.1s, box-shadow 0.15s;
+}
+.card:hover {
+  border-color: var(--line-strong);
+  transform: translateY(-1px);
+  box-shadow: var(--glow);
+}
+.card.dim {
+  opacity: 0.5;
+}
+/* Acknowledged: clearly triaged (desaturated + faded) but still on the board. */
+.card.acked {
+  opacity: 0.68;
+  filter: saturate(0.6);
+}
+.card.live {
+  border-color: var(--lilac);
+  box-shadow: 0 0 0 1px rgba(149, 133, 207, 0.35);
+}
+
+.card-bar {
+  width: 5px;
+  background: var(--sev-notice);
+  flex: 0 0 auto;
+}
+.card.sev-info .card-bar {
+  background: var(--sev-info);
+}
+.card.sev-notice .card-bar {
+  background: var(--sev-notice);
+}
+.card.sev-warning .card-bar {
+  background: var(--sev-warning);
+}
+.card.sev-critical .card-bar {
+  background: var(--sev-critical);
+}
+
+.card-main {
+  flex: 1;
+  padding: 12px 16px;
+  min-width: 0;
+}
+
+.card-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 11px;
+  color: var(--dim);
+}
+.kind {
+  color: var(--dim);
+}
+.src {
+  color: var(--ink);
+  background: var(--amber);
+  border-radius: var(--pill);
+  padding: 2px 9px;
+  font-weight: 700;
+  font-size: 10px;
+}
+.src-github {
+  background: var(--blue);
+}
+.src-slack {
+  background: var(--lilac);
+}
+.src-granola {
+  background: var(--amber);
+}
+.card-head time {
+  margin-left: auto;
+  letter-spacing: 0.04em;
+}
+
+.card-title {
+  margin-top: 8px;
+  font-size: 16px;
+  color: var(--text);
+  line-height: 1.35;
+}
+.card-title a {
+  color: var(--blue);
+  text-decoration: none;
+}
+.card-title a:hover {
+  text-decoration: underline;
+}
+
+.card-body {
+  margin-top: 4px;
+  font-size: 13px;
+  color: var(--dim);
+}
+
+.card-actions {
+  margin-top: 12px;
+  display: flex;
+  gap: 8px;
+}
+
+/* ---- chips / state / badges ---- */
+.chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 12px;
+}
+.chip {
+  background: var(--surface-2);
+  color: var(--blue);
+  border: 1px solid var(--line);
+  border-radius: var(--pill);
+  padding: 2px 10px;
+  font-size: 11px;
+}
+/* Routing tags — gold to set them apart from entity chips. */
+.chip.tag {
+  color: var(--amber);
+  border-color: var(--amber);
+}
+.chip.tag::before {
+  content: "#";
+  opacity: 0.6;
+}
+.tags {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  margin-top: 14px;
+}
+/* Vertical rhythm between the summary panel's action groups (detail view only,
+   so the chat input's own tight .row/.model-bar spacing is untouched). */
+.detail .model-bar {
+  margin-top: 14px;
+}
+.detail .row,
+.detail .thread-actions {
+  margin-top: 10px;
+}
+.thread-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.live-badge {
+  background: var(--lilac);
+  color: var(--ink);
+  border-radius: var(--pill);
+  padding: 1px 8px;
+  font-weight: 700;
+  font-size: 10px;
+}
+.state {
+  border-radius: var(--pill);
+  padding: 1px 9px;
+  font-size: 10px;
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  color: var(--dim);
+}
+.state-unseen {
+  background: transparent;
+  border-color: var(--sev-warning);
+  color: var(--sev-warning);
+}
+.state-resolved {
+  color: var(--dim);
+}
+
+/* ---- topics (board): a thread as a section with its events listed below ---- */
+.topic {
+  /* Natural height so sections overflow the scroll column instead of squashing. */
+  flex: 0 0 auto;
+  display: flex;
+  background: var(--surface);
+  border-radius: var(--radius);
+  overflow: hidden;
+  border: 1px solid var(--line);
+  transition: border-color 0.15s, box-shadow 0.15s;
+}
+.topic:hover {
+  border-color: var(--line-strong);
+}
+.topic.dim {
+  opacity: 0.5;
+}
+.topic.acked {
+  opacity: 0.72;
+  filter: saturate(0.6);
+}
+.topic.live {
+  border-color: var(--lilac);
+  box-shadow: 0 0 0 1px rgba(149, 133, 207, 0.35);
+}
+
+.topic-bar {
+  width: 5px;
+  flex: 0 0 auto;
+  background: var(--sev-notice);
+}
+.topic.sev-info .topic-bar {
+  background: var(--sev-info);
+}
+.topic.sev-notice .topic-bar {
+  background: var(--sev-notice);
+}
+.topic.sev-warning .topic-bar {
+  background: var(--sev-warning);
+}
+.topic.sev-critical .topic-bar {
+  background: var(--sev-critical);
+}
+
+.topic-main {
+  flex: 1;
+  min-width: 0;
+  padding: 12px 16px;
+}
+.topic-head {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  cursor: pointer;
+}
+.topic-titleline {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  flex: 1;
+}
+.topic-title {
+  font-size: 15px;
+  color: var(--text);
+  line-height: 1.3;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.topic-head:hover .topic-title {
+  color: var(--blue);
+}
+.topic-meta {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex: 0 0 auto;
+  font-size: 11px;
+  color: var(--dim);
+}
+.topic-summary {
+  margin-top: 8px;
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--blue);
+  border-radius: 8px;
+  padding: 8px 12px;
+}
+.topic-summary-label {
+  display: block;
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  color: var(--blue);
+  margin-bottom: 4px;
+}
+
+/* event rows — a meta line above the message in full */
+.events {
+  margin-top: 12px;
+  border-top: 1px solid var(--line);
+}
+.event {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 8px 2px;
+  border-bottom: 1px solid var(--line);
+  cursor: pointer;
+}
+.event:last-child {
+  border-bottom: none;
+}
+.event:hover {
+  background: var(--surface-2);
+}
+.event.acked {
+  opacity: 0.6;
+}
+.event-meta {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 11px;
+  color: var(--dim);
+}
+.event .dot {
+  background: var(--dim);
+  flex: 0 0 auto;
+}
+.event.sev-info .dot {
+  background: var(--sev-info);
+}
+.event.sev-notice .dot {
+  background: var(--sev-notice);
+}
+.event.sev-warning .dot {
+  background: var(--sev-warning);
+}
+.event.sev-critical .dot {
+  background: var(--sev-critical);
+}
+.event-meta .src {
+  flex: 0 0 auto;
+}
+.event-actor {
+  color: var(--dim);
+}
+/* Push the timestamp and everything after it to the right. */
+.event-meta time {
+  margin-left: auto;
+  letter-spacing: 0.04em;
+}
+.event-open {
+  color: var(--blue);
+  text-decoration: none;
+}
+.event-open:hover {
+  text-decoration: underline;
+}
+.event-line {
+  /* One-line title preview; the full body opens in a pop-out on click. */
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding-left: 19px; /* align under the text, past the severity dot */
+}
+.event-title {
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.event-details {
+  flex: 0 0 auto;
+  margin-left: auto;
+  color: var(--blue);
+  font-size: 11px;
+}
+.topic-actions {
+  margin-top: 12px;
+  display: flex;
+  gap: 8px;
+}
+
+/* ---- panels / detail ---- */
+.panel {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 16px 18px;
+}
+.panel h3 {
+  margin: 0 0 12px;
+  color: var(--blue);
+  font-size: 13px;
+}
+.detail-head {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+}
+.detail-head h2 {
+  margin: 0;
+  font-size: 20px;
+  color: var(--text);
+  font-weight: 700;
+}
+.detail-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: var(--gap);
+}
+.detail-grid .panel:first-child {
+  grid-column: 1 / -1;
+}
+.timeline-panel,
+.mitigations-panel {
+  grid-column: 1 / -1;
+}
+.summary {
+  color: var(--text);
+  line-height: 1.6;
+}
+.summary p {
+  margin: 0 0 10px;
+}
+.summary p:last-child {
+  margin-bottom: 0;
+}
+.citation {
+  margin-left: 3px;
+  color: var(--dim);
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  line-height: 1;
+  text-transform: uppercase;
+  vertical-align: super;
+}
+.sev-text-critical {
+  color: var(--sev-critical);
+}
+.sev-text-warning {
+  color: var(--sev-warning);
+}
+.sev-text-notice {
+  color: var(--sev-notice);
+}
+.sev-text-info {
+  color: var(--sev-info);
+}
+
+/* timeline */
+.timeline {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.timeline li {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  font-size: 12px;
+  border-left: 2px solid var(--line-strong);
+  padding: 8px 0 10px 14px;
+}
+.tl-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.tl-outcome {
+  flex: 0 0 auto;
+  min-width: 82px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  padding: 4px 8px;
+  border: 1px solid currentColor;
+  border-radius: var(--pill);
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+}
+.outcome-success,
+.outcome-recovered {
+  color: var(--ok);
+  background: rgba(86, 201, 141, 0.1);
+}
+.outcome-failure {
+  color: var(--sev-critical);
+  background: rgba(224, 90, 82, 0.1);
+}
+.outcome-degraded {
+  color: var(--sev-warning);
+  background: rgba(224, 138, 70, 0.1);
+}
+.tl-title {
+  color: var(--text);
+  font-size: 15px;
+  line-height: 1.45;
+}
+.tl-title p {
+  margin: 0;
+}
+.tl-advice {
+  max-width: 760px;
+  margin-top: 9px;
+  padding: 8px 11px;
+  border-left: 3px solid var(--sev-warning);
+  border-radius: 0 8px 8px 0;
+  background: rgba(224, 138, 70, 0.08);
+  color: var(--text);
+}
+.tl-advice > span {
+  color: var(--sev-warning);
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.1em;
+}
+.tl-advice p {
+  margin: 3px 0 0;
+  color: var(--dim);
+  font-size: 13px;
+  line-height: 1.45;
+}
+.tl-content {
+  padding-left: 26px;
+  max-width: 100%;
+}
+.tl-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 5px;
+}
+.tl-details {
+  color: var(--blue);
+}
+
+/* pop-out detail modal */
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.6);
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding: 6vh 16px;
+  z-index: 100;
+}
+.modal {
+  background: var(--surface, var(--surface-2));
+  border: 1px solid var(--line-strong);
+  border-radius: 14px;
+  width: min(760px, 100%);
+  max-height: 84vh;
+  overflow: auto;
+  padding: 16px 18px;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.5);
+}
+.modal-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.modal-close {
+  margin-left: auto;
+}
+.modal-title {
+  margin: 10px 0 4px;
+  overflow-wrap: anywhere;
+}
+.modal-meta {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  font-size: 12px;
+  color: var(--muted, #8aa);
+  margin-bottom: 10px;
+}
+.modal-meta a {
+  color: var(--blue);
+}
+.modal-body {
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 10px 12px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  margin-bottom: 10px;
+}
+.modal-body p {
+  margin: 0 0 6px;
+}
+.modal-body p:last-child {
+  margin-bottom: 0;
+}
+.tl-title a {
+  color: var(--blue);
+}
+.tl-actions,
+.tl-actions button {
+  display: inline-flex;
+  gap: 4px;
+}
+.tl-actions {
+  display: flex;
+  width: 100%;
+  margin-top: 9px;
+  flex-wrap: wrap;
+  justify-content: flex-start;
+}
+.tl-source {
+  display: inline-flex;
+  align-items: center;
+  min-height: 32px;
+  padding: 0 12px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--pill);
+  color: var(--blue);
+  text-decoration: none;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+@media (max-width: 1180px) {
+  .detail-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* hints */
+.hint {
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--blue);
+  border-radius: 12px;
+  padding: 10px 12px;
+  margin-bottom: 8px;
+  background: var(--surface-2);
+}
+.hint-suggestion {
+  border-left-color: var(--sev-notice);
+}
+.hint.flag {
+  border-left-color: var(--sev-critical);
+  box-shadow: 0 0 0 1px rgba(224, 90, 82, 0.25);
+}
+.hint-head {
+  display: flex;
+  justify-content: space-between;
+  font-size: 10px;
+  color: var(--dim);
+  margin-bottom: 4px;
+}
+.hint-kind {
+  color: var(--blue);
+}
+.cites {
+  font-size: 11px;
+  color: var(--dim);
+  margin-top: 4px;
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+}
+
+/* clickable entity chips (e.g. a repo:owner/name → its GitHub page) */
+.chip-link {
+  text-decoration: none;
+  cursor: pointer;
+}
+.chip-link:hover {
+  color: var(--text);
+  border-color: var(--blue);
+}
+
+/* "MuggleBot is reconsidering" — shown the instant an action re-runs analysis */
+.reconsidering {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 0 0 12px;
+  padding: 8px 12px;
+  border: 1px solid var(--blue);
+  border-radius: 10px;
+  background: rgba(87, 183, 224, 0.1);
+  color: var(--blue);
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+}
+.thinking-dots {
+  display: inline-flex;
+  gap: 4px;
+}
+.thinking-dots i {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--blue);
+  animation: thinking 1s ease-in-out infinite;
+}
+.thinking-dots i:nth-child(2) {
+  animation-delay: 0.15s;
+}
+.thinking-dots i:nth-child(3) {
+  animation-delay: 0.3s;
+}
+@keyframes thinking {
+  0%,
+  100% {
+    opacity: 0.3;
+    transform: translateY(0);
+  }
+  50% {
+    opacity: 1;
+    transform: translateY(-3px);
+  }
+}
+.mini-thinking {
+  font-weight: 600;
+  color: var(--dim);
+  letter-spacing: 0.03em;
+}
+
+/* mitigations + edges + context items */
+.mitigation,
+.edge,
+.ctx-item {
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 10px 12px;
+  margin-bottom: 8px;
+  background: var(--surface-2);
+}
+.mitigation p {
+  margin: 4px 0;
+  font-size: 13px;
+  color: var(--dim);
+}
+.edge-kind {
+  font-weight: 700;
+  color: var(--blue);
+  margin-right: 8px;
+  font-size: 11px;
+}
+.edge-same .edge-kind {
+  color: var(--sev-critical);
+}
+.edge-related .edge-kind {
+  color: var(--sev-notice);
+}
+
+/* ---- forms & controls ---- */
+.form {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 10px;
+}
+.form label {
+  font-size: 10px;
+  color: var(--dim);
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+.row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+.grow {
+  flex: 1;
+}
+input,
+textarea,
+select {
+  background: var(--surface-2);
+  color: var(--text);
+  border: 1px solid var(--line-strong);
+  border-radius: 10px;
+  padding: 8px 11px;
+  font-family: inherit;
+  font-size: 13px;
+  outline: none;
+  transition: border-color 0.15s, box-shadow 0.15s;
+}
+input:focus,
+textarea:focus,
+select:focus {
+  border-color: var(--blue);
+  box-shadow: 0 0 0 3px rgba(87, 183, 224, 0.15);
+}
+textarea {
+  min-height: 60px;
+  resize: vertical;
+  width: 100%;
+}
+
+/* Ghost pill buttons — the LCARS accent, refined. */
+button {
+  background: transparent;
+  color: var(--blue);
+  border: 1px solid var(--line-strong);
+  border-radius: var(--pill);
+  padding: 6px 15px;
+  font-family: inherit;
+  font-weight: 700;
+  font-size: 11px;
+  cursor: pointer;
+  transition: background 0.12s, color 0.12s, border-color 0.12s;
+}
+button:hover:not(:disabled) {
+  background: var(--blue);
+  color: var(--ink);
+  border-color: var(--blue);
+}
+button:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+.back {
+  color: var(--lilac);
+  border-color: var(--lilac);
+}
+.back:hover {
+  background: var(--lilac);
+  color: var(--ink);
+}
+.attach-btn {
+  display: inline-flex;
+  align-items: center;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--pill);
+  padding: 6px 12px;
+  cursor: pointer;
+  font-size: 15px;
+}
+.attach-btn:hover {
+  border-color: var(--blue);
+}
+
+/* memory / context / config items */
+.mem-item {
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 10px 12px;
+  margin-bottom: 8px;
+  background: var(--surface-2);
+}
+.mem-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+}
+.cred-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 5px 0;
+}
+.cred-name {
+  flex: 1;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+}
+.config {
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 12px;
+  font-size: 12px;
+  overflow-x: auto;
+  color: var(--blue);
+  max-height: 60vh;
+}
+.config-edit {
+  width: 100%;
+  min-height: 44vh;
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 12.5px;
+  line-height: 1.55;
+  tab-size: 2;
+  color: var(--text);
+  background: var(--surface-2);
+}
+.save-msg {
+  margin-top: 8px;
+  color: var(--ok);
+}
+code {
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  padding: 0 5px;
+  color: var(--blue);
+  font-size: 0.92em;
+}
+
+/* ---- chat ---- */
+.chat-layout {
+  flex: 1;
+  display: flex;
+  gap: 12px;
+  min-height: 0;
+}
+.chat-list {
+  width: 210px;
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-height: 0;
+  border-right: 1px solid var(--line);
+  padding-right: 10px;
+}
+.chat-new {
+  width: 100%;
+}
+.chat-list-scroll {
+  flex: 1;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.chat-list-empty {
+  color: var(--dim);
+  font-size: 12px;
+  padding: 8px 4px;
+}
+.chat-list-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--surface);
+  cursor: pointer;
+}
+.chat-list-item:hover {
+  border-color: var(--line-strong);
+}
+.chat-list-item.active {
+  border-color: var(--blue);
+  background: var(--surface-2);
+}
+.chat-list-title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12.5px;
+  color: var(--text);
+}
+.chat-del {
+  flex-shrink: 0;
+  padding: 2px 6px;
+  font-size: 11px;
+  border: none;
+  color: var(--dim);
+  opacity: 0.7;
+}
+.chat-del:hover:not(:disabled) {
+  background: transparent;
+  color: var(--sev-critical);
+  border: none;
+  opacity: 1;
+}
+.chat {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+.chat-log {
+  flex: 1;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 8px 4px;
+}
+.bubble {
+  max-width: 78%;
+  border-radius: 16px;
+  padding: 11px 15px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+}
+.bubble.user {
+  align-self: flex-start;
+  background: var(--blue);
+  color: var(--ink);
+  border-bottom-left-radius: 5px;
+}
+.bubble.assistant {
+  align-self: flex-start;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  color: var(--text);
+  border-bottom-left-radius: 5px;
+}
+.bubble-text {
+  min-width: 0;
+}
+.tool-trace {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+  margin-bottom: 8px;
+}
+.thumbs {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+  margin-top: 8px;
+}
+.thumbs img {
+  max-width: 120px;
+  max-height: 120px;
+  border-radius: 10px;
+  border: 1px solid var(--line-strong);
+}
+.chat-input {
+  border-top: 1px solid var(--line);
+  padding-top: 10px;
+}
+.model-bar {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+.model-bar select {
+  flex: 1;
+  min-width: 0;
+  padding: 6px 9px;
+  font-size: 12px;
+}
+
+/* chat context-tag chooser: toggleable tag chips that attach grounding */
+.tag-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+.tag-bar-label {
+  color: var(--dim);
+  font-size: 10px;
+  letter-spacing: 0.18em;
+}
+.tag-toggle {
+  background: var(--surface-2);
+  cursor: pointer;
+  font-family: inherit;
+  opacity: 0.55;
+  text-transform: none;
+  letter-spacing: normal;
+}
+.tag-toggle.on {
+  opacity: 1;
+  background: rgba(217, 169, 78, 0.16);
+}
+
+/* confirmation strip after distilling a thread into a one-sentence memory */
+.saved-memory {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: 10px;
+  padding: 8px 12px;
+  border: 1px solid var(--amber);
+  border-radius: 10px;
+  background: rgba(217, 169, 78, 0.1);
+  color: var(--text);
+  font-size: 12.5px;
+  line-height: 1.5;
+}
+
+/* postmortem */
+.postmortem {
+  margin-top: 10px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 12px;
+  background: var(--surface-2);
+}
+.postmortem-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+.pm-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.icon-btn {
+  padding: 4px 10px;
+  font-size: 11px;
+  text-transform: none;
+  letter-spacing: normal;
+}
+.postmortem .md {
+  max-height: 46vh;
+  overflow-y: auto;
+}
+
+/* ---- rendered markdown (chat replies, postmortem drafts) ---- */
+.md {
+  color: var(--text);
+  font-size: 13px;
+  line-height: 1.6;
+  word-break: break-word;
+}
+.md > :first-child {
+  margin-top: 0;
+}
+.md > :last-child {
+  margin-bottom: 0;
+}
+.md p {
+  margin: 0 0 9px;
+}
+/* Board cards keep their muted body tone even with Markdown rendering. */
+.card-body.md {
+  color: var(--dim);
+}
+/* The full Slack message text — brighter than the summary, accented in the
+   Slack source colour so it reads as the raw message, not the reasoner's note. */
+.card-body.slack-msg {
+  color: var(--text);
+  border-left: 2px solid var(--lilac);
+  padding-left: 10px;
+}
+.md h1,
+.md h2,
+.md h3,
+.md h4,
+.md h5,
+.md h6 {
+  margin: 14px 0 7px;
+  color: var(--blue);
+  line-height: 1.3;
+}
+.md h1 {
+  font-size: 17px;
+}
+.md h2 {
+  font-size: 15px;
+}
+.md h3 {
+  font-size: 13.5px;
+}
+.md h4,
+.md h5,
+.md h6 {
+  font-size: 12.5px;
+}
+.md ul,
+.md ol {
+  margin: 0 0 9px;
+  padding-left: 22px;
+}
+.md li {
+  margin: 3px 0;
+}
+.md a {
+  color: var(--blue);
+  text-decoration: underline;
+}
+.md code {
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  padding: 1px 5px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+}
+.md pre {
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 10px 12px;
+  overflow-x: auto;
+  margin: 0 0 9px;
+}
+.md pre code {
+  background: none;
+  border: none;
+  padding: 0;
+  white-space: pre;
+}
+.md blockquote {
+  margin: 0 0 9px;
+  padding: 2px 12px;
+  border-left: 3px solid var(--line-strong);
+  color: var(--dim);
+}
+.md hr {
+  border: none;
+  border-top: 1px solid var(--line);
+  margin: 12px 0;
+}
+
+/* ---- flags + red alert ---- */
+.flag-strip {
+  background: rgba(224, 90, 82, 0.12);
+  border: 1px solid var(--sev-critical);
+  color: var(--sev-critical);
+  border-radius: 10px;
+  padding: 9px 13px;
+  margin-bottom: var(--gap);
+  font-weight: 700;
+  letter-spacing: 0.04em;
+}
+.action-error {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  overflow-wrap: anywhere;
+}
+.action-error .linkish {
+  flex: 0 0 auto;
+  color: inherit;
+}
+.alert-bar {
+  background: var(--sev-critical) !important;
+  color: #fff;
+  display: flex;
+  align-items: center;
+  padding: 0 20px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  opacity: 1;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.lcars.red-alert .elbow,
+.lcars.red-alert .count,
+.lcars.red-alert .count-label {
+  background: var(--sev-critical);
+  border-color: var(--sev-critical);
+  color: #fff;
+  animation: pulse 1.1s steps(2, start) infinite;
+}
+@keyframes pulse {
+  50% {
+    opacity: 0.5;
+  }
+}
+
+/* ---- scrollbars ---- */
+::-webkit-scrollbar {
+  width: 9px;
+  height: 9px;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--line-strong);
+  border-radius: 8px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--slate);
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}

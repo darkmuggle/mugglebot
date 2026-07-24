@@ -1,0 +1,83 @@
+# MuggleBot configuration — non-secret behavior only.
+# Credentials live in the macOS Keychain (service "dev.mugglebot", account =
+# source name), set via the config page or `security add-generic-password`.
+# Copy this to config.toml and edit.
+
+[general]
+data_dir = "~/.mugglebot"      # SQLite DB (event store + memory + context) lives here
+quiet_hours = "22:00-08:00"    # suppress non-Critical notifications (local time)
+
+[sources.github]
+enabled = true
+watch = ["review_requested", "mention", "ci_failure", "assigned"]
+poll_interval = "60s"
+enrich = true                                    # pull the issue/PR/discussion + triggering comment for context
+ignore_prefixes = ["CLA Assistant workflow run"] # drop notifications whose title starts with these
+
+[sources.slack]
+enabled = false
+user_id = "U0123ABC"                             # your Slack id — flags your own messages
+channels = ["#eng"]                              # watched for mentions / keywords
+alert_channels = ["#alerts", "#prod-incidents"]  # posts here are alert signals
+keywords = ["mugglebot", "prod down"]
+search_mentions = false                          # catch mentions of you everywhere (see below)
+# mention_query = "<@U0123ABC> OR yourname"      # override the default `<@user_id>` search
+poll_interval = "30s"
+# Token (a Slack bot/user token with channels:history + channels:read) lives in
+# the Keychain under account "slack".
+#
+# search_mentions polls search.messages so mentions of you surface from ANY
+# conversation you can see — channels outside `channels`, private channels, and
+# DMs. It requires the stored "slack" credential to be a USER token (xoxp-…,
+# scope search:read); a bot token can't search. The first poll seeds silently
+# (no history flood); you get mentions from then on. Note: a user token is your
+# full Slack identity and DM content will reach the reasoner — see the README.
+
+[sources.granola]
+enabled = false
+poll_interval = "2m"
+api_base = "https://api.granola.ai"              # override for a proxy/self-host
+# Token lives in the Keychain under account "granola".
+
+[notifications]
+min_severity = "notice"        # below this: board-only, no macOS notification
+critical_sound = true
+
+[correlation]
+window = "30m"                 # time window for entity-based grouping
+dedup_threshold = 0.8          # min LLM confidence for a "same" verdict
+auto_merge = true              # true → high-confidence "same" verdicts merge duplicate threads
+
+[live]
+debounce = "1m"                # wait after last thread activity before re-analysis
+debounce_max = "5m"            # hard cap so busy threads still get analyzed
+red_alert = true               # red-alert + Critical notification on high-confidence flags
+red_alert_min_confidence = 0.75
+
+[reasoner]
+# "claude"/"chatgpt" run through the subscription CLI bridge (`claude -p` /
+# `codex exec`) riding your existing login — no API keys. Reasoning about one
+# thread continues as a persistent CLI session per topic. If the CLI binary isn't
+# on PATH, correlation/live-assist degrade to deterministic behavior and the
+# daemon still runs. "ollama_local" is the on-device option (endpoint below);
+# "ollama" is Ollama Cloud (ollama.com), which needs an API key in the Keychain
+# under account "ollama". They're separate providers so a hosted model can't get
+# routed at localhost (404) and vice versa.
+ambient = "claude"            # claude | ollama | ollama_local | chatgpt
+ambient_model = "claude-sonnet-5"
+heavy = "claude"
+heavy_model = "claude-opus-4-8"
+# On-device Ollama endpoint (used by "ollama_local" and by local_only_sources).
+ollama_url = "http://127.0.0.1:11434"
+# Ollama Cloud host (used by the "ollama" provider). Requires the API key in the
+# Keychain under account "ollama"; hosted models are listed once it's set.
+ollama_cloud_url = "https://ollama.com"
+ollama_model = "llama3.1"
+local_only_sources = []       # pin sensitive sources here to force on-device Ollama
+
+[mcp]
+stdio = true
+http_listen = "127.0.0.1:8787"
+
+[ui]
+listen = "127.0.0.1:8080"

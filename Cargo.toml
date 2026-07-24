@@ -1,0 +1,29 @@
+[package]
+name = "mugglebot"
+version = "0.1.0"
+edition = "2021"
+description = "MuggleBot — a single-pane-of-glass ops-awareness agent"
+license = "MIT"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+chrono = { version = "0.4", features = ["serde"] }
+anyhow = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive", "env"] }
+mac-notification-sys = "0.6"
+axum = { version = "0.8", features = ["ws"] }
+tower-http = { version = "0.6", features = ["cors", "fs"] }
+dirs = "5"
+url = { version = "2", features = ["serde"] }
+async-trait = "0.1"
+
+[profile.release]
+lto = "thin"
