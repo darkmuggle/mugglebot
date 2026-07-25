@@ -224,7 +224,35 @@ impl GithubWatcher {
                             None => format!("CI on PR #{}", pr.number),
                         },
                     );
+                    // Climb one more level: if the PR closes an issue, the issue
+                    // is the controlling identity and the PR rides along as a
+                    // secondary entity.
+                    e.extra_entities
+                        .push(Entity::new("pr", format!("{repo}#{}", pr.number)));
+                    if let Some(issue) = linked_issue(pr.body.as_deref(), pr.title.as_deref()) {
+                        return (Entity::new("issue", format!("{repo}#{issue}")), e);
+                    }
                     return (Entity::new("pr", format!("{repo}#{}", pr.number)), e);
+                }
+                // No open PR for this branch. On a default branch that usually
+                // means the PR already merged — find it through the commit the run
+                // was built from, so post-merge CI still attaches to the work it
+                // came from instead of piling up as anonymous cards.
+                if is_default_branch(&branch) {
+                    if let Some(pr) = self.merged_pr_for_run(headers, repo, n).await {
+                        e.subject = Some(match pr.title.as_deref().map(str::trim) {
+                            Some(t) if !t.is_empty() => {
+                                format!("CI on main after PR #{}: {t}", pr.number)
+                            }
+                            _ => format!("CI on main after PR #{}", pr.number),
+                        });
+                        e.extra_entities
+                            .push(Entity::new("pr", format!("{repo}#{}", pr.number)));
+                        if let Some(issue) = linked_issue(pr.body.as_deref(), pr.title.as_deref()) {
+                            return (Entity::new("issue", format!("{repo}#{issue}")), e);
+                        }
+                        return (Entity::new("pr", format!("{repo}#{}", pr.number)), e);
+                    }
                 }
             }
             e.subject = Some(format!("CI on branch {branch}"));
@@ -237,7 +265,16 @@ impl GithubWatcher {
         } else {
             Enrichment::default()
         };
-        let entity = subject_entity(&n.subject.r#type, n.subject.url.as_deref(), repo, &n.id);
+        let mut entity = subject_entity(&n.subject.r#type, n.subject.url.as_deref(), repo, &n.id);
+        // A PR that closes an issue is *about* that issue. Promote the issue to the
+        // controlling identity and keep the PR as a secondary entity, so the PR,
+        // its CI, and the issue's own notifications all land on one thread.
+        if entity.kind == "pr" {
+            if let Some(issue) = linked_issue(e.excerpt.as_deref(), Some(&n.subject.title)) {
+                e.extra_entities.push(entity.clone());
+                entity = Entity::new("issue", format!("{repo}#{issue}"));
+            }
+        }
         // For a PR, pull the head commit's summary so the body carries the code
         // change, not just the discussion text.
         if self.enrich && entity.kind == "pr" {
@@ -253,6 +290,59 @@ impl GithubWatcher {
             }
         }
         (entity, e)
+    }
+
+    /// Find the merged PR a default-branch CI run was built from, via the commit
+    /// the workflow ran on (`/commits/{sha}/pulls`).
+    ///
+    /// This closes the last gap in the branch → PR → issue chain. CI on `main` has
+    /// no open PR for its branch, so without this every post-merge run becomes an
+    /// anonymous card — "workflow run skipped for main branch", over and over, with
+    /// nothing linking it to the change that caused it. Going through the commit
+    /// recovers the PR that merged, and from there the issue that PR closed.
+    ///
+    /// Best effort throughout: a run we can't resolve simply falls back to the
+    /// branch identity.
+    async fn merged_pr_for_run(
+        &self,
+        headers: &HeaderMap,
+        repo: &str,
+        n: &GhNotification,
+    ) -> Option<GhPullRef> {
+        let branch = ci_branch(&n.subject.title)?;
+        let workflow = ci_workflow_name(&n.subject.title)?;
+        // Locate the run to get its head SHA.
+        let mut url =
+            Url::parse(&format!("https://api.github.com/repos/{repo}/actions/runs")).ok()?;
+        url.query_pairs_mut()
+            .append_pair("branch", &branch)
+            .append_pair("per_page", "20");
+        let runs: GhRunsResponse = self.get_json(headers, url.as_str()).await?;
+        let sha = runs
+            .workflow_runs
+            .iter()
+            .find(|r| {
+                r.name
+                    .as_deref()
+                    .is_some_and(|name| name.eq_ignore_ascii_case(&workflow))
+            })
+            .or_else(|| runs.workflow_runs.first())
+            .and_then(|r| r.head_sha.clone())
+            .filter(|s| !s.is_empty())?;
+
+        let pulls: Vec<GhPullRef> = self
+            .get_json(
+                headers,
+                &format!("https://api.github.com/repos/{repo}/commits/{sha}/pulls"),
+            )
+            .await?;
+        // A commit can appear in several PRs (backports, chained branches); the
+        // merged one is the change that actually landed.
+        pulls
+            .iter()
+            .find(|p| p.merged_at.is_some())
+            .or_else(|| pulls.first())
+            .cloned()
     }
 
     /// Find the PR whose head branch is `branch` in `repo` (`owner/name`), so a
@@ -677,6 +767,53 @@ fn subject_entity(
     }
 }
 
+/// Default branch names, matching [`crate::correlation::engine`]'s view: CI on one
+/// of these has no feature branch to identify it, so the run is attributed through
+/// the commit it built instead.
+fn is_default_branch(branch: &str) -> bool {
+    matches!(
+        branch.to_ascii_lowercase().as_str(),
+        "main" | "master" | "trunk" | "develop" | "development"
+    )
+}
+
+/// The issue a pull request closes, from GitHub's own closing keywords.
+///
+/// This is the branch → PR → **issue** step. Without it a PR, its CI runs, and the
+/// issue they are all about sit on three separate threads, and the issue — the one
+/// durable statement of what the work is — ends up as the card with none of the
+/// activity attached.
+///
+/// Only GitHub's closing keywords count. A bare `#412` in a PR body is usually a
+/// cross-reference ("similar to #412"), and treating that as identity would merge
+/// unrelated work.
+fn linked_issue(body: Option<&str>, title: Option<&str>) -> Option<u64> {
+    const KEYWORDS: &[&str] = &[
+        "close", "closes", "closed", "fix", "fixes", "fixed", "resolve", "resolves", "resolved",
+    ];
+    let haystack = format!("{} {}", title.unwrap_or(""), body.unwrap_or("")).to_ascii_lowercase();
+    // Scan word-wise so "fixes #412" matches but "prefixes #412" does not.
+    let words: Vec<&str> = haystack.split_whitespace().collect();
+    for pair in words.windows(2) {
+        let keyword = pair[0].trim_matches(|c: char| !c.is_alphanumeric());
+        if !KEYWORDS.contains(&keyword) {
+            continue;
+        }
+        let number: String = pair[1]
+            .trim_start_matches(|c: char| c != '#')
+            .trim_start_matches('#')
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .collect();
+        if !number.is_empty() {
+            if let Ok(n) = number.parse::<u64>() {
+                return Some(n);
+            }
+        }
+    }
+    None
+}
+
 /// A subject title is ignorable when it begins with any configured prefix
 /// (leading/trailing whitespace trimmed on both sides before comparing).
 fn ignored_by_prefix(title: &str, prefixes: &[String]) -> bool {
@@ -817,6 +954,11 @@ struct Enrichment {
     /// A bounded excerpt from the matching workflow run's jobs. Failures keep
     /// error lines; successful runs keep the final useful output.
     ci_log: Option<CiLog>,
+    /// Identities resolved *below* the controlling one — the PR a CI run came
+    /// from, when the issue that PR closes is what actually owns the thread. They
+    /// still correlate (a later notification about the PR itself finds this
+    /// signal) without displacing the stronger identity.
+    extra_entities: Vec<Entity>,
 }
 
 #[derive(Clone)]
@@ -838,6 +980,9 @@ struct GhRun {
     id: u64,
     #[serde(default)]
     name: Option<String>,
+    /// The commit the run was built from — the link to the PR that merged it.
+    #[serde(default)]
+    head_sha: Option<String>,
     #[serde(default)]
     conclusion: Option<String>,
     #[serde(default)]
@@ -866,6 +1011,10 @@ struct GhPullRef {
     number: u64,
     #[serde(default)]
     title: Option<String>,
+    /// Set when the PR actually landed, which distinguishes the merged PR from
+    /// other PRs a commit may appear in.
+    #[serde(default)]
+    merged_at: Option<String>,
     #[serde(default)]
     body: Option<String>,
     #[serde(default)]
@@ -1060,6 +1209,18 @@ impl Watcher for GithubWatcher {
                 subject_entity,
                 Entity::new("repo", n.repository.full_name.clone()),
             ];
+            // Secondary identities resolved on the way up the chain
+            // (branch → PR → issue), so every level still correlates. Deduplicated
+            // because several paths contribute and a repeated entity is noise in
+            // both the chips and the correlation key set.
+            for extra in &enrichment.extra_entities {
+                if !entities
+                    .iter()
+                    .any(|e| e.kind == extra.kind && e.value == extra.value)
+                {
+                    entities.push(extra.clone());
+                }
+            }
             if let Some(author) = &enrichment.author {
                 entities.push(Entity::new("person", author.clone()));
             }
@@ -1110,8 +1271,8 @@ impl Watcher for GithubWatcher {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_body, excerpt, extract_ci_tail, ignored_by_prefix, state_label, CiLog, Enrichment,
-        GhSubjectDetail,
+        build_body, excerpt, extract_ci_tail, ignored_by_prefix, is_default_branch, linked_issue,
+        state_label, CiLog, Enrichment, GhSubjectDetail,
     };
     use super::{
         ci_branch, ci_failed, ci_workflow_name, extract_ci_errors, subject_entity, subject_html_url,
@@ -1230,6 +1391,41 @@ mod tests {
         assert_eq!(a.kind, "ci");
         assert_eq!(a.value, "octo/repo:111");
         assert_ne!(a.value, b.value, "distinct check suites stay separate");
+    }
+
+    #[test]
+    fn closing_keywords_link_a_pr_to_its_issue() {
+        // The branch → PR → issue step: only GitHub's closing keywords count.
+        assert_eq!(linked_issue(Some("Fixes #412"), None), Some(412));
+        assert_eq!(linked_issue(Some("this closes #7."), None), Some(7));
+        assert_eq!(
+            linked_issue(None, Some("Resolves #99: bound the pool")),
+            Some(99)
+        );
+        assert_eq!(
+            linked_issue(Some("blah\n\nCloses #1234\n\nmore"), None),
+            Some(1234)
+        );
+    }
+
+    /// A bare cross-reference is not a claim of ownership. Treating "similar to
+    /// #412" as identity would merge unrelated work onto one thread.
+    #[test]
+    fn a_bare_reference_is_not_an_issue_link() {
+        assert_eq!(linked_issue(Some("similar to #412"), None), None);
+        assert_eq!(linked_issue(Some("see #412 for context"), None), None);
+        assert_eq!(linked_issue(Some("no references at all"), None), None);
+        // …and a word merely ending in a keyword must not match.
+        assert_eq!(linked_issue(Some("prefixes #412 nicely"), None), None);
+    }
+
+    #[test]
+    fn default_branches_are_recognized() {
+        assert!(is_default_branch("main"));
+        assert!(is_default_branch("MASTER"));
+        assert!(is_default_branch("develop"));
+        assert!(!is_default_branch("fix/pool-leak"));
+        assert!(!is_default_branch("maintenance"));
     }
 
     #[test]

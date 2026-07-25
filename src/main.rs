@@ -9,24 +9,33 @@
 
 #![allow(dead_code)]
 
+mod browser;
 mod chat;
+mod checkout;
+mod comments;
 mod config;
 mod context;
 mod correlation;
+mod ecosystem;
 mod embed;
 mod event;
+mod github;
 mod live;
 mod live_engine;
 mod mcp;
 mod memory;
 mod mitigations;
 mod notify;
+mod prfix;
 mod reasoner;
+mod repos;
+mod rootcause;
 mod server;
 mod signal;
 mod store;
 mod tags;
 mod tools;
+mod triage;
 mod watchers;
 
 use anyhow::{Context, Result};
@@ -52,7 +61,8 @@ use crate::server::AppState;
 use crate::store::Store;
 use crate::tools::Tools;
 use crate::watchers::{
-    github::GithubWatcher, granola::GranolaWatcher, slack::SlackWatcher, Watcher,
+    assigned::AssignedWatcher, github::GithubWatcher, granola::GranolaWatcher, slack::SlackWatcher,
+    Watcher,
 };
 
 #[derive(Parser)]
@@ -76,6 +86,8 @@ struct Services {
     live: Arc<LiveEngine>,
     notifier: Arc<Notifier>,
     context: Arc<ContextManager>,
+    investigator: Arc<rootcause::Investigator>,
+    browser: Arc<browser::BrowserDriver>,
     events: broadcast::Sender<Event>,
 }
 
@@ -107,10 +119,10 @@ async fn main() -> Result<()> {
     // Reasoners + embedder. Reasoning rides the subscription CLI bridge (no API
     // keys); Ollama's optional key is stored in the database.
     let ollama_key = store.credential_get("ollama").unwrap_or(None);
-    let reasoners = Reasoners::from_config(&cfg.reasoner, ollama_key.clone());
+    let reasoners = Reasoners::from_config(&cfg.reasoner, ollama_key.clone(), Some(store.clone()));
     // Use Ollama embeddings whenever any reasoning already runs through Ollama —
     // either ambient (local or cloud) or the on-device path used by local_only_sources.
-    let embed_provider = if matches!(cfg.reasoner.ambient.as_str(), "ollama" | "ollama_local")
+    let embed_provider = if matches!(cfg.reasoner.local.as_str(), "ollama" | "ollama_local")
         || !cfg.reasoner.local_only_sources.is_empty()
     {
         "ollama"
@@ -120,7 +132,7 @@ async fn main() -> Result<()> {
     let embedder = embed::build(
         embed_provider,
         &cfg.reasoner.ollama_url,
-        &cfg.reasoner.ollama_model,
+        &cfg.reasoner.embed_model,
         ollama_key,
     );
     info!("embedder: {embed_provider}");
@@ -129,14 +141,14 @@ async fn main() -> Result<()> {
     let memory = Arc::new(MemoryManager::new(
         store.clone(),
         embedder.clone(),
-        reasoners.ambient.clone(),
-        reasoners.heavy.clone(),
+        reasoners.routed.clone(),
+        reasoners.routed.clone(),
     ));
     let context = Arc::new(ContextManager::new(
         store.clone(),
         embedder.clone(),
-        reasoners.ambient.clone(),
-        reasoners.heavy.clone(),
+        reasoners.routed.clone(),
+        reasoners.routed.clone(),
         cfg_context_refresh(&cfg),
     ));
 
@@ -147,12 +159,66 @@ async fn main() -> Result<()> {
     let analyst = Arc::new(Analyst::new(
         store.clone(),
         correlator.clone(),
-        reasoners.ambient.clone(),
+        reasoners.routed.clone(),
+        reasoners.local.clone(),
         memory.clone(),
         context.clone(),
         cfg.correlation.dedup_threshold,
         cfg.correlation.auto_merge,
+        cfg.correlation.reopen_min_confidence,
         window,
+    ));
+
+    // Root-cause investigation: the README-derived repo index, and the issue/PR/
+    // commit search over it. Crawling and shortlisting run on the local classifier;
+    // only the final verdict reaches the cloud tier.
+    let github_token = store.credential_get("github").unwrap_or(None);
+    // One checkout cache, shared: the repo index reads code to characterize it and
+    // triage reads code to analyze an issue, and they want the same working copies.
+    let checkout_root = {
+        let configured = std::path::PathBuf::from(&cfg.assigned.checkout_dir);
+        if configured.is_absolute() {
+            configured
+        } else {
+            data_dir.join(configured)
+        }
+    };
+    let checkouts = Arc::new(checkout::CheckoutCache::new(
+        checkout_root,
+        github_token.clone(),
+        cfg.assigned.max_checkout_mb,
+        cfg.assigned.max_cache_mb,
+    ));
+    let repo_index = Arc::new(repos::RepoIndex::new(
+        store.clone(),
+        github_token.clone(),
+        reasoners.local.clone(),
+        Some(checkouts.clone()),
+        cfg.investigation.clone(),
+    ));
+    let investigator = Arc::new(rootcause::Investigator::new(
+        store.clone(),
+        correlator.clone(),
+        repo_index.clone(),
+        github_token.clone(),
+        reasoners.local.clone(),
+        reasoners.routed.clone(),
+        cfg.investigation.clone(),
+    ));
+    let browser_driver = Arc::new(browser::BrowserDriver::new(cfg.browser.clone()));
+
+    // Assigned-issue triage: check the repo out, read the code with the local
+    // coder model, propose patches, look for a PR that already fixes it, then
+    // render the lot in plain English.
+    let triager = Arc::new(triage::Triager::new(
+        store.clone(),
+        checkouts.clone(),
+        github_token.clone(),
+        reasoners.local.clone(),
+        reasoners.brief.clone(),
+        reasoners.routed.clone(),
+        analyst.clone(),
+        cfg.assigned.clone(),
     ));
 
     // Notifier + live event bus.
@@ -167,8 +233,8 @@ async fn main() -> Result<()> {
     let live = Arc::new(LiveEngine::new(
         store.clone(),
         correlator.clone(),
-        reasoners.heavy.clone(),
-        reasoners.ambient.clone(),
+        reasoners.routed.clone(),
+        reasoners.routed.clone(),
         memory.clone(),
         context.clone(),
         notifier.clone(),
@@ -186,10 +252,13 @@ async fn main() -> Result<()> {
         analyst: analyst.clone(),
         memory: memory.clone(),
         context: context.clone(),
-        reasoner: reasoners.heavy.clone(),
+        reasoner: reasoners.routed.clone(),
         config: cfg.clone(),
+        investigator: investigator.clone(),
+        repos: repo_index.clone(),
+        browser: browser_driver.clone(),
     });
-    let chat = Arc::new(ChatAgent::new(tools.clone(), reasoners.heavy.clone()));
+    let chat = Arc::new(ChatAgent::new(tools.clone(), reasoners.vision.clone()));
 
     // Web server (UI/API + WS).
     let app_state = AppState {
@@ -231,6 +300,128 @@ async fn main() -> Result<()> {
 
     // Live-assist debounce scheduler + context-library refresh scheduler.
     tokio::spawn(live.clone().run());
+
+    // Completion-cache upkeep: expire stale answers and hold the store to its LRU
+    // ceiling, so a long-running daemon doesn't accumulate a database of replies
+    // nothing will ask for again.
+    if cfg.reasoner.cache.enabled {
+        let store = store.clone();
+        let ttl =
+            config::parse_duration(&cfg.reasoner.cache.ttl).unwrap_or(Duration::from_secs(86_400));
+        let max_entries = cfg.reasoner.cache.max_entries;
+        tokio::spawn(async move {
+            loop {
+                match store.prune_completions(ttl, max_entries) {
+                    Ok(n) if n > 0 => debug!("cache: pruned {n} completion(s)"),
+                    Ok(_) => {}
+                    Err(e) => warn!("cache: prune failed: {e:#}"),
+                }
+                if let Ok((entries, hits)) = store.completion_cache_stats() {
+                    if hits > 0 {
+                        info!("cache: {entries} answer(s) stored, {hits} reuse(s) so far");
+                    }
+                }
+                tokio::time::sleep(Duration::from_secs(3600)).await;
+            }
+        });
+    }
+
+    // Repo index: crawl the org's READMEs at startup so routing has something to
+    // work with on the first incident, then refresh on a slow interval.
+    // Conditional requests make a no-change refresh cheap and model-free.
+    if cfg.investigation.enabled {
+        let repos = repo_index.clone();
+        let interval = config::parse_duration(&cfg.investigation.refresh_interval)
+            .unwrap_or(Duration::from_secs(86_400));
+        let org = cfg.investigation.org.clone();
+        tokio::spawn(async move {
+            if !repos.online() {
+                warn!(
+                    "investigation: no GitHub token stored — the repo index stays empty and \
+                     root-cause routing falls back to the configured default repos"
+                );
+                return;
+            }
+            loop {
+                match repos.sync().await {
+                    Ok(n) => info!("repo index: {org} synced ({n} summary/summaries refreshed)"),
+                    Err(e) => warn!("repo index: sync failed: {e:#}"),
+                }
+                tokio::time::sleep(interval).await;
+            }
+        });
+    }
+
+    // Browser worker: drains the dashboard-investigation queue one job at a time
+    // (they share a single Chrome), then re-analyzes the thread with the findings
+    // and kicks off root-cause investigation now that the numbers are in hand.
+    if browser_driver.enabled() {
+        let worker = Arc::new(browser::BrowserWorker::new(
+            store.clone(),
+            browser_driver.clone(),
+            {
+                let svc_analyst = analyst.clone();
+                let svc_investigator = investigator.clone();
+                let svc_correlator = correlator.clone();
+                let events = events.clone();
+                Arc::new(move |inv: store::BrowserInvestigation| {
+                    let Some(thread_id) = inv.thread_id.clone() else {
+                        return;
+                    };
+                    let analyst = svc_analyst.clone();
+                    let investigator = svc_investigator.clone();
+                    let correlator = svc_correlator.clone();
+                    let events = events.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = analyst.reanalyze(&thread_id).await {
+                            warn!("browser findings reanalyze {thread_id} failed: {e:#}");
+                        }
+                        if investigator.enabled() {
+                            if let Err(e) = investigator.investigate(&thread_id).await {
+                                debug!("root-cause after browser findings: {e:#}");
+                            }
+                        }
+                        if let Ok(views) = correlator.thread_views(true) {
+                            let _ = events.send(Event::Board(views));
+                        }
+                    });
+                })
+            },
+        ));
+        tokio::spawn(worker.run());
+    } else {
+        debug!("browser control disabled ([browser].enabled = false)");
+    }
+
+    // Triage worker: one assigned issue at a time. A clone plus several passes of
+    // a 33b local model is minutes of work, so it never runs on the poll path.
+    if triager.enabled() {
+        let worker = Arc::new(triage::TriageWorker::new(store.clone(), triager.clone(), {
+            let correlator = correlator.clone();
+            let events = events.clone();
+            let store = store.clone();
+            Arc::new(move |t: store::IssueTriage| {
+                // Re-emit the issue's signal so the open card picks up the new
+                // analysis, and push the board.
+                if let Some(sig) = t
+                    .signal_id
+                    .as_deref()
+                    .and_then(|id| store.get_signal(id).ok().flatten())
+                {
+                    let _ = events.send(Event::Signal(sig));
+                }
+                if let Ok(views) = correlator.thread_views(true) {
+                    let _ = events.send(Event::Board(views));
+                }
+            })
+        }));
+        tokio::spawn(worker.run());
+    } else if cfg.assigned.enabled {
+        warn!(
+            "assigned-issue triage needs a stored GitHub credential — issues will still \
+             appear on the board once one is set"
+        );
+    }
     {
         let context = context.clone();
         tokio::spawn(async move {
@@ -277,6 +468,8 @@ async fn main() -> Result<()> {
         live: live.clone(),
         notifier: notifier.clone(),
         context: context.clone(),
+        investigator: investigator.clone(),
+        browser: browser_driver.clone(),
         events: events.clone(),
     };
     let watchers = build_watchers(&cfg, &store);
@@ -322,6 +515,23 @@ fn build_watchers(cfg: &Config, store: &Store) -> Vec<Box<dyn Watcher>> {
             },
             Ok(None) => warn!(
                 "github enabled but no token stored (account 'github'); skipping. \
+                 Store one from the config page."
+            ),
+            Err(e) => error!("github credential read failed: {e:#}"),
+        }
+    }
+
+    // Assignment is a standing state, not an event, so it gets its own poll —
+    // an issue assigned weeks ago produces no notification but still belongs on
+    // the board.
+    if cfg.assigned.enabled {
+        match token_for(store, "github") {
+            Ok(Some(token)) => match AssignedWatcher::new(&cfg.assigned, token) {
+                Ok(w) => watchers.push(Box::new(w)),
+                Err(e) => error!("assigned-issues watcher init failed: {e:#}"),
+            },
+            Ok(None) => warn!(
+                "assigned issues enabled but no github token stored; skipping. \
                  Store one from the config page."
             ),
             Err(e) => error!("github credential read failed: {e:#}"),
@@ -388,6 +598,139 @@ async fn enrich_slack_links(sig: &mut signal::Signal, context: &ContextManager) 
     }
 }
 
+/// Queue a read-only browser investigation for the first dashboard link in a
+/// Slack signal. The worker picks it up and drives the operator's signed-in
+/// Chrome; queueing here keeps the poll path non-blocking, since one browser
+/// session can take minutes.
+fn queue_dashboard_investigation(
+    sig: &mut signal::Signal,
+    store: &Store,
+    driver: &browser::BrowserDriver,
+) {
+    if sig.source != signal::Source::Slack || !driver.enabled() {
+        return;
+    }
+    let Some(url) = rootcause::dashboard_links(sig, |u| driver.matches(u)).map(str::to_string)
+    else {
+        return;
+    };
+    let context = sig.body.as_deref().unwrap_or(&sig.title).to_string();
+    let brief = driver.brief(&url, &context);
+    match store.queue_browser_investigation(&sig.id, &url, &brief) {
+        Ok(investigation) => {
+            if let Some(raw) = sig.raw.as_object_mut() {
+                raw.insert(
+                    "browser_investigation_id".into(),
+                    serde_json::json!(investigation.id),
+                );
+            }
+            debug!(
+                "queued browser investigation {} for {url}",
+                investigation.id
+            );
+        }
+        Err(e) => warn!(
+            "queueing browser investigation for {} failed: {e:#}",
+            sig.id
+        ),
+    }
+}
+
+/// Queue triage for a signal that represents an issue assigned to the user.
+///
+/// The watcher re-emits every assigned issue on every poll, so this is called
+/// repeatedly for the same issue; [`Store::queue_issue_triage`] is what decides
+/// whether there's anything to redo (it won't re-run a completed analysis).
+fn queue_issue_triage(sig: &signal::Signal, store: &Store) {
+    if !sig
+        .raw
+        .get("assigned_issue")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        return;
+    }
+    let (Some(key), Some(repo), Some(number)) = (
+        sig.raw.get("issue_key").and_then(|v| v.as_str()),
+        sig.raw.get("repo").and_then(|v| v.as_str()),
+        sig.raw.get("number").and_then(|v| v.as_u64()),
+    ) else {
+        return;
+    };
+    match store.queue_issue_triage(
+        key,
+        repo,
+        number as i64,
+        &sig.title,
+        sig.url.as_deref(),
+        &sig.id,
+    ) {
+        Ok(true) => debug!("queued triage for {key}"),
+        Ok(false) => {}
+        Err(e) => warn!("queueing triage for {key} failed: {e:#}"),
+    }
+}
+
+/// Investigate a thread's root cause, but only when there's something worth
+/// investigating.
+///
+/// Root-cause investigation is the most expensive thing MuggleBot does — GitHub
+/// search calls, a commit-log scan, several local model passes, and one cloud
+/// call. Firing it on every ingested signal would rate-limit the search API and
+/// spend a cloud call on "Ben mentioned you in #eng". The gate is deliberately
+/// narrow: a thread earns an investigation when it looks like something actually
+/// broke, and it isn't re-investigated once it has a completed report.
+async fn investigate_if_worthwhile(svc: &Services, thread_id: &str) {
+    let Ok(Some(view)) = svc.correlator.thread_view(thread_id) else {
+        return;
+    };
+    // Handled work is settled — the investigator refuses these anyway, but don't
+    // even ask.
+    if rootcause::is_handled(view.state) {
+        return;
+    }
+    // Something has to have gone wrong. A review request or a passing CI run has
+    // no cause to find.
+    let looks_broken = view.severity >= signal::Severity::Warning
+        || view.signals.iter().any(|s| {
+            matches!(
+                s.kind,
+                signal::SignalKind::Alert | signal::SignalKind::CiFailure
+            )
+        });
+    if !looks_broken {
+        return;
+    }
+    // Don't redo work. A failed report is worth retrying (the failure may have
+    // been a rate limit); a complete one is not, until the operator asks.
+    match svc.store.get_root_cause(thread_id) {
+        Ok(Some(report)) if report.status != "failed" => return,
+        Ok(_) => {}
+        Err(e) => {
+            warn!("root-cause lookup for {thread_id} failed: {e:#}");
+            return;
+        }
+    }
+    match svc.investigator.investigate(thread_id).await {
+        Ok(report) => {
+            let found = report.candidates.as_array().map(Vec::len).unwrap_or(0);
+            info!(
+                "investigation {thread_id}: {} with {found} candidate(s)",
+                report.status
+            );
+            // Re-summarize so the board reflects the new evidence, cited
+            // `[cause:REF]`. This can't recurse: the completed report above makes
+            // the next `investigate_if_worthwhile` a no-op.
+            if found > 0 {
+                if let Err(e) = svc.analyst.reanalyze(thread_id).await {
+                    warn!("resummarize after investigating {thread_id} failed: {e:#}");
+                }
+            }
+        }
+        Err(e) => debug!("investigation {thread_id} skipped: {e:#}"),
+    }
+}
+
 async fn poll_loop(watcher: Box<dyn Watcher>, svc: Services) {
     let interval = watcher.interval();
     let name = watcher.name();
@@ -401,11 +744,21 @@ async fn poll_loop(watcher: Box<dyn Watcher>, svc: Services) {
                 let mut touched: BTreeSet<String> = BTreeSet::new();
                 // Newly-ingested Slack signals to classify per-message (id + text).
                 let mut slack_to_classify: Vec<(String, String)> = Vec::new();
+                // Threads that were already handled but received new activity. These
+                // are triaged on the LOCAL classifier only — see `triage_handled`.
+                let mut handled_to_triage: Vec<(String, signal::Signal)> = Vec::new();
                 for sig in batch.signals {
                     let mut sig = sig;
                     // Enrich a linked-out Slack message with a one-paragraph
                     // summary of the (public) page it points at, before storing.
                     enrich_slack_links(&mut sig, &svc.context).await;
+                    queue_dashboard_investigation(&mut sig, &svc.store, &svc.browser);
+                    // Queue triage for an assigned issue. This runs before the
+                    // insert-dedup check on purpose: the signal is re-emitted every
+                    // poll and only inserts once, but a triage that previously
+                    // failed (or whose code has moved on) still deserves another
+                    // run, and `queue_issue_triage` decides that for itself.
+                    queue_issue_triage(&sig, &svc.store);
                     match svc.store.insert_signal(&sig) {
                         Ok(true) => {
                             new += 1;
@@ -436,12 +789,28 @@ async fn poll_loop(watcher: Box<dyn Watcher>, svc: Services) {
                                     format!("{} {}", sig.title, sig.body.as_deref().unwrap_or(""));
                                 slack_to_classify.push((sig.id.clone(), text));
                             }
-                            let _ = svc.events.send(Event::Signal(sig));
+                            let _ = svc.events.send(Event::Signal(sig.clone()));
                             if let Some(tid) = thread_id {
                                 if engaged {
                                     svc.live.on_activity(&tid);
                                 }
-                                touched.insert(tid);
+                                // A handled thread stays out of the cloud analysis
+                                // path entirely. New activity on it is instead
+                                // matched locally to decide whether it should come
+                                // back — so a snoozed issue that genuinely recurs
+                                // isn't lost, without paying to re-reason settled
+                                // work.
+                                let handled = svc
+                                    .correlator
+                                    .thread_view(&tid)
+                                    .ok()
+                                    .flatten()
+                                    .is_some_and(|v| rootcause::is_handled(v.state));
+                                if handled {
+                                    handled_to_triage.push((tid, sig));
+                                } else {
+                                    touched.insert(tid);
+                                }
                             }
                         }
                         Ok(false) => {
@@ -457,10 +826,18 @@ async fn poll_loop(watcher: Box<dyn Watcher>, svc: Services) {
                 if let Some(snapshot) = batch.snapshot {
                     match snapshot.source {
                         signal::Source::GitHub => {
-                            match svc
-                                .store
-                                .resolve_missing_github_notifications(&snapshot.active_ids)
-                            {
+                            // Two watchers write GitHub signals and each is
+                            // authoritative only for its own half — reconciling
+                            // with the wrong listing would resolve the other's
+                            // cards wholesale.
+                            let reconciled = if name == "github-assigned" {
+                                svc.store
+                                    .resolve_missing_assigned_issues(&snapshot.active_ids)
+                            } else {
+                                svc.store
+                                    .resolve_missing_github_notifications(&snapshot.active_ids)
+                            };
+                            match reconciled {
                                 Ok(signals) => {
                                     resolved = signals.len();
                                     for sig in signals {
@@ -507,8 +884,8 @@ async fn poll_loop(watcher: Box<dyn Watcher>, svc: Services) {
                 if !touched.is_empty() {
                     let svc2 = svc.clone();
                     tokio::spawn(async move {
-                        for tid in touched {
-                            if let Err(e) = svc2.analyst.reanalyze(&tid).await {
+                        for tid in &touched {
+                            if let Err(e) = svc2.analyst.reanalyze(tid).await {
                                 warn!("ambient reanalyze {tid} failed: {e:#}");
                             }
                         }
@@ -518,6 +895,45 @@ async fn poll_loop(watcher: Box<dyn Watcher>, svc: Services) {
                         // Reconcile the board — reanalyze may have auto-merged threads.
                         if let Ok(views) = svc2.correlator.thread_views(true) {
                             let _ = svc2.events.send(Event::Board(views));
+                        }
+                        // Then go looking for the cause. This runs after the merge
+                        // dust settles, so an investigation isn't wasted on a thread
+                        // that's about to be collapsed into another.
+                        if svc2.investigator.enabled() {
+                            for tid in &touched {
+                                investigate_if_worthwhile(&svc2, tid).await;
+                            }
+                            if let Ok(views) = svc2.correlator.thread_views(true) {
+                                let _ = svc2.events.send(Event::Board(views));
+                            }
+                        }
+                    });
+                }
+                // Handled threads: local-only triage, off the poll path.
+                if !handled_to_triage.is_empty() {
+                    let svc2 = svc.clone();
+                    tokio::spawn(async move {
+                        let mut reopened = false;
+                        for (tid, sig) in handled_to_triage {
+                            match svc2.analyst.triage_handled(&tid, &sig).await {
+                                Ok(true) => {
+                                    reopened = true;
+                                    // Now that it's live again, it earns the normal
+                                    // treatment — including cloud analysis.
+                                    if let Err(e) = svc2.analyst.reanalyze(&tid).await {
+                                        warn!("reanalyze reopened {tid} failed: {e:#}");
+                                    }
+                                    svc2.notifier.clear_notified(&tid);
+                                    svc2.notifier.maybe_notify_thread(&tid, &sig);
+                                }
+                                Ok(false) => {}
+                                Err(e) => warn!("reopen triage {tid} failed: {e:#}"),
+                            }
+                        }
+                        if reopened {
+                            if let Ok(views) = svc2.correlator.thread_views(true) {
+                                let _ = svc2.events.send(Event::Board(views));
+                            }
                         }
                     });
                 }

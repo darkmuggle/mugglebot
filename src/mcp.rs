@@ -232,14 +232,18 @@ mod tests {
             "6h".into(),
         ));
         let correlator = Arc::new(Correlator::new(store.clone(), Duration::from_secs(1800)));
+        let (investigator, repos, browser) =
+            crate::rootcause::offline_stack(store.clone(), correlator.clone(), reasoner.clone());
         let analyst = Arc::new(Analyst::new(
             store.clone(),
             correlator.clone(),
+            reasoner.clone(),
             reasoner.clone(),
             memory.clone(),
             context.clone(),
             0.8,
             false,
+            0.6,
             Duration::from_secs(1800),
         ));
         Arc::new(McpServer::new(Arc::new(Tools {
@@ -250,6 +254,9 @@ mod tests {
             context,
             reasoner,
             config: Arc::new(crate::config::Config::default()),
+            investigator,
+            repos,
+            browser,
         })))
     }
 
@@ -314,6 +321,14 @@ mod tests {
             .await
             .unwrap();
         let text = r["result"]["contents"][0]["text"].as_str().unwrap();
-        assert!(text.contains("ambient_model"));
+        assert!(text.contains("local_model"), "config is exposed");
+        // Behavior is public; secrets are not. Credentials live in the store, and
+        // this resource is built from the config struct, which never holds them.
+        for secret in ["xoxp-", "xoxb-", "ghp_", "secret", "token"] {
+            assert!(
+                !text.to_ascii_lowercase().contains(secret),
+                "config resource leaked `{secret}`"
+            );
+        }
     }
 }

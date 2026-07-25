@@ -34,6 +34,10 @@ pub struct Tools {
     /// Heavy reasoner, for on-demand deep work like postmortem drafting.
     pub reasoner: Arc<dyn Reasoner>,
     pub config: Arc<Config>,
+    /// Root-cause investigation over the repo index.
+    pub investigator: Arc<crate::rootcause::Investigator>,
+    pub repos: Arc<crate::repos::RepoIndex>,
+    pub browser: Arc<crate::browser::BrowserDriver>,
 }
 
 pub struct ToolDef {
@@ -62,6 +66,14 @@ impl Tools {
             "search" => self.search(args),
             "list_alerts" => self.list_alerts(args),
             "suggest_mitigations" => self.suggest_mitigations(args).await,
+            "list_browser_investigations" => self.list_browser_investigations(args),
+            "get_root_cause" => self.get_root_cause(args),
+            "list_repos" => Ok(json!(self.repos.list()?)),
+            "list_issue_triage" => Ok(json!(self.store.list_issue_triage()?)),
+            "get_issue_triage" => self.get_issue_triage(args),
+            "list_pr_fixes" => Ok(json!(self
+                .store
+                .pr_fixes_for_issue(&req_str(args, "issue_key")?)?)),
             "source_health" => Ok(json!(self.store.source_health()?)),
             "draft_postmortem" => self.draft_postmortem(args).await,
             "distill_memory" => self.distill_memory(args).await,
@@ -70,6 +82,21 @@ impl Tools {
             "split_thread" => self.split_thread(args).await,
             "attach_thread_context" => self.attach_thread_context(args).await,
             "reanalyze" => self.reanalyze(args).await,
+            "record_browser_investigation" => self.record_browser_investigation(args).await,
+            "investigate_root_cause" => self.investigate_root_cause(args).await,
+            "investigate_link" => self.investigate_link(args).await,
+            "refresh_repo_index" => {
+                let summarized = self.repos.sync().await?;
+                Ok(json!({ "ok": true, "summarized": summarized }))
+            }
+            "retriage_issue" => {
+                let key = req_str(args, "issue_key")?;
+                if self.store.get_issue_triage(&key)?.is_none() {
+                    bail!("no assigned issue {key}");
+                }
+                self.store.retriage_issue(&key)?;
+                Ok(json!({ "ok": true, "queued": key }))
+            }
             // ---- grounding ----
             "search_memory" => self.search_memory(args).await,
             "search_context" => self.search_context(args).await,
@@ -204,7 +231,10 @@ impl Tools {
         // work completed, not a production incident. This check deliberately
         // precedes the cache so a stale LLM response cannot keep showing
         // rollback/drain advice after the run turns green.
-        if mitigations::is_successful_ci_only(&signals) {
+        // Not an incident → no mitigations, and this check deliberately precedes
+        // the cache so a stale response can't keep showing rollback advice for a
+        // feature request.
+        if !mitigations::is_incident(&signals) || mitigations::is_work_item_only(&signals) {
             return Ok(json!([]));
         }
         // Tailored LLM mitigations are generated in the background during
@@ -217,6 +247,82 @@ impl Tools {
             }
         }
         Ok(json!(mitigations::suggest(&signals)))
+    }
+
+    fn list_browser_investigations(&self, args: &Value) -> Result<Value> {
+        let thread_id = req_str(args, "thread_id")?;
+        Ok(json!(self
+            .store
+            .browser_investigations_for_thread(&thread_id)?))
+    }
+
+    async fn record_browser_investigation(&self, args: &Value) -> Result<Value> {
+        let id = req_str(args, "id")?;
+        let findings = req_str(args, "findings")?;
+        if findings.trim().is_empty() {
+            bail!("findings cannot be empty");
+        }
+        let investigation = self.store.complete_browser_investigation(&id, &findings)?;
+        if let Some(thread_id) = investigation.thread_id.as_deref() {
+            self.analyst.reanalyze(thread_id).await?;
+        }
+        Ok(json!(investigation))
+    }
+
+    /// Queue (or re-queue) a browser investigation of one link on a thread, so the
+    /// operator can point MuggleBot at a dashboard the watcher didn't pick up.
+    /// The worker picks it up and drives Chrome; this returns immediately.
+    async fn investigate_link(&self, args: &Value) -> Result<Value> {
+        let thread_id = req_str(args, "thread_id")?;
+        let url = req_str(args, "url")?;
+        if !self.browser.enabled() {
+            bail!("browser control is disabled — set [browser].enabled = true");
+        }
+        // Anchor the investigation to a signal so its findings reach the thread the
+        // same way an automatically-queued one does.
+        let signals = self.store.signals_for_thread(&thread_id)?;
+        let anchor = signals
+            .first()
+            .ok_or_else(|| anyhow!("thread {thread_id} has no signals to anchor to"))?;
+        let context = anchor.body.as_deref().unwrap_or(&anchor.title);
+        let queued = self.store.queue_browser_investigation(
+            &anchor.id,
+            &url,
+            self.browser.brief(&url, context).as_str(),
+        )?;
+        Ok(json!(queued))
+    }
+
+    /// Triage for one issue, by `owner/repo#number` — or everything on a thread.
+    fn get_issue_triage(&self, args: &Value) -> Result<Value> {
+        if let Some(key) = opt_str(args, "issue_key") {
+            return Ok(json!(self.store.get_issue_triage(&key)?));
+        }
+        let thread_id = opt_str(args, "thread_id")
+            .ok_or_else(|| anyhow!("provide either `issue_key` or `thread_id`"))?;
+        Ok(json!(self.store.issue_triage_for_thread(&thread_id)?))
+    }
+
+    fn get_root_cause(&self, args: &Value) -> Result<Value> {
+        let thread_id = req_str(args, "thread_id")?;
+        Ok(json!(self.investigator.get(&thread_id)?))
+    }
+
+    /// Run the root-cause investigation for a thread and return the report.
+    /// Slow — it walks the GitHub search and commit APIs — so the UI kicks it off
+    /// and reads the persisted report as it progresses.
+    async fn investigate_root_cause(&self, args: &Value) -> Result<Value> {
+        let thread_id = req_str(args, "thread_id")?;
+        let report = self.investigator.investigate(&thread_id).await?;
+        // Fold the findings into the thread summary, so the board reflects the new
+        // evidence (cited `[cause:REF]`) instead of only the root-cause panel. The
+        // report is already persisted, so a failure here costs nothing.
+        if !report.candidates.as_array().is_none_or(Vec::is_empty) {
+            if let Err(e) = self.analyst.reanalyze(&thread_id).await {
+                tracing::warn!("resummarize after investigating {thread_id} failed: {e:#}");
+            }
+        }
+        Ok(json!(report))
     }
 
     /// Postmortem-assist: draft a postmortem from a thread's timeline + grounding.
@@ -588,11 +694,17 @@ impl Tools {
 
     pub async fn read_resource(&self, uri: &str) -> Result<Value> {
         match uri {
-            "board://current" => Ok(json!({
-                "signals": self.store.recent(200)?,
-                "threads": self.correlator.thread_views(true)?,
-                "health": self.store.source_health()?,
-            })),
+            "board://current" => {
+                // Cache stats ride along here rather than changing `source_health`'s
+                // shape, which clients consume as a plain array.
+                let (entries, hits) = self.store.completion_cache_stats()?;
+                Ok(json!({
+                    "signals": self.store.recent(200)?,
+                    "threads": self.correlator.thread_views(true)?,
+                    "health": self.store.source_health()?,
+                    "completion_cache": { "entries": entries, "hits": hits },
+                }))
+            }
             "config://redacted" => Ok(serde_json::to_value(&*self.config)?),
             "memory://" => Ok(json!(self.memory.list()?)),
             "context://" => Ok(json!(self.context.list()?)),
@@ -641,6 +753,24 @@ pub fn definitions() -> Vec<ToolDef> {
         ToolDef { name: "suggest_mitigations", read_only: true,
             description: "Generate thread-specific first mitigations with the reasoner (grounded in the thread's signals + context, seeded by the generic catalog); falls back to catalog keyword-matching with no reasoner. Suggestions only, never executed.",
             schema: obj(json!({ "thread_id": s() }), &["thread_id"]) },
+        ToolDef { name: "list_browser_investigations", read_only: true,
+            description: "Browser investigations of dashboard links on one thread, with status (pending/running/completed/failed) and the findings read off each page. MuggleBot drives the operator's signed-in Chrome read-only; it never mutates a dashboard.",
+            schema: obj(json!({ "thread_id": s() }), &["thread_id"]) },
+        ToolDef { name: "get_root_cause", read_only: true,
+            description: "The stored root-cause report for a thread: the symptoms searched, repos routed to, and the ranked issue/PR/commit/code candidates with confidences and rationales. Null if none has been run. Candidates are hypotheses with citations, never confirmed causes.",
+            schema: obj(json!({ "thread_id": s() }), &["thread_id"]) },
+        ToolDef { name: "list_issue_triage", read_only: true,
+            description: "Every issue assigned to you that MuggleBot has triaged: what the local coder model made of it after reading the repository's source, the candidate patch approaches it proposed, and the plain-English summary. Assigned issues appear here (and on the board) whether or not they ever produced a notification.",
+            schema: none() },
+        ToolDef { name: "get_issue_triage", read_only: true,
+            description: "Triage for one assigned issue by `issue_key` (owner/repo#number), or every triaged issue on a thread via `thread_id`. Patches are proposed approaches with files, risk, and effort — never applied.",
+            schema: obj(json!({ "issue_key": s(), "thread_id": s() }), &[]) },
+        ToolDef { name: "list_pr_fixes", read_only: true,
+            description: "Open pull requests that may already fix an assigned issue (`issue_key` = owner/repo#number) — often written by somebody else. Each carries what the PR actually implements (read from the diff), a skeptical critique of whether it really fixes the issue, other issues it would also resolve, and which model tier judged it.",
+            schema: obj(json!({ "issue_key": s() }), &["issue_key"]) },
+        ToolDef { name: "list_repos", read_only: true,
+            description: "The repo index: every repository in the watched org with a purpose/symptom card derived by reading its CODE (layout, manifests, module names) rather than its README. This is the routing table that maps a symptom to the repos worth searching.",
+            schema: none() },
         ToolDef { name: "draft_postmortem", read_only: false,
             description: "Draft a blameless postmortem from a thread's timeline + grounding. `save: true` also stores it to memory.",
             schema: obj(json!({ "thread_id": s(), "save": {"type":"boolean"} }), &["thread_id"]) },
@@ -659,6 +789,21 @@ pub fn definitions() -> Vec<ToolDef> {
         ToolDef { name: "reanalyze", read_only: false,
             description: "Force the LLM correlation pass to re-run for a thread. Optional `provider` (anthropic|openai|ollama|ollama_local) and `model` reconsider it on a chosen model for this run only.",
             schema: obj(json!({ "thread_id": s(), "provider": s(), "model": s() }), &["thread_id"]) },
+        ToolDef { name: "record_browser_investigation", read_only: false,
+            description: "Record findings for a browser investigation by hand (the manual path, when the browser worker can't reach Chrome). Writes only MuggleBot's local evidence store and re-analyzes the thread; it never changes the dashboard.",
+            schema: obj(json!({ "id": s(), "findings": s() }), &["id","findings"]) },
+        ToolDef { name: "investigate_root_cause", read_only: false,
+            description: "Find what caused a thread: extract symptoms, route to repos via the README index, search issues/PRs, scan the commit log over the incident window, and rank the candidates — falling back to code search when nothing explains it. Returns hypotheses with citations, never a confirmed cause, and never runs on a handled (snoozed/resolved/acknowledged) thread. Slow; the report is persisted as it progresses.",
+            schema: obj(json!({ "thread_id": s() }), &["thread_id"]) },
+        ToolDef { name: "investigate_link", read_only: false,
+            description: "Queue a read-only browser investigation of one URL on a thread — for a dashboard the watcher didn't pick up automatically. The worker drives the operator's signed-in Chrome (navigate + read only) and files the findings back to the thread.",
+            schema: obj(json!({ "thread_id": s(), "url": s() }), &["thread_id","url"]) },
+        ToolDef { name: "retriage_issue", read_only: false,
+            description: "Re-run triage for an assigned issue (`issue_key` = owner/repo#number): re-pull the code, re-read it, and propose fresh patch approaches. Queued for the worker; returns immediately.",
+            schema: obj(json!({ "issue_key": s() }), &["issue_key"]) },
+        ToolDef { name: "refresh_repo_index", read_only: false,
+            description: "Re-crawl the watched org's repositories, re-characterizing any whose code has moved since it was last read (keyed on the indexed commit, so an unchanged repo costs no model call).",
+            schema: none() },
         ToolDef { name: "distill_memory", read_only: false,
             description: "Summarize a thread down to a single-sentence institutional-memory entry (linked to the thread) and save it. Returns the created memory.",
             schema: obj(json!({ "thread_id": s() }), &["thread_id"]) },
@@ -807,14 +952,18 @@ mod tests {
             "6h".into(),
         ));
         let correlator = Arc::new(Correlator::new(store.clone(), Duration::from_secs(1800)));
+        let (investigator, repos, browser) =
+            crate::rootcause::offline_stack(store.clone(), correlator.clone(), reasoner.clone());
         let analyst = Arc::new(Analyst::new(
             store.clone(),
             correlator.clone(),
+            reasoner.clone(),
             reasoner.clone(),
             memory.clone(),
             context.clone(),
             0.8,
             false,
+            0.6,
             Duration::from_secs(1800),
         ));
         Tools {
@@ -825,6 +974,9 @@ mod tests {
             context,
             reasoner,
             config: Arc::new(Config::default()),
+            investigator,
+            repos,
+            browser,
         }
     }
 

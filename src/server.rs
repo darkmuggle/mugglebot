@@ -300,7 +300,15 @@ async fn call_tool(
 async fn broadcast_after(st: &AppState, tool: &str) {
     let touches_threads = matches!(
         tool,
-        "relate" | "split_thread" | "attach_thread_context" | "reanalyze" | "set_thread_tags"
+        "relate"
+            | "split_thread"
+            | "attach_thread_context"
+            | "reanalyze"
+            | "set_thread_tags"
+            | "record_browser_investigation"
+            // An investigation rewrites the thread's summary (its findings feed the
+            // summary prompt), so the board needs the refreshed view.
+            | "investigate_root_cause"
     );
     if touches_threads {
         if let Ok(views) = st.tools.correlator.thread_views(true) {

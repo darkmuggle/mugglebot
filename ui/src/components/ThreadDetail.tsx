@@ -1,9 +1,19 @@
-import { createEffect, createMemo, createResource, createSignal, For, Show } from "solid-js";
+import { createEffect, createMemo, createResource, createSignal, For, onCleanup, Show } from "solid-js";
 import { api } from "../api";
 import { entityHref } from "../entities";
 import { renderMarkdown } from "../markdown";
 import { hints, patchThreadSignalState, removeHint, setChatSeed, threads } from "../state";
-import type { Edge, Memory, Mitigation, Signal } from "../types";
+import type {
+  BrowserInvestigation,
+  Edge,
+  IssueTriage,
+  Memory,
+  Mitigation,
+  PrFix,
+  RootCauseReport,
+  Signal,
+} from "../types";
+import { AttentionBadge } from "./Attention";
 import { SignalModal, signalHref } from "./SignalModal";
 
 // UI-facing provider labels; the id is what the backend maps to a reasoner.
@@ -13,6 +23,22 @@ const PROVIDERS = [
   { id: "ollama_local", label: "Ollama (Local)" },
   { id: "ollama", label: "Ollama Cloud" },
 ] as const;
+
+// Reuse the signal-state pills so a browser investigation reads like the rest of
+// the board rather than inventing a second status vocabulary.
+const BROWSER_STATE: Record<BrowserInvestigation["status"], string> = {
+  pending: "unseen",
+  running: "seen",
+  completed: "resolved",
+  failed: "unseen",
+};
+
+const TRIAGE_STATE: Record<IssueTriage["status"], string> = {
+  pending: "unseen",
+  running: "seen",
+  complete: "resolved",
+  failed: "unseen",
+};
 
 function successfulCiOnly(signals: Signal[]) {
   if (!signals.length || !signals.every((signal) => {
@@ -72,13 +98,18 @@ function failureSuggestion(signal: Signal): string | null {
   return `${prefix}open the failing job log, address the first error, and rerun the check.`;
 }
 
+// Citation kinds the summary may cite: signals, grounding, dashboard readings,
+// and suspected causes. Keep in sync with the summary prompt in correlation/llm.rs.
+const CITE_KINDS = "sig|ctx|mem|browser|cause";
+const CITE_LABEL: Record<string, string> = { sig: "signal", browser: "dashboard" };
+
 function renderSummary(src: string): string {
   // Citations are evidence metadata, not prose. Collapse adjacent citations so
   // one well-supported sentence does not turn into a row of equal-weight pills.
-  return renderMarkdown(src).replace(/(?:\[(sig|ctx|mem):([^\]\s]+)\])+/g, (group) => {
-    const entries = [...group.matchAll(/\[(sig|ctx|mem):([^\]\s]+)\]/g)];
+  return renderMarkdown(src).replace(new RegExp(`(?:\\[(${CITE_KINDS}):([^\\]\\s]+)\\])+`, "g"), (group) => {
+    const entries = [...group.matchAll(new RegExp(`\\[(${CITE_KINDS}):([^\\]\\s]+)\\]`, "g"))];
     const detail = entries
-      .map(([, kind, id]) => `${kind === "sig" ? "signal" : kind}: ${id}`)
+      .map(([, kind, id]) => `${CITE_LABEL[kind] ?? kind}: ${id}`)
       .join(" · ")
       .replace(/[&<>"]/g, (ch) => ({
         "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;",
@@ -104,6 +135,47 @@ export default function ThreadDetail(props: {
     () => props.id,
     (id) => api.tool<Mitigation[]>("suggest_mitigations", { thread_id: id }),
   );
+  const [browserInvestigations, { refetch: refetchBrowserInvestigations }] = createResource(
+    () => props.id,
+    (id) => api.tool<BrowserInvestigation[]>("list_browser_investigations", { thread_id: id }),
+  );
+  const [rootCause, { refetch: refetchRootCause }] = createResource(
+    () => props.id,
+    (id) => api.tool<RootCauseReport | null>("get_root_cause", { thread_id: id }),
+  );
+  const [triage, { refetch: refetchTriage }] = createResource(
+    () => props.id,
+    (id) => api.tool<IssueTriage[]>("get_issue_triage", { thread_id: id }),
+  );
+  // PR-fix candidates per triaged issue, fetched together so the panel can show
+  // "somebody is already on this" next to the issue it belongs to.
+  const [prFixes, { refetch: refetchPrFixes }] = createResource(
+    () => triage()?.map((t) => t.issue_key).join(","),
+    async (keys) => {
+      const out: Record<string, PrFix[]> = {};
+      for (const key of keys.split(",").filter(Boolean)) {
+        out[key] = await api.tool<PrFix[]>("list_pr_fixes", { issue_key: key }).catch(() => []);
+      }
+      return out;
+    },
+  );
+  // The browser worker and the investigator both run in the background, so poll
+  // while either is in flight rather than leaving a stale "running" on screen.
+  createEffect(() => {
+    const inFlight = (s?: string) => s === "pending" || s === "running";
+    const pending =
+      browserInvestigations()?.some((i) => inFlight(i.status)) ||
+      triage()?.some((t) => inFlight(t.status)) ||
+      rootCause()?.status === "running";
+    if (!pending) return;
+    const timer = setInterval(() => {
+      refetchBrowserInvestigations();
+      refetchRootCause();
+      refetchTriage();
+      refetchPrFixes();
+    }, 5000);
+    onCleanup(() => clearInterval(timer));
+  });
 
   const [ctxText, setCtxText] = createSignal("");
   const [ctxUrl, setCtxUrl] = createSignal("");
@@ -119,6 +191,7 @@ export default function ThreadDetail(props: {
   const [busy, setBusy] = createSignal("");
   const [actionError, setActionError] = createSignal("");
   const [postmortem, setPostmortem] = createSignal<string | null>(null);
+  const [browserFindings, setBrowserFindings] = createSignal<Record<string, string>>({});
   // True while an action that triggers a backend LLM re-analysis is in flight,
   // so the UI can show a "reconsidering" indicator the moment the user acts.
   const [reconsidering, setReconsidering] = createSignal(false);
@@ -196,7 +269,7 @@ export default function ThreadDetail(props: {
         </button>
         <Show when={thread()} fallback={<span class="muted">thread not found (merged?)</span>}>
           <h2 class={`sev-text-${thread()!.severity}`}>{thread()!.title}</h2>
-          <span class={`state state-${thread()!.state}`}>{thread()!.state.toUpperCase()}</span>
+          <AttentionBadge attention={thread()!.attention} />
         </Show>
       </div>
 
@@ -474,6 +547,356 @@ export default function ThreadDetail(props: {
                   SPLIT SELECTED ({selected().size})
                 </button>
               </div>
+            </section>
+
+            {/* What the browser read off any linked dashboard. MuggleBot drives
+                the operator's signed-in Chrome read-only; the manual paste box is
+                the fallback for when it can't reach it. */}
+            <Show when={browserInvestigations()?.length}>
+              <section class="panel browser-investigations">
+                <h3>DASHBOARD READINGS</h3>
+                <For each={browserInvestigations()}>
+                  {(inv) => (
+                    <div class="browser-investigation">
+                      <div class="browser-investigation-head">
+                        <span class={`state state-${BROWSER_STATE[inv.status]}`}>{inv.status}</span>
+                        <a href={inv.url} target="_blank" rel="noreferrer">
+                          open dashboard ↗
+                        </a>
+                        <Show when={inv.attempts > 1}>
+                          <span class="muted">attempt {inv.attempts}</span>
+                        </Show>
+                      </div>
+                      <Show when={inv.status === "running"}>
+                        <p class="muted">Reading the page in your authenticated Chrome…</p>
+                      </Show>
+                      <Show when={inv.status === "pending"}>
+                        <p class="muted">Queued — the browser worker takes one page at a time.</p>
+                      </Show>
+                      <Show when={inv.error}>
+                        <p class="browser-error">{inv.error}</p>
+                      </Show>
+                      <Show
+                        when={inv.findings}
+                        fallback={
+                          <Show when={inv.status === "failed"}>
+                            <div class="browser-findings-entry">
+                              <textarea
+                                placeholder="Paste findings by hand if the browser can't reach the page…"
+                                value={browserFindings()[inv.id] ?? ""}
+                                onInput={(e) =>
+                                  setBrowserFindings((current) => ({
+                                    ...current,
+                                    [inv.id]: e.currentTarget.value,
+                                  }))
+                                }
+                              />
+                              <button
+                                disabled={!browserFindings()[inv.id]?.trim() || busy() !== ""}
+                                onClick={() =>
+                                  run("browser findings", async () => {
+                                    await api.tool("record_browser_investigation", {
+                                      id: inv.id,
+                                      findings: browserFindings()[inv.id],
+                                    });
+                                    await refetchBrowserInvestigations();
+                                  }, true)
+                                }
+                              >
+                                RECORD FINDINGS
+                              </button>
+                            </div>
+                          </Show>
+                        }
+                      >
+                        <div class="browser-findings md" innerHTML={renderMarkdown(inv.findings!)} />
+                      </Show>
+                    </div>
+                  )}
+                </For>
+              </section>
+            </Show>
+
+            {/* Assigned to you: what the code says, and what your options are.
+                Patch options are proposals — nothing here has been applied. */}
+            <For each={triage()}>
+              {(t) => (
+                <section class="panel issue-triage">
+                  <div class="panel-head">
+                    <h3>ASSIGNED · {t.issue_key}</h3>
+                    <div class="row">
+                      <span class={`state state-${TRIAGE_STATE[t.status]}`}>{t.status}</span>
+                      <button
+                        disabled={busy() !== "" || t.status === "running" || t.status === "pending"}
+                        onClick={() =>
+                          run("re-triage", async () => {
+                            await api.tool("retriage_issue", { issue_key: t.issue_key });
+                            await refetchTriage();
+                          })
+                        }
+                      >
+                        RE-TRIAGE
+                      </button>
+                    </div>
+                  </div>
+
+                  <Show when={t.status === "pending"}>
+                    <p class="muted">Queued — the code is read one issue at a time.</p>
+                  </Show>
+                  <Show when={t.status === "running"}>
+                    <p class="muted thinking">Pulling the code and reading it…</p>
+                  </Show>
+                  <Show when={t.error}>
+                    <p class="browser-error">{t.error}</p>
+                  </Show>
+
+                  {/* The plain-English gloss leads: it's the part you read at a
+                      glance. The technical detail sits underneath it. */}
+                  <Show when={t.plain_summary}>
+                    <div class="triage-plain">{t.plain_summary}</div>
+                  </Show>
+                  <Show when={t.characterization}>
+                    <div class="triage-analysis md" innerHTML={renderMarkdown(t.characterization!)} />
+                  </Show>
+
+                  <Show when={t.patches.length}>
+                    <h4 class="triage-heading">
+                      {t.patches.length} POSSIBLE APPROACH{t.patches.length === 1 ? "" : "ES"}
+                      <span class="muted"> — proposals, nothing applied</span>
+                    </h4>
+                    <For each={t.patches}>
+                      {(p, i) => (
+                        <div class="patch">
+                          <div class="patch-head">
+                            <span class="patch-index">{i() + 1}</span>
+                            <span class="patch-title">{p.title}</span>
+                            <span class={`chip effort-${p.effort}`}>{p.effort}</span>
+                            <span class="rc-confidence" title="The model's confidence — a proposal, not a verdict">
+                              {Math.round(p.confidence * 100)}%
+                            </span>
+                          </div>
+                          {/* The mechanism is the check on ecosystem-appropriateness:
+                              "js-yaml parse" vs "ValidatingAdmissionPolicy" is the
+                              difference between a generic answer and a real one. */}
+                          <Show when={p.mechanism}>
+                            <div class="patch-mechanism">
+                              <span class="rc-label">via</span> {p.mechanism}
+                            </div>
+                          </Show>
+                          <div class="patch-approach">{p.approach}</div>
+                          <Show when={p.new_dependency}>
+                            <div class="patch-dep">
+                              adds a new dependency: <code>{p.new_dependency}</code>
+                            </div>
+                          </Show>
+                          <Show when={p.files.length}>
+                            <div class="rc-files">{p.files.join(" · ")}</div>
+                          </Show>
+                          <Show when={p.sketch}>
+                            <pre class="rc-fragment">{p.sketch}</pre>
+                          </Show>
+                          <Show when={p.risk}>
+                            <div class="patch-risk">
+                              <span class="rc-label">risk</span> {p.risk}
+                            </div>
+                          </Show>
+                        </div>
+                      )}
+                    </For>
+                  </Show>
+
+                  {/* Somebody may already be fixing this. Shown after the options
+                      but before the provenance, because it can make the options
+                      moot — and the critique is the part that matters, not the
+                      PR's own claim to close the issue. */}
+                  <Show when={prFixes()?.[t.issue_key]?.length}>
+                    <h4 class="triage-heading">
+                      ALREADY BEING FIXED?
+                      <span class="muted"> — open pull requests that may cover this</span>
+                    </h4>
+                    <For each={prFixes()![t.issue_key]}>
+                      {(pr) => (
+                        <div class={`pr-fix pr-${pr.verdict}`}>
+                          <div class="patch-head">
+                            <span class={`rc-relation pr-verdict-${pr.verdict}`}>{pr.verdict}</span>
+                            <a class="rc-ref" href={pr.pr_url ?? "#"} target="_blank" rel="noreferrer">
+                              {pr.pr_repo}#{pr.pr_number} ↗
+                            </a>
+                            <Show when={pr.pr_author}>
+                              <span class="muted">by {pr.pr_author}</span>
+                            </Show>
+                            <Show when={pr.pr_state === "draft"}>
+                              <span class="chip">draft</span>
+                            </Show>
+                            <span class="rc-confidence" title="Confidence in this judgment">
+                              {Math.round(pr.confidence * 100)}%
+                            </span>
+                          </div>
+                          <div class="patch-title">{pr.pr_title}</div>
+                          <Show when={pr.implementation}>
+                            <div class="patch-approach">
+                              <span class="rc-label">implements</span> {pr.implementation}
+                            </div>
+                          </Show>
+                          <Show when={pr.critique}>
+                            <div class="pr-critique">
+                              <span class="rc-label">critique</span> {pr.critique}
+                            </div>
+                          </Show>
+                          {/* Each entry carries its own justification, so it reads
+                              as a claim you can check rather than a bare list. */}
+                          <Show when={pr.also_fixes.length}>
+                            <div class="pr-also">
+                              <span class="rc-label">also resolves</span>
+                              <For each={pr.also_fixes}>
+                                {(entry) => <div class="pr-also-entry">{entry}</div>}
+                              </For>
+                            </div>
+                          </Show>
+                          <Show when={pr.files.length}>
+                            <div class="rc-files">{pr.files.slice(0, 8).join(" · ")}</div>
+                          </Show>
+                          <Show when={pr.analyzed_by && pr.analyzed_by !== "local"}>
+                            <div class="muted pr-tier">judged by the {pr.analyzed_by} tier</div>
+                          </Show>
+                        </div>
+                      )}
+                    </For>
+                  </Show>
+
+                  {/* The citation for everything above: which commit, which files. */}
+                  <Show when={t.head_sha || t.files.length}>
+                    <div class="triage-provenance">
+                      <Show when={t.head_sha}>
+                        <span class="rc-label">read at</span>
+                        <code>{t.head_sha!.slice(0, 8)}</code>
+                      </Show>
+                      <Show when={t.files.length}>
+                        <span class="rc-label">from</span>
+                        <span>{t.files.length} file{t.files.length === 1 ? "" : "s"}</span>
+                        <details>
+                          <summary class="muted">show</summary>
+                          <div class="rc-files">{t.files.join("\n")}</div>
+                        </details>
+                      </Show>
+                    </div>
+                  </Show>
+                </section>
+              )}
+            </For>
+
+            {/* Root cause: hypotheses with citations, never conclusions. */}
+            <section class="panel root-cause">
+              <div class="panel-head">
+                <h3>ROOT CAUSE</h3>
+                <button
+                  disabled={busy() !== "" || rootCause()?.status === "running"}
+                  onClick={() =>
+                    run("investigate", async () => {
+                      await api.tool("investigate_root_cause", { thread_id: props.id });
+                      await refetchRootCause();
+                    })
+                  }
+                >
+                  {rootCause() ? "RE-INVESTIGATE" : "INVESTIGATE"}
+                </button>
+              </div>
+              <Show
+                when={rootCause()}
+                fallback={
+                  <p class="muted">
+                    Search the indexed repositories for the issue, PR, or commit behind this — and
+                    for the code responsible when nothing has been filed yet.
+                  </p>
+                }
+              >
+                {(report) => (
+                  <>
+                    <Show when={report().status === "running"}>
+                      <p class="muted thinking">Investigating…</p>
+                    </Show>
+                    <Show when={report().symptoms.length}>
+                      <div class="rc-meta">
+                        <span class="rc-label">searched</span>
+                        <For each={report().symptoms}>
+                          {(term) => <span class="chip">{term}</span>}
+                        </For>
+                      </div>
+                    </Show>
+                    <Show when={report().repos.length}>
+                      <div class="rc-meta">
+                        <span class="rc-label">in</span>
+                        <For each={report().repos}>
+                          {(repo) => (
+                            <a
+                              class="chip repo"
+                              href={`https://github.com/${repo}`}
+                              target="_blank"
+                              rel="noreferrer"
+                            >
+                              {repo}
+                            </a>
+                          )}
+                        </For>
+                      </div>
+                    </Show>
+                    <Show when={report().verdict}>
+                      <div class="rc-verdict md" innerHTML={renderMarkdown(report().verdict!)} />
+                    </Show>
+                    <Show when={report().error}>
+                      <p class="browser-error">{report().error}</p>
+                    </Show>
+                    <For each={report().candidates}>
+                      {(c) => (
+                        <div class={`rc-candidate rc-${c.relation}`}>
+                          <div class="rc-head">
+                            <span class={`rc-relation rc-relation-${c.relation}`}>{c.relation}</span>
+                            <span class="rc-kind">{c.kind.replace("_", " ")}</span>
+                            <Show when={c.url} fallback={<span class="rc-ref">{c.reference}</span>}>
+                              <a class="rc-ref" href={c.url!} target="_blank" rel="noreferrer">
+                                {c.reference} ↗
+                              </a>
+                            </Show>
+                            <span
+                              class="rc-confidence"
+                              title="How confident the model is — a hypothesis, not a verdict"
+                            >
+                              {Math.round(c.confidence * 100)}%
+                            </span>
+                          </div>
+                          <div class="rc-title">{c.title}</div>
+                          <Show when={c.rationale}>
+                            <div class="muted">{c.rationale}</div>
+                          </Show>
+                          <div class="rc-facts">
+                            <Show when={c.state}>
+                              <span class="chip">{c.state}</span>
+                            </Show>
+                            <Show when={c.author}>
+                              <span class="muted">{c.author}</span>
+                            </Show>
+                            <Show when={c.when}>
+                              <span class="muted">{c.when!.slice(0, 10)}</span>
+                            </Show>
+                            <For each={c.labels}>{(l) => <span class="chip tag">{l}</span>}</For>
+                          </div>
+                          <Show when={c.files.length}>
+                            <div class="rc-files">{c.files.slice(0, 8).join(" · ")}</div>
+                          </Show>
+                          <Show when={c.fragments?.length}>
+                            <pre class="rc-fragment">{c.fragments!.join("\n")}</pre>
+                          </Show>
+                        </div>
+                      )}
+                    </For>
+                    <Show when={report().status === "complete" && !report().candidates.length}>
+                      <p class="muted">
+                        Nothing in the searched repositories explains this — it looks unreported.
+                      </p>
+                    </Show>
+                  </>
+                )}
+              </Show>
             </section>
 
             <Show when={threadHints().length}>

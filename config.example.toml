@@ -47,6 +47,12 @@ critical_sound = true
 window = "30m"                 # time window for entity-based grouping
 dedup_threshold = 0.8          # min LLM confidence for a "same" verdict
 auto_merge = true              # true → high-confidence "same" verdicts merge duplicate threads
+# New activity on a snoozed/acknowledged/resolved thread is matched by the LOCAL
+# classifier to decide whether the issue has actually recurred. Handled threads are
+# never sent to a cloud model, so this decision is always on-device. Below this
+# confidence the thread stays muted — a false reopen re-raises a notification you
+# deliberately silenced.
+reopen_min_confidence = 0.6
 
 [live]
 debounce = "1m"                # wait after last thread activity before re-analysis
@@ -55,25 +61,175 @@ red_alert = true               # red-alert + Critical notification on high-confi
 red_alert_min_confidence = 0.75
 
 [reasoner]
+# Models are chosen by TASK DIFFICULTY, not by call site. The local model is the
+# default for everything; before running a task it grades how much reasoning the
+# task actually needs, and the grade decides who answers:
+#
+#   easy, medium  -> local alone
+#   hard          -> local drafts, `mid` cleans it up
+#                    (or `mid` does it outright if local fails)
+#   extra_hard    -> `heavy` directly; local doesn't attempt it
+#
+# Grading is itself a local call (~10 output tokens) and is cached per call-site
+# shape, so a task type grades about once per process, not once per invocation.
+#
 # "claude"/"chatgpt" run through the subscription CLI bridge (`claude -p` /
-# `codex exec`) riding your existing login — no API keys. Reasoning about one
-# thread continues as a persistent CLI session per topic. If the CLI binary isn't
-# on PATH, correlation/live-assist degrade to deterministic behavior and the
-# daemon still runs. "ollama_local" is the on-device option (endpoint below);
-# "ollama" is Ollama Cloud (ollama.com), which needs an API key in the Keychain
-# under account "ollama". They're separate providers so a hosted model can't get
-# routed at localhost (404) and vice versa.
-ambient = "claude"            # claude | ollama | ollama_local | chatgpt
-ambient_model = "claude-sonnet-5"
+# `codex exec`) riding your existing login — no API keys. "ollama_local" is the
+# on-device option (endpoint below); "ollama" is Ollama Cloud (ollama.com), which
+# needs an API key in the Keychain under account "ollama". They're separate
+# providers so a hosted model can't get routed at localhost (404) and vice versa.
+#
+# Pull the local model first:  ollama pull deepseek-coder:33b
+local = "ollama_local"        # claude | ollama | ollama_local | chatgpt
+local_model = "deepseek-coder:33b"
+mid = "claude"
+mid_model = "claude-sonnet-5"
 heavy = "claude"
 heavy_model = "claude-opus-4-8"
+# Plain-English rewriting only — turning an analysis another model already did
+# into something readable at a glance. Not a reasoning tier, which is why a small
+# fast model is the right choice here.
+brief = "claude"
+brief_model = "claude-haiku-4-5"
+
 # On-device Ollama endpoint (used by "ollama_local" and by local_only_sources).
 ollama_url = "http://127.0.0.1:11434"
 # Ollama Cloud host (used by the "ollama" provider). Requires the API key in the
 # Keychain under account "ollama"; hosted models are listed once it's set.
 ollama_cloud_url = "https://ollama.com"
-ollama_model = "llama3.1"
+ollama_model = "deepseek-coder:33b"  # local_only_sources
+# Embeddings are a DIFFERENT capability from chat: coder and chat models have no
+# embedding head and answer /api/embeddings with a 500. Keep this pointed at a real
+# embedding model — `ollama pull nomic-embed-text`. If it fails, recall silently
+# degrades to the built-in lexical hashing embedder rather than breaking.
+embed_model = "nomic-embed-text"
 local_only_sources = []       # pin sensitive sources here to force on-device Ollama
+
+# NOTE: some work is pinned on-device regardless of grade, because it must never
+# reach a cloud model at all — tag classification, repo-index code crawling, and
+# the reopen-matching pass over snoozed/handled threads. Those bypass routing.
+#
+# The [reasoner.*] sub-tables below must stay LAST in this section: in TOML every
+# key after a sub-table header belongs to that sub-table, so a plain `[reasoner]`
+# key written below one would silently become e.g. a routing key and be ignored.
+
+# Reuse of previously-computed answers. MuggleBot re-reasons constantly — a thread
+# is re-analyzed on every new signal, the same call sites get graded, a restart
+# replays work already done — and most of those requests are byte-identical to one
+# already answered. Identical request in, stored answer out, no model involved.
+# Persisted in SQLite, because a restart is exactly when you most want the answers
+# back. Deliberate redos ("reconsider on model X", "re-triage", chat) bypass it.
+[reasoner.cache]
+enabled = true
+ttl = "24h"            # how long an answer stays reusable
+max_entries = 5000     # LRU ceiling; 0 disables the size cap
+
+[reasoner.routing]
+enabled = true         # false → everything runs on the local model, ungraded
+cleanup = true         # false → a `hard` local draft is returned as-is (fully local)
+cloud_fallback = true  # false → a local outage errors instead of escalating, and
+                       # nothing leaves the machine; callers' deterministic
+                       # fallbacks still apply
+
+[investigation]
+# Root-cause investigation: index the org's repos by READING THEIR CODE (layout,
+# manifests, module names — not the README, which states intent and goes stale),
+# then search issues/PRs and the commit log for what caused an incident. Needs the
+# "github" credential (a token with `repo` read access for private repos) and `git`
+# on PATH.
+enabled = true
+org = "restatedev"
+refresh_interval = "24h"       # code re-read cadence. Characterizations are cached
+                               # against the commit they were built from, so an
+                               # unchanged repo costs a shallow fetch and no model call
+default_repos = ["restatedev/restate"]  # where to look when nothing else matches
+skip_stale_repos = true        # don't check out repos with no push in a year…
+stale_repo_days = 365          # …but keep them indexed as metadata
+commit_window = "72h"          # how far before the first signal to scan the log
+code_search = true             # if no issue/PR/commit explains it, find the code
+shortlist_size = 8             # candidates the LOCAL pass forwards to the cloud
+                               # model for the final verdict — the escalation
+                               # boundary; crawling and filtering stay on-device
+
+# Deterministic symptom→repo routes, applied before the model reads the index.
+# Key = case-insensitive substring of the symptom text; value = repos it routes to.
+# Everything not matched here is routed by the classifier reading the README cards.
+[investigation.routes]
+cloud = ["restatedev/restate-cloud"]
+environment = ["restatedev/restate-cloud"]
+provisioning = ["restatedev/restate-cloud"]
+"control plane" = ["restatedev/restate-cloud"]
+"restate runtime" = ["restatedev/restate"]
+invocation = ["restatedev/restate"]
+"partition processor" = ["restatedev/restate"]
+
+[assigned]
+# Issues assigned to you on GitHub. Assignment is a standing state, not an event:
+# an issue assigned three weeks ago with no activity since produces no
+# notification at all — which is exactly the one likely to have fallen off your
+# radar. So these are polled directly and ALWAYS get a board card, whether or not
+# a notification ever existed.
+#
+# Each one is then triaged against the real source: the repo is checked out
+# (shallow, read-only), the local coder model reads the code and characterizes the
+# issue, proposes `patches` distinct approaches, and the `brief` model renders it
+# in plain English. Patches are proposals with files/risk/effort — never applied,
+# and nothing is ever pushed to a repository. Needs `git` on PATH.
+enabled = true
+poll_interval = "5m"
+checkout_dir = "repos"         # relative paths resolve under general.data_dir
+max_checkout_mb = 500          # refuse to clone anything bigger (per repo, judged
+                               # from GitHub's reported size)
+# Ceiling on the WHOLE checkout cache. Indexing an org means a clone per repo, and
+# the per-repo limit says nothing about their sum — measured on a real org, five
+# repos came to 427MB (one docs site alone was 335MB of assets). Over budget,
+# least-recently-used checkouts are evicted. 0 disables the cap.
+max_cache_mb = 5000
+patches = 3                    # how many distinct approaches to ask for
+# Sized for a LOCAL coder model's context window, not for coverage. An over-large
+# source dump pushes the instructions and the issue out of the front of the window,
+# and the model answers "describe this code" instead of the question you asked.
+# Raise these only if you point `local_model` at something with a bigger context.
+max_files = 6                  # source files shown to the model
+max_file_chars = 3000          # per-file budget, so one big file can't crowd out the rest
+retriage_on_new_commits = true
+# Scan the repo's OPEN pull requests for one that already fixes the issue — often
+# somebody else's. Reads each candidate's diff, states what it implements,
+# critiques whether it really fixes the issue, and notes what else it would
+# resolve. Local model first; escalates to `brief` then the routed tier only if
+# the local pass can't produce a usable answer.
+check_open_prs = true
+
+[browser]
+# Authenticated browser control. When a Slack alert links to a dashboard, the page
+# behind that link holds the actual numbers — and it's behind SSO. MuggleBot drives
+# your ALREADY SIGNED-IN Chrome over the DevTools Protocol, via the agent CLI with a
+# browser MCP server attached.
+#
+# Start Chrome with the debug port first (once, and keep it running):
+#   "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" --remote-debugging-port=9222
+#
+# Note this is NOT the Claude-in-Chrome / ChatGPT-Atlas extension: those attach a
+# model to a tab from inside the browser UI and can't be handed a URL by a daemon.
+# The CLI + CDP path reaches the same authenticated page and is automatable.
+#
+# READ-ONLY BY CONSTRUCTION: `allowed_tools` grants navigate/read/screenshot and
+# never click/fill/evaluate, and `--strict-mcp-config` means your own MCP servers
+# (and their write tools) are not inherited. An investigation cannot acknowledge or
+# silence an alert even if the page tries to talk it into doing so.
+enabled = false
+agent = "claude"               # claude (`claude -p`) | chatgpt (`codex exec`)
+model = "claude-sonnet-5"
+browser_url = "http://127.0.0.1:9222"
+mcp_command = "npx"
+mcp_args = ["-y", "chrome-devtools-mcp@latest"]
+allowed_tools = [
+  "navigate_page", "take_snapshot", "take_screenshot",
+  "list_console_messages", "list_network_requests", "wait_for",
+]
+url_patterns = ["grafana"]     # link substrings worth opening a browser for
+timeout = "5m"                 # hard cap per investigation, then the agent is killed
+max_attempts = 3               # give up on a link after this many failures
 
 [mcp]
 stdio = true

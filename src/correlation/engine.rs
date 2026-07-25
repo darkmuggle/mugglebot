@@ -8,7 +8,7 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Duration;
 
-use super::{Thread, ThreadView};
+use super::{Attention, Decorations, Thread, ThreadView};
 use crate::signal::{Entity, Severity, Signal, State};
 use crate::store::Store;
 
@@ -31,25 +31,16 @@ impl Correlator {
             return Ok(existing.clone());
         }
         let keys = entity_keys(&s.entities);
-        // An environment id (`env-2…`/`acc-1…`/`org-1…`) is the authoritative
-        // grouping key: when a signal names one, match strictly on it so every
-        // alert about that tenant collapses onto its one thread — bypassing the
-        // general most-shared-entity match (and, downstream, the fuzzy LLM
-        // regrouping) that a signal without such a strong anchor would need.
-        let env_keys: BTreeSet<String> = keys
-            .iter()
-            .filter(|k| k.starts_with("environment:"))
-            .cloned()
-            .collect();
-        let match_keys = if env_keys.is_empty() {
-            &keys
-        } else {
-            &env_keys
-        };
+        // Match strictly on the signal's *strongest* identity, so the hierarchy
+        // (environment > issue > PR > branch) actually decides grouping rather
+        // than being outvoted by a count of weaker shared entities. A signal
+        // naming issue #412 belongs to #412's thread even if some branch it also
+        // mentions happens to match elsewhere.
+        let match_keys = controlling_keys(&keys);
         let matched = if match_keys.is_empty() {
             None
         } else {
-            self.best_matching_thread(s, match_keys)?
+            self.best_matching_thread(s, &match_keys)?
         };
 
         let now = Utc::now();
@@ -88,32 +79,55 @@ impl Correlator {
         Ok(thread_id)
     }
 
-    /// Find the existing thread whose members (within the window) share the most
-    /// entities with `s`. Ties broken by recency.
+    /// Find the existing thread whose members share the most entities with `s`,
+    /// within the correlation window **of `s` itself**. Ties broken by recency.
+    ///
+    /// The window is measured around `s.occurred_at`, not around wall-clock now.
+    /// Anchoring it to `now` silently breaks every catch-up ingest: on a first
+    /// poll, a restart, or any backlog, signals arrive hours after they happened,
+    /// so a `now - 30m` cutoff excludes *all* of them — every signal looks like it
+    /// has no neighbours and each gets its own thread. That failure is invisible
+    /// (no error, just fragmented threads) and is exactly what produces a board
+    /// full of near-identical one-signal cards.
     fn best_matching_thread(&self, s: &Signal, keys: &BTreeSet<String>) -> Result<Option<String>> {
-        let since = Utc::now() - chrono::Duration::from_std(self.window).unwrap_or_default();
-        let candidates = self.store.signals_since(since)?;
-        let mut best: Option<(usize, chrono::DateTime<Utc>, String)> = None;
+        let window = chrono::Duration::from_std(self.window).unwrap_or_default();
+        let candidates = self.store.signals_since(s.occurred_at - window)?;
+        let mut best: Option<(u8, usize, chrono::DateTime<Utc>, String)> = None;
         for c in candidates {
             if c.id == s.id {
+                continue;
+            }
+            // Both directions: a backlog can deliver signals newest-first, so a
+            // candidate may legitimately be *after* the one being placed.
+            if (c.occurred_at - s.occurred_at).abs() > window {
                 continue;
             }
             let Some(tid) = c.thread.clone() else {
                 continue;
             };
-            let shared = entity_keys(&c.entities).intersection(keys).count();
+            let candidate_keys = entity_keys(&c.entities);
+            let shared = candidate_keys.intersection(keys).count();
             if shared == 0 {
                 continue;
             }
+            // Prefer a match on the strongest shared identity. Sharing an issue
+            // outranks sharing a PR, which outranks sharing a branch — so a CI run
+            // whose branch also appears on an unrelated thread still lands on the
+            // issue's thread when both are candidates.
+            let strength = candidate_keys
+                .intersection(keys)
+                .map(|k| identity_rank(k))
+                .max()
+                .unwrap_or(0);
             let better = match &best {
                 None => true,
-                Some((bs, bt, _)) => shared > *bs || (shared == *bs && c.occurred_at > *bt),
+                Some((bstr, bs, bt, _)) => (strength, shared, c.occurred_at) > (*bstr, *bs, *bt),
             };
             if better {
-                best = Some((shared, c.occurred_at, tid));
+                best = Some((strength, shared, c.occurred_at, tid));
             }
         }
-        Ok(best.map(|(_, _, tid)| tid))
+        Ok(best.map(|(_, _, _, tid)| tid))
     }
 
     /// Recompute a thread's deterministic title/summary and bump `updated_at`,
@@ -179,6 +193,7 @@ impl Correlator {
         let state = aggregate_state(&signals);
         let edges = self.store.edges_for_thread(thread_id)?;
         let context = self.store.thread_context(thread_id)?;
+        let attention = self.attention(&thread, &signals, severity, state)?;
         Ok(Some(ThreadView {
             thread,
             signals,
@@ -187,7 +202,110 @@ impl Correlator {
             state,
             edges,
             context,
+            attention,
         }))
+    }
+
+    /// Derive the two things the board actually reports: whether this needs the
+    /// operator, and what the AI has made of it.
+    ///
+    /// Both are computed rather than stored. A stored "needs attention" flag drifts
+    /// the moment a signal is acknowledged elsewhere, and a stored "AI done" flag
+    /// lies after a failed pass — deriving them from the artifacts that actually
+    /// exist means the badge can't disagree with the panel underneath it.
+    fn attention(
+        &self,
+        thread: &Thread,
+        signals: &[Signal],
+        severity: Severity,
+        state: State,
+    ) -> Result<Attention> {
+        let mut decorated = Decorations {
+            // `last_reasoned_at` distinguishes a real grounded summary from the
+            // deterministic one-liner every thread gets for free.
+            summary: thread.last_reasoned_at.is_some(),
+            tags: !thread.tags.is_empty(),
+            mitigations: self
+                .store
+                .get_thread_mitigations(&thread.id)?
+                .is_some_and(|m| m.as_array().is_some_and(|a| !a.is_empty())),
+            dashboard: self
+                .store
+                .browser_investigations_for_thread(&thread.id)?
+                .iter()
+                .any(|i| i.findings.as_deref().is_some_and(|f| !f.trim().is_empty())),
+            root_cause: self
+                .store
+                .get_root_cause(&thread.id)?
+                .map(|r| r.status.clone()),
+            ..Default::default()
+        };
+        let triage_rows = self.store.issue_triage_for_thread(&thread.id)?;
+        decorated.triage = triage_rows.first().map(|t| t.status.clone());
+        for row in &triage_rows {
+            let judged = self.store.pr_fixes_for_issue(&row.issue_key)?;
+            decorated.prs_judged += judged.len();
+            // The tier that answered is recorded per judgment, so cost attribution
+            // is real rather than assumed.
+            for fix in &judged {
+                match fix.analyzed_by.as_deref() {
+                    Some("local") | None => decorated.local_passes += 1,
+                    _ => decorated.cloud_passes += 1,
+                }
+            }
+        }
+        // Tag classification, triage, and root-cause searching are on-device by
+        // policy; summaries and mitigations go through the routed tier.
+        if decorated.tags {
+            decorated.local_passes += 1;
+        }
+        if decorated.triage.as_deref() == Some("complete") {
+            decorated.local_passes += 1;
+        }
+        if decorated.root_cause.as_deref() == Some("complete") {
+            decorated.local_passes += 1;
+        }
+        if decorated.summary {
+            decorated.cloud_passes += 1;
+        }
+        if decorated.mitigations {
+            decorated.cloud_passes += 1;
+        }
+        if decorated.dashboard {
+            decorated.cloud_passes += 1;
+        }
+
+        // Attention. Handled work never asks for attention — that is what handling
+        // it meant.
+        let (needed, reason) = if matches!(state, State::Resolved | State::Snoozed) {
+            (false, None)
+        } else if self
+            .store
+            .list_hints(Some(&thread.id))?
+            .iter()
+            .any(|h| matches!(h.kind, crate::live::HintKind::Flag))
+        {
+            (
+                true,
+                Some("live-assist flagged something you said".to_string()),
+            )
+        } else if severity >= Severity::Critical {
+            (true, Some("critical".to_string()))
+        } else if severity >= Severity::Warning {
+            (true, Some("warning".to_string()))
+        } else if signals.iter().any(|s| s.is_user_engaged()) {
+            (true, Some("you're in this one".to_string()))
+        } else if triage_rows.iter().any(|t| t.status != "complete") {
+            (true, Some("assigned to you".to_string()))
+        } else {
+            // Informational, or already acknowledged: on the board, not asking.
+            (false, None)
+        };
+        Ok(Attention {
+            needed,
+            reason,
+            decorated,
+        })
     }
 
     /// All threads as views, newest activity first. `active_only` drops threads
@@ -218,10 +336,62 @@ impl Correlator {
 /// `slack_thread`, `meeting`, …).
 const CONTEXT_ONLY_KINDS: &[&str] = &["repo", "channel", "person"];
 
+/// Default branch names. A branch entity is a *topic* only when it's a feature
+/// branch: `main` is shared by every CI run in a repository forever, so grouping
+/// on it would collapse the repo's entire history into one thread — the same
+/// failure `repo` is excluded for. CI on a default branch is instead attributed to
+/// the merged PR (and through it the issue) that produced the commit; see
+/// [`crate::watchers::github`].
+const DEFAULT_BRANCHES: &[&str] = &["main", "master", "trunk", "develop", "development"];
+
+/// How authoritative an identity is, highest first. This is the precedence the
+/// board is built on:
+///
+/// **issue > pull request > branch.**
+///
+/// An issue is the durable statement of *what the work is*; a PR is one attempt at
+/// it; a branch is where that attempt happens. So when a signal can be attributed
+/// upward — a branch to its PR, a PR to the issue it closes — it must be, and the
+/// highest available identity is what groups it. Otherwise CI runs cluster by
+/// branch, PRs cluster separately, and the issue everyone is actually working on
+/// ends up as a fourth card with none of the activity attached to it.
+///
+/// `environment` sits at the top for tenant alerts: an env id names a specific
+/// customer's environment, which is the most specific thing an alert can be about.
+pub(crate) fn identity_rank(key: &str) -> u8 {
+    match key.split_once(':').map(|(kind, _)| kind).unwrap_or("") {
+        "environment" => 5,
+        "issue" => 4,
+        "pr" => 3,
+        "discussion" => 3,
+        "branch" | "commit" => 2,
+        "slack_thread" | "meeting" => 2,
+        _ => 1,
+    }
+}
+
+/// The subset of `keys` at the highest identity rank present.
+///
+/// Matching strictly on these is what makes the hierarchy real: a signal carrying
+/// both `issue:repo#412` and `branch:repo@fix-pool` groups by the *issue*, and will
+/// not be pulled onto a branch-only thread just because the branch also matches.
+fn controlling_keys(keys: &BTreeSet<String>) -> BTreeSet<String> {
+    let Some(top) = keys.iter().map(|k| identity_rank(k)).max() else {
+        return BTreeSet::new();
+    };
+    keys.iter()
+        .filter(|k| identity_rank(k) == top)
+        .cloned()
+        .collect()
+}
+
 pub(crate) fn entity_keys(entities: &[Entity]) -> BTreeSet<String> {
     entities
         .iter()
-        .filter(|e| !CONTEXT_ONLY_KINDS.contains(&e.kind.to_ascii_lowercase().as_str()))
+        .filter(|e| {
+            let kind = e.kind.to_ascii_lowercase();
+            !CONTEXT_ONLY_KINDS.contains(&kind.as_str()) && !is_default_branch(&kind, &e.value)
+        })
         .map(|e| {
             format!(
                 "{}:{}",
@@ -230,6 +400,16 @@ pub(crate) fn entity_keys(entities: &[Entity]) -> BTreeSet<String> {
             )
         })
         .collect()
+}
+
+/// Is this entity a repository's default branch (`owner/repo@main`)? Those are
+/// context, not identity — see [`DEFAULT_BRANCHES`].
+fn is_default_branch(kind: &str, value: &str) -> bool {
+    if kind != "branch" {
+        return false;
+    }
+    let branch = value.rsplit_once('@').map(|(_, b)| b).unwrap_or(value);
+    DEFAULT_BRANCHES.contains(&branch.to_ascii_lowercase().as_str())
 }
 
 /// Entity kinds that exist only as internal grouping keys and carry no display
@@ -477,6 +657,168 @@ mod tests {
         assert_eq!(
             tgh, tslack,
             "shared PR entity unifies Slack chatter with GitHub"
+        );
+    }
+
+    /// The bug that produced a board full of near-identical one-signal cards: the
+    /// window was measured from wall-clock `now`, so any catch-up ingest (first
+    /// poll, restart, backlog) placed every signal in its own thread because they
+    /// all looked older than the cutoff.
+    /// Re-runs correlation over a real signal corpus and reports the grouping.
+    ///
+    /// Ignored by default (it needs a database): point `MUGGLEBOT_REGROUP_DB` at a
+    /// copy of a live store and run
+    /// `cargo test regroup_real_corpus -- --ignored --nocapture`.
+    /// Kept because the failure this guards against — fragmented threads — is only
+    /// visible at corpus scale, not in a two-signal unit test.
+    #[test]
+    #[ignore = "needs MUGGLEBOT_REGROUP_DB pointing at a store copy"]
+    fn regroup_real_corpus() {
+        let path = match std::env::var("MUGGLEBOT_REGROUP_DB") {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        let store = Arc::new(Store::open(std::path::Path::new(&path)).unwrap());
+        let c = Correlator::new(store.clone(), Duration::from_secs(1800));
+
+        let mut signals = store.recent(100_000).unwrap();
+        // Oldest first, the order ingest sees live.
+        signals.sort_by_key(|s| s.occurred_at);
+        let total = signals.len();
+        for s in &signals {
+            let mut s = s.clone();
+            s.thread = None;
+            store.set_signal_thread(&s.id, None).unwrap();
+            c.ingest(&s).unwrap();
+        }
+
+        let mut by_thread: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+        for s in store.recent(100_000).unwrap() {
+            if let Some(t) = s.thread {
+                by_thread.entry(t).or_default().push(s.title);
+            }
+        }
+        let singletons = by_thread.values().filter(|v| v.len() == 1).count();
+        println!(
+            "REGROUP: {total} signals -> {} threads ({singletons} singletons)",
+            by_thread.len()
+        );
+        for (tid, titles) in by_thread.iter().filter(|(_, v)| v.len() > 1) {
+            println!("  {tid}  x{}", titles.len());
+            for title in titles.iter().take(4) {
+                println!("      {}", &title[..title.len().min(70)]);
+            }
+        }
+    }
+
+    #[test]
+    fn backlog_ingest_still_correlates() {
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let correlator = Correlator::new(store.clone(), Duration::from_secs(1800));
+        let hours_ago = Utc::now() - chrono::Duration::hours(8);
+        let topic = || vec![Entity::new("pr", "octo/repo#17")];
+
+        let mut a = sig("1", topic());
+        a.occurred_at = hours_ago;
+        let mut b = sig("2", topic());
+        b.occurred_at = hours_ago + chrono::Duration::minutes(10);
+
+        store.insert_signal(&a).unwrap();
+        store.insert_signal(&b).unwrap();
+        let ta = correlator.ingest(&a).unwrap();
+        let tb = correlator.ingest(&b).unwrap();
+        assert_eq!(
+            ta, tb,
+            "signals 10 minutes apart must group even when ingested hours later"
+        );
+    }
+
+    /// Two signals genuinely far apart in time are still separate topics.
+    #[test]
+    fn the_window_still_separates_distant_signals() {
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let correlator = Correlator::new(store.clone(), Duration::from_secs(1800));
+        let topic = || vec![Entity::new("pr", "octo/repo#17")];
+        let mut a = sig("1", topic());
+        a.occurred_at = Utc::now() - chrono::Duration::hours(8);
+        let mut b = sig("2", topic());
+        b.occurred_at = Utc::now();
+        store.insert_signal(&a).unwrap();
+        store.insert_signal(&b).unwrap();
+        assert_ne!(
+            correlator.ingest(&a).unwrap(),
+            correlator.ingest(&b).unwrap()
+        );
+    }
+
+    /// issue > pr > branch. A signal naming an issue belongs to the issue's thread
+    /// even when a weaker identity it also carries matches somewhere else.
+    #[test]
+    fn the_strongest_identity_controls_grouping() {
+        assert!(identity_rank("issue:o/r#1") > identity_rank("pr:o/r#2"));
+        assert!(identity_rank("pr:o/r#2") > identity_rank("branch:o/r@fix"));
+        assert!(identity_rank("environment:env-2abc") > identity_rank("issue:o/r#1"));
+
+        let keys: BTreeSet<String> = ["issue:o/r#1", "pr:o/r#2", "branch:o/r@fix"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let controlling = controlling_keys(&keys);
+        assert_eq!(controlling.len(), 1);
+        assert!(controlling.contains("issue:o/r#1"));
+    }
+
+    /// `main` is shared by every CI run in a repo forever — grouping on it would
+    /// collapse the repo's whole history into one thread, the same reason `repo` is
+    /// excluded.
+    #[test]
+    fn a_default_branch_is_not_an_identity() {
+        let keys = entity_keys(&[
+            Entity::new("branch", "octo/repo@main"),
+            Entity::new("repo", "octo/repo"),
+        ]);
+        assert!(keys.is_empty(), "main + repo are both context: {keys:?}");
+
+        // A feature branch is a real identity.
+        let keys = entity_keys(&[Entity::new("branch", "octo/repo@fix/pool-leak")]);
+        assert_eq!(keys.len(), 1);
+    }
+
+    /// CI resolved up to its PR, and the PR up to its issue, must land on the
+    /// issue's thread — that is the whole point of the hierarchy.
+    #[test]
+    fn ci_attributed_to_an_issue_joins_that_issues_thread() {
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let correlator = Correlator::new(store.clone(), Duration::from_secs(1800));
+        let now = Utc::now();
+
+        // The issue's own notification.
+        let mut issue = sig(
+            "issue",
+            vec![
+                Entity::new("issue", "octo/repo#412"),
+                Entity::new("repo", "octo/repo"),
+            ],
+        );
+        issue.occurred_at = now;
+        store.insert_signal(&issue).unwrap();
+        let issue_thread = correlator.ingest(&issue).unwrap();
+
+        // A CI run resolved branch → PR → issue: issue controls, PR rides along.
+        let mut ci = sig(
+            "ci",
+            vec![
+                Entity::new("issue", "octo/repo#412"),
+                Entity::new("pr", "octo/repo#500"),
+                Entity::new("repo", "octo/repo"),
+            ],
+        );
+        ci.occurred_at = now + chrono::Duration::minutes(5);
+        store.insert_signal(&ci).unwrap();
+        assert_eq!(
+            correlator.ingest(&ci).unwrap(),
+            issue_thread,
+            "CI attributed to an issue must join that issue's thread"
         );
     }
 

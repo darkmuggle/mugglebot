@@ -112,6 +112,10 @@ impl ChatAgent {
                 // Chat carries its full history in `messages`, so no CLI session
                 // (that would double the context).
                 session: None,
+                // Chat is a conversation, not a recomputation: asking the same
+                // question twice should get a fresh answer over whatever the board
+                // looks like now, not a replay of the earlier one.
+                no_cache: true,
             };
             let text = reasoner.complete(&req).await?;
             let Some(action) = reasoner::extract_json(&text) else {
@@ -263,14 +267,18 @@ mod tests {
             "6h".into(),
         ));
         let correlator = Arc::new(Correlator::new(store.clone(), Duration::from_secs(1800)));
+        let (investigator, repos, browser) =
+            crate::rootcause::offline_stack(store.clone(), correlator.clone(), reasoner.clone());
         let analyst = Arc::new(Analyst::new(
             store.clone(),
             correlator.clone(),
+            reasoner.clone(),
             reasoner.clone(),
             memory.clone(),
             context.clone(),
             0.8,
             false,
+            0.6,
             Duration::from_secs(1800),
         ));
         Arc::new(Tools {
@@ -281,6 +289,9 @@ mod tests {
             context,
             reasoner,
             config: Arc::new(crate::config::Config::default()),
+            investigator,
+            repos,
+            browser,
         })
     }
 

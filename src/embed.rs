@@ -59,6 +59,8 @@ pub struct OllamaEmbedder {
     url: String,
     model: String,
     api_key: Option<String>,
+    /// Set once the fallback warning has been logged.
+    warned: std::sync::atomic::AtomicBool,
 }
 
 impl OllamaEmbedder {
@@ -68,15 +70,40 @@ impl OllamaEmbedder {
             url: url.into(),
             model: model.into(),
             api_key: api_key.filter(|k| !k.trim().is_empty()),
+            warned: std::sync::atomic::AtomicBool::new(false),
         }
     }
 }
 
 #[async_trait]
 impl Embedder for OllamaEmbedder {
+    /// Embed `text`, degrading to the hashing embedder rather than failing.
+    ///
+    /// Not every Ollama model has an embedding head — a *coder* or chat model
+    /// answers `/api/embeddings` with a 500. Propagating that would break every
+    /// caller that stores or recalls an embedding (saving a memory, searching
+    /// context) over what is really a configuration mismatch. Recall quality
+    /// degrades to lexical; nothing stops working.
     async fn embed(&self, text: &str) -> Result<Vec<f32>> {
+        match self.try_embed(text).await {
+            Ok(v) if !v.is_empty() => Ok(v),
+            Ok(_) => {
+                self.warn_once("returned an empty vector");
+                Ok(HashEmbedder::embed_sync(text))
+            }
+            Err(e) => {
+                self.warn_once(&format!("{e:#}"));
+                Ok(HashEmbedder::embed_sync(text))
+            }
+        }
+    }
+}
+
+impl OllamaEmbedder {
+    async fn try_embed(&self, text: &str) -> Result<Vec<f32>> {
         #[derive(serde::Deserialize)]
         struct Resp {
+            #[serde(default)]
             embedding: Vec<f32>,
         }
         let mut req_b = self
@@ -99,6 +126,21 @@ impl Embedder for OllamaEmbedder {
         l2_normalize(&mut v);
         Ok(v)
     }
+
+    /// Complain once, not once per embedded string. A misconfigured embedding model
+    /// fails on *every* call, and the fallback is silent by design — so the log
+    /// needs to say it exactly once, with the fix.
+    fn warn_once(&self, detail: &str) {
+        if self.warned.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
+        tracing::warn!(
+            "embeddings via '{}' failed ({detail}); falling back to the local hashing embedder. \
+             Set [reasoner].embed_model to a real embedding model (e.g. `ollama pull \
+             nomic-embed-text`) — chat and coder models have no embedding head.",
+            self.model
+        );
+    }
 }
 
 /// Build the configured embedder. Falls back to the local hashing embedder for
@@ -106,11 +148,11 @@ impl Embedder for OllamaEmbedder {
 pub fn build(
     provider: &str,
     ollama_url: &str,
-    ollama_model: &str,
+    embed_model: &str,
     ollama_key: Option<String>,
 ) -> Arc<dyn Embedder> {
     match provider {
-        "ollama" => Arc::new(OllamaEmbedder::new(ollama_url, ollama_model, ollama_key)),
+        "ollama" => Arc::new(OllamaEmbedder::new(ollama_url, embed_model, ollama_key)),
         _ => Arc::new(HashEmbedder),
     }
 }

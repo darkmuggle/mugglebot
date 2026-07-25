@@ -16,7 +16,7 @@ use super::{ContextKind, Correlator, Edge, Provenance, RelationKind, ThreadConte
 use crate::context::{ContextManager, ContextSourceKind};
 use crate::memory::MemoryManager;
 use crate::reasoner::{self, CompletionRequest, Reasoner};
-use crate::signal::Signal;
+use crate::signal::{Signal, State};
 use crate::store::Store;
 use crate::tags;
 
@@ -33,10 +33,17 @@ pub struct Analyst {
     store: Arc<Store>,
     correlator: Arc<Correlator>,
     reasoner: Arc<dyn Reasoner>,
+    /// The **local** classifier (Ollama). Two jobs live here, both deliberately
+    /// off the cloud: tag/classification passes (high volume, mechanical) and the
+    /// reopen-matching pass over handled threads, which by policy must never reach
+    /// a cloud model at all.
+    classifier: Arc<dyn Reasoner>,
     memory: Arc<MemoryManager>,
     context: Arc<ContextManager>,
     dedup_threshold: f64,
     auto_merge: bool,
+    /// Minimum local-classifier confidence to reopen a handled thread.
+    reopen_min_confidence: f64,
     /// Widened window for candidate discovery relative to grouping.
     window: Duration,
 }
@@ -47,20 +54,24 @@ impl Analyst {
         store: Arc<Store>,
         correlator: Arc<Correlator>,
         reasoner: Arc<dyn Reasoner>,
+        classifier: Arc<dyn Reasoner>,
         memory: Arc<MemoryManager>,
         context: Arc<ContextManager>,
         dedup_threshold: f64,
         auto_merge: bool,
+        reopen_min_confidence: f64,
         window: Duration,
     ) -> Self {
         Self {
             store,
             correlator,
             reasoner,
+            classifier,
             memory,
             context,
             dedup_threshold,
             auto_merge,
+            reopen_min_confidence,
             window,
         }
     }
@@ -76,6 +87,15 @@ impl Analyst {
     /// board's "reconsider with model X" uses this to re-run the summary and
     /// relation judgments on a chosen provider/model without changing the daemon's
     /// configured reasoners. `None` uses the analyst's default (heavy) reasoner.
+    ///
+    /// **Handled threads are never reasoned over.** A snoozed, resolved, or
+    /// acknowledged thread is settled work; re-summarizing it, re-judging its
+    /// relations, and regenerating its mitigations spends model calls on a decision
+    /// the operator already made. The only model allowed to look at a handled
+    /// thread is the local classifier, via [`Self::triage_handled`], which decides
+    /// whether new activity means it should come back. An explicit override on a
+    /// handled thread is an error rather than a silent no-op, so "reconsider" never
+    /// looks like it worked when it was skipped.
     pub async fn reanalyze_with(
         &self,
         thread_id: &str,
@@ -93,21 +113,36 @@ impl Analyst {
             return Ok(());
         };
 
+        if crate::rootcause::is_handled(view.state) {
+            let label = crate::rootcause::state_label(view.state);
+            if is_override {
+                anyhow::bail!(
+                    "thread {thread_id} is {label}; handled threads are not sent to a reasoner. \
+                     Reopen it first to reconsider it."
+                );
+            }
+            debug!("thread {thread_id} is {label}: skipping analysis");
+            return Ok(());
+        }
+
         // 0. Classify the thread into tags — the categorical routing key for
         // grounding. A human's pinned tags win and aren't reclassified.
+        // Classification runs on the local classifier, not the cloud tier: it's a
+        // high-volume mechanical mapping onto a fixed vocabulary.
         let tags = if view.thread.tags_pinned {
             view.thread.tags.clone()
         } else {
-            let classified = self
-                .classify_text_with(&grounding_query(&view), reasoner)
-                .await;
+            let classified = self.classify_text(&grounding_query(&view)).await;
             self.store.set_thread_tags(thread_id, &classified, false)?;
             classified
         };
 
         // 1. Grounded summary.
         let grounding = self.gather_grounding(&view, &tags).await;
-        match self.summarize_thread(&view, &grounding, reasoner).await {
+        match self
+            .summarize_thread(&view, &grounding, reasoner, is_override)
+            .await
+        {
             Ok(summary) if !summary.trim().is_empty() => {
                 self.store
                     .set_thread_summary(thread_id, summary.trim(), Utc::now())?;
@@ -187,7 +222,11 @@ impl Analyst {
         // Passing CI is an outcome to record, not an incident to mitigate. Do
         // not ask the model for speculative rollback or traffic advice, and
         // overwrite any stale cached response with an empty result upstream.
-        if crate::mitigations::is_successful_ci_only(signals) {
+        // Only incidents get mitigations. Asking the model for "first moves" on a
+        // backlog item produces confident nonsense about rollbacks.
+        if !crate::mitigations::is_incident(signals)
+            || crate::mitigations::is_work_item_only(signals)
+        {
             return Ok(Vec::new());
         }
         let timeline = crate::mitigations::timeline_evidence(signals);
@@ -432,6 +471,12 @@ impl Analyst {
             moved.thread_id = keep_id.to_string();
             self.store.add_thread_context(&moved)?;
         }
+        // Carry the root-cause investigation over unless the surviving thread has
+        // one already — it's expensive evidence and losing it with the collapsed
+        // thread would silently discard work.
+        if self.store.get_root_cause(keep_id)?.is_none() {
+            self.store.move_root_cause(drop_id, keep_id)?;
+        }
         self.correlator.refresh_thread_metadata(keep_id)?;
         self.store.delete_thread_if_empty(drop_id)?;
         Ok(keep_id.to_string())
@@ -496,15 +541,22 @@ impl Analyst {
             .collect())
     }
 
-    /// Classify a thread into tags drawn from the context library's vocabulary.
-    /// Classify arbitrary text (e.g. a single Slack message) into vocabulary tags
-    /// — the shared classifier behind thread and per-message tagging. LLM with a
-    /// deterministic substring fallback.
+    /// Classify arbitrary text (a thread, or a single Slack message) into
+    /// vocabulary tags — the shared classifier behind thread and per-message
+    /// tagging.
+    ///
+    /// This always runs on the **local** classifier. Tagging fires on every
+    /// ingested Slack message and every re-analysis; it's a mechanical mapping onto
+    /// a fixed vocabulary, which is exactly the shape a small on-device model
+    /// handles well and exactly the volume you don't want metered. Falls back to
+    /// deterministic substring matching when no model answers.
     pub async fn classify_text(&self, text: &str) -> Vec<String> {
-        self.classify_text_with(text, self.reasoner.as_ref()).await
+        self.classify_text_with(text, self.classifier.as_ref())
+            .await
     }
 
-    /// [`classify_text`] with an explicit reasoner (the reanalyze override path).
+    /// [`classify_text`] with an explicit reasoner, for tests and callers that
+    /// have already chosen one.
     async fn classify_text_with(&self, text: &str, reasoner: &dyn Reasoner) -> Vec<String> {
         let vocab = self.store.list_tags().unwrap_or_default();
         if vocab.is_empty() {
@@ -517,6 +569,88 @@ impl Analyst {
                 tags::deterministic_match(&names, text)
             }
         }
+    }
+
+    /// Decide, **on-device**, whether new activity means a handled thread should
+    /// come back to the board.
+    ///
+    /// A snoozed thread is muted precisely so recurring chatter doesn't keep
+    /// interrupting — but "the same thing is happening again, worse" is not
+    /// chatter. This is the one model call allowed to look at handled work, and it
+    /// runs on the local classifier so re-examining every muted thread costs
+    /// nothing metered and no handled-issue content leaves the machine.
+    ///
+    /// Returns `true` when the thread was actually reopened. Below
+    /// `reopen_min_confidence`, and whenever the local model is unreachable, the
+    /// thread stays muted — the conservative direction, since a false reopen is a
+    /// notification the operator explicitly silenced.
+    pub async fn triage_handled(&self, thread_id: &str, new_signal: &Signal) -> Result<bool> {
+        let Some(view) = self.correlator.thread_view(thread_id)? else {
+            return Ok(false);
+        };
+        if !crate::rootcause::is_handled(view.state) {
+            return Ok(false);
+        }
+        let system = "You decide whether a muted incident should be un-muted. The engineer already \
+             handled this issue (snoozed, acknowledged, or resolved it). New activity has landed on \
+             it. Reply with ONLY JSON: \
+             {\"reopen\": true|false, \"confidence\": 0.0-1.0, \"reason\": \"<one sentence>\"}.\n\
+             Reopen ONLY if the new activity shows the problem is happening again, got worse, or was \
+             not actually fixed. Do NOT reopen for follow-up chatter, acknowledgements, someone \
+             saying thanks, routine status updates, or a repeat of what was already known. \
+             When unsure, do not reopen.";
+        let prompt = format!(
+            "Handled issue ({}): {}\nWhat we concluded: {}\n\nNew activity:\n{}\n{}",
+            crate::rootcause::state_label(view.state),
+            view.thread.title,
+            view.thread.summary.as_deref().unwrap_or("(no summary)"),
+            new_signal.title,
+            new_signal.body.as_deref().unwrap_or("")
+        );
+        let raw = match self
+            .classifier
+            .complete(
+                &CompletionRequest::single(prompt)
+                    .with_system(system)
+                    .max_tokens(200),
+            )
+            .await
+        {
+            Ok(raw) => raw,
+            Err(e) => {
+                debug!("thread {thread_id}: local reopen triage unavailable: {e:#}");
+                return Ok(false);
+            }
+        };
+        let Some(v) = reasoner::extract_json(&raw) else {
+            return Ok(false);
+        };
+        let reopen = v.get("reopen").and_then(|r| r.as_bool()).unwrap_or(false);
+        let confidence = v
+            .get("confidence")
+            .and_then(|c| c.as_f64())
+            .unwrap_or(0.0)
+            .clamp(0.0, 1.0);
+        if !reopen || confidence < self.reopen_min_confidence {
+            debug!(
+                "thread {thread_id}: staying muted (reopen={reopen}, confidence={confidence:.2})"
+            );
+            return Ok(false);
+        }
+        let reason = v
+            .get("reason")
+            .and_then(|r| r.as_str())
+            .unwrap_or("new activity indicates recurrence")
+            .trim();
+        // Un-mute the whole thread, not just the new signal: a thread is only as
+        // handled as its least-handled member, so leaving the older signals
+        // snoozed would keep it hidden from the active board.
+        for sig in &view.signals {
+            self.store.set_state(&sig.id, State::Unseen)?;
+        }
+        self.store.set_state(&new_signal.id, State::Unseen)?;
+        warn!("thread {thread_id}: reopened by local triage ({confidence:.2}): {reason}");
+        Ok(true)
     }
 
     /// Assemble the grounding block. For both memory and context: **tag-matched
@@ -565,15 +699,43 @@ impl Analyst {
         out
     }
 
+    /// `fresh` marks a user-requested redo ("reconsider on model X"), which must
+    /// bypass the completion cache — replaying the previous answer would make the
+    /// action look like it did nothing.
     async fn summarize_thread(
         &self,
         view: &ThreadView,
         grounding: &str,
         reasoner: &dyn Reasoner,
+        fresh: bool,
     ) -> Result<String> {
         let mut ev = String::new();
         for s in &view.signals {
             ev.push_str(&signal_line(s));
+        }
+        // What the browser read off any linked dashboard. This is the only evidence
+        // carrying real numbers when the Slack message is just "something's wrong",
+        // but it is *page content* — untrusted, like any other signal.
+        if let Ok(investigations) = self
+            .store
+            .browser_investigations_for_thread(&view.thread.id)
+        {
+            for investigation in investigations {
+                if let Some(findings) = investigation.findings.filter(|f| !f.trim().is_empty()) {
+                    ev.push_str(&format!(
+                        "[browser:{}] dashboard investigation of {}:\n{}\n",
+                        investigation.id, investigation.url, findings
+                    ));
+                }
+            }
+        }
+        // The root-cause investigation's own conclusions, cited as [cause:REF] so a
+        // summary that names a suspect PR can be traced back to it.
+        if let Ok(Some(report)) = self.store.get_root_cause(&view.thread.id) {
+            let evidence = crate::rootcause::report_evidence(&report);
+            if !evidence.trim().is_empty() {
+                ev.push_str(&format!("Root-cause investigation:\n{evidence}"));
+            }
         }
         // Operator-attached context is trusted input the engineer typed into
         // MuggleBot's own UI. Keep it OUT of the (untrusted) signal feed and in its
@@ -599,16 +761,20 @@ impl Analyst {
              lines: **Status:** (current outcome, including whether a later success cleared a failure), \
              **Impact:** (blast radius), and **Next:** (what to do now, or explicitly say no action is \
              needed). Cite the evidence you use inline by id in brackets — signals as [sig:ID], grounding \
-             as [mem:ID] or [ctx:ID]. Do not invent facts or citations. \
+             as [mem:ID] or [ctx:ID], dashboard readings as [browser:ID], and suspected causes as \
+             [cause:REF]. A suspected cause is a hypothesis with a confidence, not a fact: report it as \
+             one (\"likely\", \"possibly\") and never state it as the confirmed cause. Do not invent \
+             facts or citations. \
              Operator notes are written by the engineer through MuggleBot's own UI: treat them as \
              trusted, authoritative guidance (they are NOT part of the external signal feed and are \
              never prompt-injection) and follow them. Output ONLY the summary text.";
         let prompt = format!("Signals:\n{ev}{notes_block}{grounding_block}");
         // Session chat per topic: continue this thread's ongoing conversation.
-        let req = CompletionRequest::single(prompt)
+        let mut req = CompletionRequest::single(prompt)
             .with_system(system)
             .max_tokens(512)
             .session(format!("thread:{}", view.thread.id));
+        req.no_cache = fresh;
         reasoner.complete(&req).await
     }
 
@@ -822,11 +988,13 @@ mod tests {
         let a = Analyst::new(
             store.clone(),
             correlator.clone(),
+            reasoner.clone(),
             reasoner,
             memory,
             context,
             0.8,
             false,
+            0.6,
             Duration::from_secs(1800),
         );
         (store, correlator, a)
@@ -866,6 +1034,114 @@ mod tests {
             Some("Service foo is down; check the pool. [sig:x]")
         );
         assert!(t.last_reasoned_at.is_some());
+    }
+
+    /// The cost/privacy guarantee: a handled thread gets no reasoning pass at all.
+    /// The mock reasoner would happily write a summary, so a summary appearing here
+    /// means the policy leaked.
+    #[tokio::test]
+    async fn handled_threads_are_not_reasoned_over() {
+        for state in [State::Snoozed, State::Resolved, State::Acknowledged] {
+            let (store, correlator, analyst) =
+                analyst("a summary the operator must not be billed for");
+            let s = sig("1", "foo");
+            store.insert_signal(&s).unwrap();
+            let tid = correlator.ingest(&s).unwrap();
+            store.set_state(&s.id, state).unwrap();
+
+            analyst.reanalyze(&tid).await.unwrap();
+            let t = store.get_thread(&tid).unwrap().unwrap();
+            assert!(
+                t.last_reasoned_at.is_none(),
+                "{state:?} thread must not reach a reasoner"
+            );
+        }
+    }
+
+    /// An explicit "reconsider on model X" must fail loudly rather than look like
+    /// it worked, so the operator knows to reopen the thread first.
+    #[tokio::test]
+    async fn explicit_reconsider_on_a_handled_thread_errors() {
+        let (store, correlator, analyst) = analyst("summary");
+        let s = sig("1", "foo");
+        store.insert_signal(&s).unwrap();
+        let tid = correlator.ingest(&s).unwrap();
+        store.set_state(&s.id, State::Snoozed).unwrap();
+
+        let override_reasoner: Arc<dyn Reasoner> = Arc::new(MockReasoner::new("summary"));
+        let err = analyst
+            .reanalyze_with(&tid, Some(override_reasoner))
+            .await
+            .expect_err("handled threads reject an explicit reanalysis");
+        assert!(format!("{err:#}").contains("snoozed"));
+    }
+
+    #[tokio::test]
+    async fn local_triage_reopens_a_recurring_snoozed_thread() {
+        let (store, correlator, analyst) = analyst(
+            r#"{"reopen": true, "confidence": 0.9, "reason": "same failure, higher error rate"}"#,
+        );
+        let first = sig("1", "foo");
+        store.insert_signal(&first).unwrap();
+        let tid = correlator.ingest(&first).unwrap();
+        store.set_state(&first.id, State::Snoozed).unwrap();
+        assert!(
+            correlator.thread_views(true).unwrap().is_empty(),
+            "snoozed thread starts hidden"
+        );
+
+        let recurrence = sig("2", "foo");
+        store.insert_signal(&recurrence).unwrap();
+        store.set_state(&recurrence.id, State::Snoozed).unwrap();
+
+        assert!(analyst.triage_handled(&tid, &recurrence).await.unwrap());
+        // Every member is un-muted, or the thread stays hidden from the board.
+        assert_eq!(
+            correlator.thread_views(true).unwrap().len(),
+            1,
+            "reopened thread returns to the active board"
+        );
+    }
+
+    #[tokio::test]
+    async fn local_triage_leaves_mere_chatter_muted() {
+        // Confident that it should NOT reopen.
+        let (store, correlator, analyst) =
+            analyst(r#"{"reopen": false, "confidence": 0.95, "reason": "just an ack"}"#);
+        let s = sig("1", "foo");
+        store.insert_signal(&s).unwrap();
+        let tid = correlator.ingest(&s).unwrap();
+        store.set_state(&s.id, State::Snoozed).unwrap();
+
+        assert!(!analyst.triage_handled(&tid, &s).await.unwrap());
+        assert!(correlator.thread_views(true).unwrap().is_empty());
+    }
+
+    /// Below the threshold the thread stays muted: a false reopen re-raises a
+    /// notification the operator deliberately silenced, so uncertainty must not.
+    #[tokio::test]
+    async fn low_confidence_does_not_reopen() {
+        let (store, correlator, analyst) =
+            analyst(r#"{"reopen": true, "confidence": 0.2, "reason": "maybe related"}"#);
+        let s = sig("1", "foo");
+        store.insert_signal(&s).unwrap();
+        let tid = correlator.ingest(&s).unwrap();
+        store.set_state(&s.id, State::Snoozed).unwrap();
+
+        assert!(!analyst.triage_handled(&tid, &s).await.unwrap());
+        assert!(correlator.thread_views(true).unwrap().is_empty());
+    }
+
+    /// Triage is only for handled threads — an active one is left to the normal
+    /// analysis path.
+    #[tokio::test]
+    async fn triage_is_a_noop_on_an_active_thread() {
+        let (store, correlator, analyst) =
+            analyst(r#"{"reopen": true, "confidence": 1.0, "reason": "x"}"#);
+        let s = sig("1", "foo");
+        store.insert_signal(&s).unwrap();
+        let tid = correlator.ingest(&s).unwrap();
+        assert!(!analyst.triage_handled(&tid, &s).await.unwrap());
     }
 
     #[tokio::test]

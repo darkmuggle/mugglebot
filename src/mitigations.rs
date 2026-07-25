@@ -7,7 +7,7 @@
 
 use serde::Serialize;
 
-use crate::signal::{Signal, Source};
+use crate::signal::{Severity, Signal, SignalKind, Source};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Mitigation {
@@ -172,6 +172,50 @@ pub const CATALOG: &[Mitigation] = &[
     },
 ];
 
+/// Is this thread an **incident** at all?
+///
+/// Generic mitigations — roll back, drain, quarantine, upsize — are first moves for
+/// something that is currently broken in production. Offering them for planned work
+/// is worse than offering nothing: "add YAML validation to prevent typos" is a
+/// backlog item, and answering it with "consider rolling back the recent deploy"
+/// is noise that trains you to ignore the panel.
+///
+/// The catalog is keyword-matched, and engineering text is full of words like
+/// "fails", "error", and "slow" that match it — so the gate has to be on the
+/// *nature* of the signals, not on their vocabulary. Work items (an issue assigned
+/// to you, a review request, an @-mention) are never incidents, however they're
+/// worded. Alerts and failing CI are.
+pub fn is_incident(signals: &[Signal]) -> bool {
+    if signals.is_empty() || is_successful_ci_only(signals) {
+        return false;
+    }
+    // Something has to be actually firing or failing.
+    signals.iter().any(|s| {
+        matches!(s.kind, SignalKind::Alert)
+            || (is_ci_signal(s) && ci_outcome(s).as_deref() == Some("failure"))
+            || s.severity >= Severity::Warning && s.kind != SignalKind::Assigned
+    })
+}
+
+/// Are these all *work items* rather than events?
+///
+/// A GitHub assignment, review request, or @-mention is something to do — a backlog
+/// entry, not a fault. Scoped to GitHub deliberately: a Slack mention is
+/// *conversation*, and someone saying "pool exhausted, cpu saturated" in an incident
+/// channel is exactly when first moves are wanted. Treating both as the same kind of
+/// "mention" would silence the live-assist panel during an actual incident, which is
+/// the one moment it earns its place.
+pub fn is_work_item_only(signals: &[Signal]) -> bool {
+    !signals.is_empty()
+        && signals.iter().all(|s| {
+            s.source == Source::GitHub
+                && matches!(
+                    s.kind,
+                    SignalKind::Assigned | SignalKind::ReviewRequested | SignalKind::Mention
+                )
+        })
+}
+
 /// A completed CI run is evidence, not an incident. The last known CI outcome
 /// in the chronological timeline is authoritative: a green run after a red one
 /// closes that failure instead of leaving stale remediation on the board.
@@ -262,7 +306,11 @@ pub fn timeline_evidence(signals: &[Signal]) -> String {
 /// Rank the catalog against a thread's signals. Returns matches with a nonzero
 /// score, best first. Each match cites the signals whose text triggered it.
 pub fn suggest(signals: &[Signal]) -> Vec<MitigationMatch> {
-    if is_successful_ci_only(signals) {
+    // Nothing is on fire, so there is nothing to mitigate. This gate matters more
+    // than the ranking below it: a wrong suggestion here is actively misleading,
+    // and the keyword matcher will happily fire on the word "fails" in a feature
+    // request.
+    if !is_incident(signals) || is_work_item_only(signals) {
         return Vec::new();
     }
     let mut out: Vec<MitigationMatch> = CATALOG
@@ -407,5 +455,72 @@ mod tests {
     fn unrelated_signal_yields_nothing() {
         let sigs = vec![sig("lunch", "who wants tacos")];
         assert!(suggest(&sigs).is_empty());
+    }
+
+    /// The case that motivated the gate: "add yaml validation to prevent typos" is a
+    /// backlog item. Answering it with "roll back the recent deploy" is noise that
+    /// trains you to ignore the panel.
+    #[test]
+    fn an_assigned_feature_request_gets_no_mitigations() {
+        let mut s = sig(
+            "Assigned: add yaml validation to prevent typos and other footguns",
+            "Typos in the manifests cause failures that are slow to debug",
+        );
+        s.source = Source::GitHub;
+        s.kind = SignalKind::Assigned;
+        s.severity = Severity::Notice;
+        assert!(!is_incident(&[s.clone()]));
+        assert!(is_work_item_only(&[s.clone()]));
+        assert!(
+            suggest(&[s]).is_empty(),
+            "the keyword matcher must not fire on 'failures' and 'slow' in a feature request"
+        );
+    }
+
+    #[test]
+    fn a_review_request_is_not_an_incident() {
+        let mut s = sig("Review requested on #17", "please take a look");
+        s.source = Source::GitHub;
+        s.kind = SignalKind::ReviewRequested;
+        s.severity = Severity::Notice;
+        assert!(is_work_item_only(&[s.clone()]));
+        assert!(suggest(&[s]).is_empty());
+    }
+
+    /// A Slack mention is conversation, not a work item. Someone saying "pool
+    /// exhausted" in an incident channel is precisely when first moves are wanted,
+    /// and scoping the work-item gate to GitHub is what keeps that working.
+    #[test]
+    fn slack_incident_chatter_is_not_a_work_item() {
+        let mut s = sig(
+            "connection pool exhausted, cpu saturation",
+            "pool exhausted",
+        );
+        s.source = Source::Slack;
+        s.kind = SignalKind::Mention;
+        s.severity = Severity::Warning;
+        assert!(
+            !is_work_item_only(&[s.clone()]),
+            "Slack talk is not a backlog item"
+        );
+        assert!(is_incident(&[s.clone()]));
+        assert!(!suggest(&[s]).is_empty());
+    }
+
+    /// A real alert still gets first moves — the gate must not silence the panel
+    /// when it's actually useful.
+    #[test]
+    fn a_firing_alert_still_gets_mitigations() {
+        let mut s = sig(
+            "[FIRING] connection pool exhausted on api",
+            "pool exhausted, latency spike",
+        );
+        s.kind = SignalKind::Alert;
+        s.severity = Severity::Critical;
+        assert!(is_incident(&[s.clone()]));
+        assert!(
+            !suggest(&[s]).is_empty(),
+            "a real incident must still get advice"
+        );
     }
 }

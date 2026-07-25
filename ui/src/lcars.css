@@ -740,7 +740,8 @@ button {
   grid-column: 1 / -1;
 }
 .timeline-panel,
-.mitigations-panel {
+.mitigations-panel,
+.browser-investigations {
   grid-column: 1 / -1;
 }
 .summary {
@@ -956,6 +957,270 @@ button {
   font-weight: 700;
   letter-spacing: 0.08em;
   text-transform: uppercase;
+}
+.browser-investigation {
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 12px;
+  background: var(--surface-2);
+}
+.browser-investigation + .browser-investigation {
+  margin-top: 10px;
+}
+.browser-investigation-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.browser-investigation-head a {
+  color: var(--blue);
+  font-size: 12px;
+}
+.browser-prompt {
+  margin: 8px 0;
+  padding: 10px;
+  overflow-x: auto;
+  white-space: pre-wrap;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  color: var(--dim);
+  font: 12px/1.45 ui-monospace, "SF Mono", Menlo, monospace;
+}
+.browser-findings-entry {
+  display: flex;
+  gap: 8px;
+  align-items: flex-end;
+}
+.browser-findings-entry textarea {
+  flex: 1;
+  min-height: 86px;
+  max-width: none;
+}
+.browser-findings {
+  margin-top: 8px;
+  color: var(--text);
+}
+.browser-error {
+  margin: 8px 0 0;
+  color: var(--sev-critical);
+  font-size: 12px;
+}
+
+/* Root cause. Candidates are hypotheses: the relation pill carries the claim and
+   the confidence is always shown next to it, so nothing reads as a verdict. */
+.root-cause {
+  grid-column: 1 / -1;
+}
+.panel-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.panel-head h3 {
+  margin: 0;
+}
+.rc-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin-top: 8px;
+}
+.rc-label {
+  color: var(--dim);
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+.chip.repo {
+  color: var(--blue);
+  text-decoration: none;
+}
+.rc-verdict {
+  margin-top: 10px;
+  padding: 10px 12px;
+  border-left: 3px solid var(--lilac);
+  background: var(--surface-2);
+  border-radius: 0 8px 8px 0;
+}
+.rc-candidate {
+  margin-top: 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--slate);
+  border-radius: 0 10px 10px 0;
+  background: var(--surface-2);
+}
+.rc-candidate.rc-cause {
+  border-left-color: var(--sev-critical);
+}
+.rc-candidate.rc-fix {
+  border-left-color: var(--ok);
+}
+.rc-candidate.rc-duplicate {
+  border-left-color: var(--amber);
+}
+.rc-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+.rc-relation {
+  padding: 1px 8px;
+  border-radius: var(--pill);
+  background: var(--slate);
+  color: var(--text);
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+.rc-relation-cause {
+  background: var(--sev-critical);
+  color: var(--ink);
+}
+.rc-relation-fix {
+  background: var(--ok);
+  color: var(--ink);
+}
+.rc-relation-duplicate {
+  background: var(--amber);
+  color: var(--ink);
+}
+.rc-kind,
+.rc-confidence {
+  color: var(--dim);
+  font-size: 11px;
+}
+.rc-confidence {
+  margin-left: auto;
+  cursor: help;
+}
+.rc-ref {
+  color: var(--blue);
+  font: 12px/1.4 ui-monospace, "SF Mono", Menlo, monospace;
+  text-decoration: none;
+}
+.rc-title {
+  margin-top: 4px;
+}
+.rc-facts {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-top: 6px;
+  font-size: 12px;
+}
+.rc-files,
+.rc-fragment {
+  margin-top: 6px;
+  overflow-x: auto;
+  color: var(--dim);
+  font: 11px/1.5 ui-monospace, "SF Mono", Menlo, monospace;
+}
+.rc-fragment {
+  padding: 8px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  white-space: pre-wrap;
+}
+
+/* Assigned-issue triage. The plain-English gloss leads; the technical analysis
+   and the patch options sit under it. Patches are proposals, and the numbering
+   plus the "nothing applied" note keep that visible. */
+.issue-triage {
+  grid-column: 1 / -1;
+}
+.triage-plain {
+  margin-top: 10px;
+  padding: 10px 12px;
+  border-left: 3px solid var(--blue);
+  border-radius: 0 8px 8px 0;
+  background: var(--surface-2);
+  font-size: 15px;
+  line-height: 1.55;
+}
+.triage-analysis {
+  margin-top: 10px;
+  color: var(--text);
+}
+.triage-heading {
+  margin: 16px 0 8px;
+  color: var(--amber);
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+.triage-heading .muted {
+  text-transform: none;
+  letter-spacing: 0;
+  font-weight: 400;
+}
+.patch {
+  margin-top: 8px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--surface-2);
+}
+.patch-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+.patch-index {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  border-radius: var(--pill);
+  background: var(--panel);
+  color: var(--ink);
+  font-size: 11px;
+  font-weight: 700;
+}
+.patch-title {
+  font-weight: 600;
+}
+.patch-approach {
+  margin-top: 6px;
+  line-height: 1.5;
+}
+.patch-risk {
+  margin-top: 6px;
+  font-size: 13px;
+  color: var(--dim);
+}
+.chip.effort-small {
+  color: var(--ok);
+}
+.chip.effort-large {
+  color: var(--sev-warning);
+}
+.triage-provenance {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-top: 12px;
+  padding-top: 10px;
+  border-top: 1px solid var(--line);
+  font-size: 12px;
+  color: var(--dim);
+}
+.triage-provenance code {
+  font: 11px/1.4 ui-monospace, "SF Mono", Menlo, monospace;
+}
+.triage-provenance details {
+  width: 100%;
+}
+.triage-provenance summary {
+  cursor: pointer;
 }
 @media (max-width: 1180px) {
   .detail-grid {
@@ -1608,4 +1873,146 @@ code {
 }
 ::-webkit-scrollbar-track {
   background: transparent;
+}
+
+/* "Already being fixed?" — open PRs that may cover an assigned issue. The verdict
+   pill carries the claim and the critique is always shown next to it, because a PR
+   saying "closes #412" is a claim, not a verification. */
+.pr-fix {
+  margin-top: 8px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--slate);
+  border-radius: 0 10px 10px 0;
+  background: var(--surface-2);
+}
+.pr-fix.pr-fixes {
+  border-left-color: var(--ok);
+}
+.pr-fix.pr-partial {
+  border-left-color: var(--amber);
+}
+.pr-verdict-fixes {
+  background: var(--ok);
+  color: var(--ink);
+}
+.pr-verdict-partial {
+  background: var(--amber);
+  color: var(--ink);
+}
+.pr-verdict-related {
+  background: var(--slate);
+  color: var(--text);
+}
+.pr-critique {
+  margin-top: 6px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--amber) 8%, transparent);
+  line-height: 1.5;
+}
+.pr-tier {
+  margin-top: 6px;
+  font-size: 11px;
+}
+.pr-also {
+  margin-top: 6px;
+}
+.pr-also-entry {
+  margin-top: 3px;
+  padding-left: 10px;
+  border-left: 2px solid var(--line-strong);
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+/* ---- attention + AI decoration ----
+   The board's two questions: does this need you, and has the AI been over it.
+   These replace reading the unseen/ack state machine at a glance — that state is
+   bookkeeping about what you did, not a description of what needs doing. */
+.attention {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-top: 6px;
+}
+.att {
+  padding: 2px 10px;
+  border-radius: var(--pill);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.1em;
+}
+.att-needed {
+  background: var(--sev-warning);
+  color: var(--ink);
+}
+.att-clear {
+  background: transparent;
+  border: 1px solid var(--line-strong);
+  color: var(--dim);
+}
+.att-reason {
+  color: var(--dim);
+  font-size: 12px;
+}
+
+/* Facet strip: filled = the AI produced this, hollow = it hasn't. A row of hollow
+   pills is the "nobody has looked at this yet" signal. */
+.facets {
+  display: inline-flex;
+  gap: 3px;
+  margin-left: auto;
+}
+.facet {
+  padding: 1px 5px;
+  border-radius: 4px;
+  font: 9px/1.6 ui-monospace, "SF Mono", Menlo, monospace;
+  letter-spacing: 0.04em;
+  cursor: help;
+}
+.facet-on {
+  background: var(--blue);
+  color: var(--ink);
+}
+.facet-off {
+  border: 1px solid var(--line-strong);
+  color: var(--slate);
+}
+
+/* Where the work ran: ⌂ on this machine, ☁ metered. */
+.passes {
+  display: inline-flex;
+  gap: 4px;
+  font: 10px/1.6 ui-monospace, "SF Mono", Menlo, monospace;
+}
+.pass {
+  padding: 1px 5px;
+  border-radius: 4px;
+  cursor: help;
+}
+.pass-local {
+  background: color-mix(in srgb, var(--ok) 22%, transparent);
+  color: var(--ok);
+}
+.pass-cloud {
+  background: color-mix(in srgb, var(--lilac) 22%, transparent);
+  color: var(--lilac);
+}
+.patch-mechanism {
+  margin-top: 4px;
+  font-size: 13px;
+  color: var(--blue);
+}
+/* A new dependency is a real cost of an approach, so it's called out rather than
+   buried in the prose. */
+.patch-dep {
+  margin-top: 6px;
+  padding: 3px 8px;
+  display: inline-block;
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--sev-warning) 14%, transparent);
+  color: var(--sev-warning);
+  font-size: 12px;
 }

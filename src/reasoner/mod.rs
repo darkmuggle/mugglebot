@@ -9,11 +9,11 @@
 //!     `/v1/chat/completions`.
 //!   - [`MockReasoner`] — a canned reasoner for tests.
 //!
-//! Routing (config `[reasoner]`): ambient work → Claude Sonnet; heavy on-demand
-//! → Claude Opus; sources pinned in `local_only_sources` → on-device Ollama. The
-//! [`build`] factory turns a provider label into a concrete reasoner, preferring
-//! the CLI bridge for `claude`/`chatgpt` when the binary is on `PATH`, else the
-//! direct API.
+//! Routing (config `[reasoner]`) is **by task difficulty, not by call site**. The
+//! local model answers by default and grades each task first; `hard` gets a cloud
+//! cleanup pass and `extra_hard` goes straight to the top tier — see [`router`].
+//! The [`build`] factory turns a provider label into a concrete reasoner,
+//! preferring the CLI bridge for `claude`/`chatgpt` when the binary is on `PATH`.
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -22,8 +22,10 @@ use std::sync::Arc;
 
 use crate::config::Reasoner as ReasonerCfg;
 
+pub mod cache;
 pub mod cli;
 pub mod ollama;
+pub mod router;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -77,6 +79,13 @@ pub struct CompletionRequest {
     /// this key (a "session chat per topic") so reasoning about one thread
     /// continues the same conversation across passes.
     pub session: Option<String>,
+    /// Skip the completion cache and force a fresh call.
+    ///
+    /// Set this when the *user asked for the work to be redone* — "reconsider on
+    /// model X", "re-triage this issue". Serving those from cache would make the
+    /// action look broken. Ordinary automatic passes leave it false so repeated
+    /// identical work is free.
+    pub no_cache: bool,
 }
 
 impl CompletionRequest {
@@ -88,7 +97,15 @@ impl CompletionRequest {
             max_tokens: 1024,
             temperature: 0.2,
             session: None,
+            no_cache: false,
         }
+    }
+
+    /// Force a fresh call, bypassing the completion cache — for actions where the
+    /// user explicitly asked for the work to be redone.
+    pub fn no_cache(mut self) -> Self {
+        self.no_cache = true;
+        self
     }
 
     pub fn with_system(mut self, system: impl Into<String>) -> Self {
@@ -274,7 +291,8 @@ pub async fn list_models(
     let mut models = curated;
     // Surface whichever configured models belong to this provider.
     let pinned = [
-        (cfg.ambient.as_str(), cfg.ambient_model.clone()),
+        (cfg.local.as_str(), cfg.local_model.clone()),
+        (cfg.mid.as_str(), cfg.mid_model.clone()),
         (cfg.heavy.as_str(), cfg.heavy_model.clone()),
     ]
     .into_iter()
@@ -295,21 +313,106 @@ fn dedup_prepend(models: &mut Vec<String>, extra: impl IntoIterator<Item = Strin
 }
 
 /// The reasoners MuggleBot routes to, built once at startup.
+///
+/// There are only two things a caller can ask for, and the distinction is about
+/// **who is allowed to decide**, not about capability:
+///
+/// - [`Self::routed`] — the front door for task-shaped work. It grades each task
+///   on the local model and escalates only when the difficulty warrants it (see
+///   [`router`]). Almost everything should use this.
+/// - [`Self::local`] — the raw on-device model, no grading and no escalation
+///   possible. This is for work that must *never* reach a cloud model regardless
+///   of how hard it looks: tag classification, repo crawling, and the reopen
+///   triage over handled threads.
+///
+/// [`Self::vision`] exists only because images need a model that can see them.
 #[derive(Clone)]
 pub struct Reasoners {
-    pub ambient: Arc<dyn Reasoner>,
-    pub heavy: Arc<dyn Reasoner>,
+    /// Difficulty-routed: local by default, escalating on grade.
+    pub routed: Arc<dyn Reasoner>,
+    /// On-device only, by policy. Never escalates.
     pub local: Arc<dyn Reasoner>,
+    /// Vision-capable tier, for multimodal chat.
+    pub vision: Arc<dyn Reasoner>,
+    /// Small, fast cloud model for plain-English rewriting. Not a reasoning tier —
+    /// it re-renders conclusions another model already reached.
+    pub brief: Arc<dyn Reasoner>,
 }
 
 impl Reasoners {
     /// `ollama_key` is the stored Ollama API key (if any), fetched off
-    /// the async runtime before this is called.
-    pub fn from_config(cfg: &ReasonerCfg, ollama_key: Option<String>) -> Self {
+    /// the async runtime before this is called. `store` backs the completion
+    /// cache; pass `None` to run uncached.
+    pub fn from_config(
+        cfg: &ReasonerCfg,
+        ollama_key: Option<String>,
+        store: Option<Arc<crate::store::Store>>,
+    ) -> Self {
+        // Every tier is wrapped, including the one the router uses to grade, so a
+        // repeated identical request is free wherever it originates.
+        let ttl = crate::config::parse_duration(&cfg.cache.ttl)
+            .unwrap_or(std::time::Duration::from_secs(86_400));
+        let wrap = |inner: Arc<dyn Reasoner>, provider: &str, model: &str| -> Arc<dyn Reasoner> {
+            match (&store, cfg.cache.enabled) {
+                (Some(store), true) => Arc::new(cache::CachingReasoner::new(
+                    inner,
+                    store.clone(),
+                    format!("{provider}/{model}"),
+                    ttl,
+                )),
+                _ => inner,
+            }
+        };
+        let local = wrap(
+            build(
+                provider_label(&cfg.local),
+                &cfg.local_model,
+                cfg,
+                ollama_key.clone(),
+            ),
+            &cfg.local,
+            &cfg.local_model,
+        );
+        let mid = wrap(
+            build(
+                provider_label(&cfg.mid),
+                &cfg.mid_model,
+                cfg,
+                ollama_key.clone(),
+            ),
+            &cfg.mid,
+            &cfg.mid_model,
+        );
+        let heavy = wrap(
+            build(
+                provider_label(&cfg.heavy),
+                &cfg.heavy_model,
+                cfg,
+                ollama_key.clone(),
+            ),
+            &cfg.heavy,
+            &cfg.heavy_model,
+        );
+        let brief = wrap(
+            build(
+                provider_label(&cfg.brief),
+                &cfg.brief_model,
+                cfg,
+                ollama_key,
+            ),
+            &cfg.brief,
+            &cfg.brief_model,
+        );
         Self {
-            ambient: build(&cfg.ambient, &cfg.ambient_model, cfg, ollama_key.clone()),
-            heavy: build(&cfg.heavy, &cfg.heavy_model, cfg, ollama_key.clone()),
-            local: build("ollama_local", &cfg.ollama_model, cfg, ollama_key),
+            routed: Arc::new(router::RoutingReasoner::new(
+                local.clone(),
+                mid,
+                heavy.clone(),
+                cfg.routing.clone(),
+            )),
+            local,
+            vision: heavy,
+            brief,
         }
     }
 }

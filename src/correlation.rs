@@ -51,6 +51,67 @@ pub struct ThreadView {
     pub state: State,
     pub edges: Vec<Edge>,
     pub context: Vec<ThreadContext>,
+    /// Does this need the operator, and has the AI actually looked at it?
+    pub attention: Attention,
+}
+
+/// The two questions the board exists to answer.
+///
+/// The five-state triage machine (`Unseen`/`Seen`/`Acknowledged`/`Resolved`/
+/// `Snoozed`) is bookkeeping — it records what you *did*, which is not what you want
+/// to read at a glance. What you want is: **does this need me**, and **has the AI
+/// been over it** (and at whose expense). So the board renders those two, and the
+/// underlying state stays available for filtering without being the headline.
+#[derive(Debug, Clone, Serialize)]
+pub struct Attention {
+    /// Needs a human. Derived — not a stored flag to keep in sync.
+    pub needed: bool,
+    /// Why, in a few words, so the badge is explainable rather than mysterious.
+    pub reason: Option<String>,
+    /// Which AI decorations exist on this thread. This is the "has the AI paid
+    /// attention?" indicator: an undecorated thread is one you're reading raw.
+    pub decorated: Decorations,
+}
+
+/// Per-facet record of what the AI has produced for a thread, and where the work
+/// ran.
+///
+/// Split by tier because "has the AI paid attention" and "what did it cost me" are
+/// different questions: `local_passes` is work that ran on this machine (fans up,
+/// battery down), `cloud_passes` is metered.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct Decorations {
+    /// A grounded summary has been written (not just the deterministic one-liner).
+    pub summary: bool,
+    /// Routing tags were classified.
+    pub tags: bool,
+    /// Tailored mitigations were generated and cached.
+    pub mitigations: bool,
+    /// A dashboard behind a linked alert was actually read.
+    pub dashboard: bool,
+    /// Root-cause investigation status: `complete`, `running`, `failed`, or absent.
+    pub root_cause: Option<String>,
+    /// Assigned-issue triage status, if this thread is an assigned issue.
+    pub triage: Option<String>,
+    /// How many associated pull requests have been judged.
+    pub prs_judged: usize,
+    /// Completed AI artifacts produced on-device.
+    pub local_passes: u32,
+    /// Completed AI artifacts that cost a metered call.
+    pub cloud_passes: u32,
+}
+
+impl Decorations {
+    /// Has the AI done anything at all here?
+    pub fn any(&self) -> bool {
+        self.summary
+            || self.tags
+            || self.mitigations
+            || self.dashboard
+            || self.root_cause.is_some()
+            || self.triage.is_some()
+            || self.prs_judged > 0
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

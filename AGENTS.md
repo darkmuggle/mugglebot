@@ -123,7 +123,33 @@ struct Signal {
 
 `entities` are the correlation currency — a PR number, a service name, a
 channel, a person. Signals that share entities within a time window are
-candidates for the same `thread`. Threads in turn carry the relation graph —
+candidates for the same `thread`.
+
+**Identity is a hierarchy, not a set.** Grouping matches on a signal's *strongest*
+identity, in this order:
+
+> environment > **issue** > pull request > branch / commit
+
+An issue is the durable statement of what the work is; a PR is one attempt at it; a
+branch is where that attempt happens. So a signal is attributed as far *up* that
+chain as it can be resolved, and the highest identity is what groups it. Concretely,
+a CI run is resolved to the PR whose head branch it ran on; on a default branch —
+where no open PR exists — it's resolved through the run's commit to the PR that
+merged it; and a PR is resolved to the issue it closes via GitHub's closing
+keywords. Each level it climbs is kept as a secondary entity, so a later
+notification about the PR itself still correlates.
+
+Without that chain, the same piece of work fragments: CI clusters by branch, the PR
+sits on its own, and the issue everyone is actually working on becomes a fourth card
+with none of the activity attached. Two rules make the hierarchy real rather than
+advisory:
+
+- **Matching is strict on the top rank present.** A signal carrying both
+  `issue:repo#412` and `branch:repo@fix-pool` groups by the issue, and cannot be
+  pulled onto a branch-only thread just because more weak entities happen to match.
+- **A default branch is context, not identity.** `main` is shared by every CI run
+  in a repository forever, so grouping on it would collapse the repo's whole history
+  into one thread — the same reason `repo`, `channel`, and `person` are excluded. Threads in turn carry the relation graph —
 `same` / `related` / `distinct` edges to other threads, each tagged with
 provenance (`llm` verdict or a user `pin`) — plus any ad-hoc context you've
 attached (see _Correlation & intelligence_).
@@ -136,7 +162,15 @@ Correlation happens in two tiers so that the cheap, deterministic work never
 waits on a model, and the model is only asked to reason when it adds value.
 
 1. **Deterministic grouping (always on, in-process).** Group signals into
-   threads by shared entities and time proximity: the alert in `#alerts` firing
+   threads by shared entities and time proximity — where "proximity" is measured
+   **around the signal's own `occurred_at`, never around wall-clock now**. Anchoring
+   the window to `now` silently breaks every catch-up ingest: on a first poll, a
+   restart, or any backlog, signals arrive hours after they happened, so a
+   `now - 30m` cutoff excludes all of them, every signal looks like it has no
+   neighbours, and each gets its own thread. The failure is invisible — no error,
+   just a board full of near-identical one-signal cards.
+
+   Grouping itself: the alert in `#alerts` firing
    on `service-foo`, the Slack thread discussing it, and the GitHub PR that
    touches `service-foo` collapse into one topic. Fast, explainable,
    no LLM required.
@@ -169,6 +203,34 @@ waits on a model, and the model is only asked to reason when it adds value.
      (`claude-opus-4-8`). Sources pinned in `local_only_sources` → on-device
      Ollama, which never leaves the machine. Interactive deep-dive → the
      MCP-server path below, where your Claude/ChatGPT client connects to MuggleBot.
+
+### What the board reports: attention, and whether the AI looked
+
+The signal state machine (`Unseen` / `Seen` / `Acknowledged` / `Resolved` /
+`Snoozed`) is bookkeeping. It records what you *did*, which is not what you want to
+read at a glance — "unseen" doesn't tell you whether something matters, and
+"acknowledged" doesn't tell you whether it's finished. So the board leads with the
+two questions that actually get asked:
+
+1. **Does this need me?** One derived boolean plus a short reason — critical, warning,
+   a live-assist flag on something you said, you're personally in the thread, or it's
+   assigned to you and not yet triaged. Handled work never asks.
+2. **Has the AI been over it, and at whose expense?** A strip of per-facet
+   indicators — tags, summary, mitigations, dashboard read, root cause, code triage,
+   PRs judged — filled when the artifact exists and hollow when it doesn't. A row of
+   hollow pills is the "nobody has looked at this yet" signal, which is otherwise
+   only discoverable by opening the thread and finding empty panels.
+
+Alongside them, the work is attributed by where it ran: `⌂n` for passes on this
+machine and `☁n` for metered calls. "Has the AI paid attention" and "what did that
+cost me" are different questions, and the second one is the difference between a warm
+laptop and a bill.
+
+Both are **derived, never stored**. A stored "needs attention" flag drifts the moment
+a signal is acknowledged elsewhere, and a stored "AI done" flag lies after a failed
+pass. Deriving them from the artifacts that actually exist means the badge cannot
+disagree with the panel underneath it. The underlying state is still there for
+filtering — it's just no longer the headline.
 
 ### Relatedness, de-duplication & the relation graph
 
@@ -338,6 +400,272 @@ in one action.
 
 ---
 
+## Browser investigation — reading the dashboard behind the link
+
+A Slack alert that links to a Grafana panel carries almost none of its own
+evidence. "CPU high on api" is the notification; the *numbers* — the error rate,
+the saturation curve, the time range, the deploy marker — live on a page behind
+SSO. Correlating alert text alone means reasoning about a symptom nobody has
+actually looked at.
+
+So MuggleBot looks. When an ingested signal links to a URL matching
+`[browser].url_patterns`, a **read-only browser investigation** is queued. A
+worker claims one at a time (they share a single browser) and drives the
+operator's **already signed-in Chrome** over the DevTools Protocol, then files
+what it saw back onto the thread as evidence, cited `[browser:ID]`.
+
+**How the browser is actually driven — and what doesn't work.** MuggleBot spawns
+its existing agent CLI bridge (`claude -p`) with a browser MCP server
+(`chrome-devtools-mcp`) attached over stdio and pointed at the running Chrome
+(`--browserUrl http://127.0.0.1:9222`). The session, cookies, and SSO state are
+the ones already in that profile.
+
+This is deliberately **not** the Claude-in-Chrome or ChatGPT-Atlas extension. The
+original idea was "use the Claude/ChatGPT browser extension to control Chrome",
+but those extensions attach a model to a tab *from inside the browser UI* and
+expose no interface for a background daemon to hand them a URL and collect an
+answer — they are not automatable. The CLI-plus-CDP path reaches the same
+authenticated page, needs no new credentials, and is scriptable, which is what a
+watcher loop requires. The cost is that Chrome must be started with
+`--remote-debugging-port`, which is why `[browser].enabled` is off by default:
+nothing should look enabled when nothing is listening.
+
+**Read-only by construction**, in three layers:
+
+1. **The tool allowlist** — `--allowedTools` names only navigate / snapshot /
+   screenshot / console / network. `click`, `fill`, and `evaluate_script` are
+   never granted, so there is no *mechanism* to acknowledge or silence an alert.
+2. **`--strict-mcp-config`** — only the browser server MuggleBot passes in is
+   loaded; the operator's own MCP servers (and their write tools) are not
+   inherited.
+3. **The prompt** — states the contract, and marks page content as untrusted.
+
+Layer 1 is the real enforcement. Layers 2 and 3 matter because the page is
+untrusted input: a dashboard annotation could contain text aimed at the agent
+reading it, so the brief instructs it to *report* anything instruction-shaped
+rather than act on it.
+
+Failures are contained: no Chrome on the port, no `npx`, a hung spinner past
+`timeout`, or an empty response marks that one investigation `failed` with its
+error recorded and retries it up to `max_attempts`. A permanently unreachable
+link stops consuming the worker instead of spinning forever.
+
+## Assigned issues — the work you own, triaged against the code
+
+The notification feed is an *event* stream: it tells you what changed. Assignment
+isn't an event, it's a standing state. An issue assigned to you three weeks ago
+with no activity since emits nothing, so it never reaches the board — and that is
+precisely the issue most likely to have fallen off your radar. So assigned issues
+are polled separately (`GET /issues?filter=assigned`) and **always get a card**,
+independent of notifications.
+
+The two GitHub watchers each reconcile against their own complete listing, and
+neither listing contains the other's ids — so the reconciler is scoped by an
+`assigned/` id prefix. Without that split, each snapshot would resolve the other's
+cards wholesale. Both emit the same `issue` entity, so correlation still collapses
+a notification and an assignment about the same issue into one card rather than
+two.
+
+**Triage against real source.** The expensive part of picking an assigned issue
+back up isn't noticing it — it's the cold start: reloading what the issue is
+about, finding the code, working out the options. That's twenty minutes every
+time. So each assigned issue is triaged ahead of you:
+
+1. **Pull the code** — shallow (`--depth 1`, single branch), read-only. The triage
+   only reads the current tree; full history on a large repo costs minutes for
+   nothing. The token reaches git through its *environment* config — never the
+   remote URL (which would persist it to `.git/config`) and never `argv` (which
+   would expose it to `ps`). Note also that git authenticates a GitHub token over
+   **Basic** as `x-access-token:<token>`; Bearer is rejected with a bare
+   "Authentication failed", which is a confusing way to discover this.
+
+   The cache is bounded in total, not just per repo. The per-repo limit reads
+   GitHub's reported size, which undercounts what lands on disk — measured on a
+   real org, five repos came to 427MB, one docs site accounting for 335MB of
+   assets. Since the code-derived repo index clones across the entire org, the sum
+   is the number that matters, so `max_cache_mb` evicts least-recently-used
+   checkouts (by mtime, which a fetch bumps) to stay under budget.
+2. **Select files deterministically** — identifiers from the issue text (backticked
+   spans, `snake_case`, `camelCase`, dotted paths) matched against paths and
+   contents, with a path hit worth far more than a body hit. No model is involved,
+   so selection works even with nothing reachable, and the model is never asked to
+   guess at paths it hasn't seen.
+3. **Characterize** on the local coder model, with the source in hand.
+4. **Propose N distinct approaches** — distinctness is the requirement, not a
+   nicety: three variations on one idea is a single option wearing three hats and
+   doesn't help you choose. Each carries files, a risk, an effort, and a
+   confidence. Paths the model wasn't shown are dropped, because a patch citing a
+   file that doesn't exist reads as authoritative and sends you hunting.
+5. **Plain English** via the `brief` tier, told explicitly to add nothing. That
+   constraint is what makes a small model right here: it's re-wording a conclusion,
+   not reaching one.
+
+Steps 2–4 are on-device — reading source is exactly the work that shouldn't leave
+the machine, and a coder model is better at it than a generalist. Nothing in this
+path writes to a repository: no commit, no push, no PR. The output is a proposal in
+MuggleBot's own store, and each triage records the commit it read so you can tell
+when its analysis has gone stale.
+
+## Root-cause investigation — from symptom to the change that caused it
+
+Correlation answers "what lit up, and what else belongs to this event?". The next
+question an on-call engineer asks is *why*, and answering it means leaving the
+notification stream and going into the code.
+
+**The repo index.** On startup MuggleBot lists the watched org's repositories,
+checks each one out, and distills a two-line card from its **code**: `PURPOSE:`
+(what this runs) and `SYMPTOMS:` (the terms that should route an incident here).
+That index is the routing table. It matters because searching every repo for every
+alert is slow, noisy, and rate-limited; routing "environment stuck provisioning" to
+`restate-cloud` and nothing else is what makes the rest affordable.
+
+Reading the code rather than the README is deliberate. A README states intent, and
+intent goes stale, turns aspirational, or is simply absent — plenty of real services
+have a README that is one line and a badge. The directory layout, the manifests, and
+the module names say what the thing actually *is*, and they cannot drift from the
+code because they *are* the code. What the model sees is a structural digest —
+layout, file-type counts, manifest headers, module paths — rather than file contents:
+names are the highest-signal-per-token description a codebase offers, and a digest
+stays bounded whether the repo is a small service or a monorepo. A README, where one
+exists, is one input among several rather than the basis.
+
+Characterizations are cached against the commit they were built from
+(`indexed_sha`), so a refresh only re-reads repos whose code has actually moved. An
+unchanged org costs a shallow `git fetch` per repo and **no** model calls.
+
+**Routing runs in two tiers**, mirroring correlation's own shape. Deterministic
+keyword routes (`[investigation.routes]`) always apply and never wait on a model —
+"cloud"/"environment" means `restate-cloud`, "invocation"/"partition processor"
+means `restate`. Everything else is routed by the model reading the index cards.
+Repo names the index doesn't know are dropped, so a hallucinated repo never
+reaches the GitHub API.
+
+**The pipeline**, per thread:
+
+1. **Symptoms** — search terms extracted from the thread's signals *and* the
+   browser's dashboard reading (which is where the concrete numbers are).
+2. **Route** — the two tiers above, capped at a handful of repos.
+3. **Existing issues and PRs** — someone may have already filed it. That's the
+   cheapest possible answer.
+4. **The commit log** — over `commit_window` before the *earliest* signal, because
+   a cause precedes its symptom.
+5. **Rank** — into candidates, each with a `relation` (`cause` / `fix` /
+   `duplicate` / `context`), a confidence, and a rationale.
+6. **Code search** — only when nothing above explains it. "No issue, no PR, no
+   commit" means the answer to "what's causing this?" becomes "here's the code
+   that implements the failing thing."
+
+Every candidate is a **hypothesis with a citation**, cited `[cause:REF]` and
+rendered with its confidence beside it. A summary may say "likely caused by
+#412"; it may never say "caused by #412". Nothing here closes an issue, reverts a
+commit, or touches a repository.
+
+Investigation is gated so it doesn't fire on everything: the thread has to look
+broken (warning-or-worse, or an alert/CI-failure signal), and a thread with a
+completed report isn't re-investigated until asked. A failed report *is* retried —
+the failure was often a rate limit.
+
+## Reasoning tiers — routing by graded difficulty
+
+The provider table above splits models by *capability*. What actually decides
+which one runs is **how hard the task is**, judged per task rather than assumed
+per call site.
+
+The reason to do it this way: most of what an ops agent asks a model to do isn't
+hard — label a thread, extract search terms, decide whether two alerts are the
+same thing, shortlist commits. Routing all of that to a frontier model is how an
+always-on daemon gets expensive without getting better. But some of it *is* hard,
+and a small local model quietly producing a worse answer is the failure mode you
+never notice. Grading is the cheap way to tell the two apart.
+
+So the **local model (`deepseek-coder:33b`) is the default for everything**, and
+before running a task it grades that task's difficulty:
+
+| Grade | Who answers |
+|---|---|
+| `easy`, `medium` | local alone |
+| `hard` | local drafts, the mid tier (Sonnet) corrects it — or Sonnet takes the whole task if local fails |
+| `extra_hard` | the top tier (Opus) directly; local doesn't attempt it |
+
+The grader is a local call with a ~64-token budget and a deliberately concrete
+rubric — an abstract "how hard is this?" makes a small model grade nearly
+everything `hard`, which would escalate constantly and defeat the point. It grades
+*reasoning* difficulty, not input length: a long list to filter is still easy.
+Grades are cached by call-site shape (the system prompt, which identifies the job,
+plus a coarse size bucket), so a task type grades about once per process.
+
+**Cleanup, not escalation.** For `hard`, the local draft is passed *to* the mid
+tier as material rather than discarded. A draft that's mostly right anchors the
+cloud call and makes it shorter, and the cleanup prompt is explicit that the
+output contract is not up for revision — most callers here parse strict JSON, so
+a cleanup pass that "improved" the shape would break them. If cleanup is
+unavailable the local draft still stands: cleanup can improve an answer, never
+destroy one.
+
+**Failure is not a difficulty.** If the grader can't be reached, the local model
+can't answer either, so the task goes to the mid tier rather than being treated as
+easy. `cloud_fallback = false` inverts that for operators who want a hard
+guarantee that nothing leaves the machine — the failure surfaces, and the callers'
+deterministic fallbacks handle it. Requests carrying images bypass grading
+entirely and go to a vision-capable tier, since a text-only local model would
+silently ignore the attachment and answer confidently about nothing.
+
+**Answers are cached, not recomputed.** The tiers above decide *which* model runs;
+the cache decides *whether one needs to run at all*. A thread is re-analyzed on
+every new signal, candidate pairs get re-judged, the router re-grades the same call
+sites, and a restart replays work the daemon already paid for — and a large share
+of those requests are byte-identical to one already answered.
+
+So a decorator in front of every tier keys completions on the whole request (tier
+label, system prompt, messages, images, sampling limits) and serves stored answers.
+It lives in SQLite rather than a process map deliberately: a restart is precisely
+when the accumulated answers are most valuable, and an in-memory cache discards
+them exactly then. The tier label is part of the key, so switching models can't
+serve answers from the model you switched away from, and the key uses two
+independent hash lanes because a collision here would serve the *wrong* answer.
+
+Three things are deliberately never cached:
+
+- **Deliberate redos.** "Reconsider on model X", "re-triage this issue", and chat
+  set `no_cache`. The user asked for the work to be *redone*; a cache hit would
+  make the action look broken. Re-triage detects this by comparing the commit it's
+  about to read against the one the last analysis read — same code means redo, new
+  code is a natural miss anyway.
+- **Empty responses.** A model returning nothing is a transient failure, not an
+  answer. Caching it would make one bad minute stick for the whole TTL.
+- **The `session` key**, which is excluded from the key entirely — it's CLI
+  conversation bookkeeping, not part of the question, and including it would mint a
+  fresh key per session and make the cache useless.
+
+Two further policies, both enforced in code rather than left to convention:
+
+**Handled threads never reach a cloud model.** A snoozed, acknowledged, or
+resolved thread is settled work; re-summarizing it, re-judging its relations, and
+regenerating its mitigations spends metered calls re-litigating a decision the
+operator already made. `Analyst::reanalyze_with` refuses these outright. An
+explicit "reconsider on model X" against a handled thread is an **error**, not a
+silent skip — otherwise the UI would look like it worked.
+
+The one model allowed to look at handled work is the local classifier, doing
+exactly one job: deciding whether new activity means the issue actually came
+back. A snoozed thread is muted so recurring chatter stops interrupting — but
+"the same failure, worse" is not chatter. `triage_handled` un-mutes the whole
+thread (a thread is only as handled as its least-handled member) when the local
+model is confident past `reopen_min_confidence`; below that, and whenever Ollama
+is unreachable, it stays muted. That asymmetry is deliberate: a false reopen
+re-raises a notification the operator deliberately silenced, so uncertainty must
+fail closed.
+
+**Investigation escalates; it doesn't start cloud-side.** Steps 1–4 above and the
+shortlisting all run on-device — reading dozens of issue titles and commit
+subjects to decide what's even worth considering is mechanical work. Only
+`shortlist_size` already-plausible candidates reach the cloud model for the final
+verdict. An investigation therefore costs several local passes and *one* metered
+call; with no cloud reasoner reachable at all it still returns the local
+shortlist, marked as unranked.
+
+---
+
 ## MCP surface
 
 MuggleBot exposes an MCP server over both stdio (for local clients) and
@@ -357,6 +685,14 @@ principles).
 - `suggest_mitigations(thread_id)` — matches against the generic mitigations
   catalog; suggestions only, never executed.
 - `source_health()` — per-watcher status, last cursor, error state.
+- `list_repos()` — the code-derived repo index used for symptom routing.
+- `list_pr_fixes(issue_key)` — open PRs that may already fix an assigned issue,
+  with the diff-derived implementation, the critique, and what else they resolve.
+- `get_root_cause(thread_id)` — ranked issue/PR/commit/code candidates with
+  confidences and rationales. Hypotheses with citations, never conclusions.
+- `list_browser_investigations(thread_id)` — dashboard readings and their status.
+- `list_issue_triage()` / `get_issue_triage(issue_key | thread_id)` — assigned
+  issues read against their source, with candidate patch approaches.
 
 **Tools (correlation — read/write, writes gated):**
 
@@ -366,7 +702,17 @@ principles).
   own thread.
 - `attach_thread_context(thread_id, text | url)` — add ad-hoc grounding to one
   thread; triggers re-analysis.
-- `reanalyze(thread_id)` — force the LLM correlation pass to re-run.
+- `reanalyze(thread_id)` — force the LLM correlation pass to re-run. Errors on a
+  handled thread rather than silently skipping it.
+- `investigate_root_cause(thread_id)` — search the routed repos for what caused
+  this. Refuses handled threads.
+- `investigate_link(thread_id, url)` — queue a read-only browser investigation of
+  one dashboard link.
+- `record_browser_investigation(id, findings)` — file findings by hand when the
+  browser can't reach the page.
+- `retriage_issue(issue_key)` — re-pull an assigned issue's code and re-propose.
+- `refresh_repo_index()` — re-read the org's code, skipping repos whose commit is
+  already indexed.
 
 **Tools (grounding — read/write, writes gated):**
 
@@ -401,6 +747,39 @@ principles).
 - `live://hints` — active live-assist hints and flags.
 
 ---
+
+## Comments — read on merit, not on position
+
+The discussion on an issue is usually where its real content is. A title says what
+broke; the comments say what was tried, what was ruled out, what a maintainer
+decided, and — on a pull request — what a reviewer is blocking on. Reasoning from the
+body alone reliably misses an answer somebody already wrote down.
+
+A long thread can't go into a bounded context window whole, and the obvious
+shortcuts are both wrong. **Keeping the most recent N** throws away the framing: the
+opening carries the reproduction and the initial diagnosis, so truncating to the tail
+keeps a conclusion and discards what it was a conclusion about. **Keeping the first N
+and last M** is better but still decides by position, and a decisive comment in the
+middle of a fifty-comment thread — "this is a duplicate of the connection-pool bug,
+see #204" — is exactly the one that changes what you do.
+
+So **every comment is scored on its own merits** and selection is by that score:
+does this carry decision-relevant information? One batched local call scores all of
+them by index; underneath sits a deterministic heuristic (evidence markers, pasted
+code or stack traces, cross-references, minus social patterns and bots) so the pass
+still works with nothing reachable. The model can only *raise* a score, never lower
+it — a blocking review is pinned at maximum merit and cannot be demoted by a model
+that overlooked it, because "this doesn't handle the retry case" is the single most
+decision-changing sentence a PR can contain.
+
+Conversation order is restored before rendering: ranking says which comments matter
+more, not that the discussion happened backwards. The prompt states how many of how
+many were kept, so the model knows it's seeing a selection.
+
+Comments feed the two deep-read paths: an assigned issue's discussion goes into its
+characterization and patch proposals, and a PR's reviews go into the critique — where
+the instruction is explicitly to defer to a human reviewer who already objected,
+since that's better evidence than the model's own reading of the diff.
 
 ## Web UI — LCARS
 
@@ -487,18 +866,26 @@ red_alert = true               # red-alert + Critical notification on high-confi
 red_alert_min_confidence = 0.75
 
 [reasoner]
-# Default provider for ambient/unattended reasoning: Claude Sonnet.
-# "claude" uses the Claude Code subscription bridge when available, else an API key.
-ambient = "claude"            # claude | ollama | chatgpt
-ambient_model = "claude-sonnet-5"
+# The default for everything, and the grader. On-device.
+local = "ollama_local"        # claude | ollama | ollama_local | chatgpt
+local_model = "deepseek-coder:33b"
 
-# Heavier on-demand reasoning (deep correlation, mitigations).
+# Escalation: cleans up a `hard` local draft, and takes over if local can't answer.
+mid = "claude"
+mid_model = "claude-sonnet-5"
+
+# `extra_hard` only — where a plausible-but-wrong answer would mislead mid-incident.
 heavy = "claude"
 heavy_model = "claude-opus-4-8"
 
-# On-device fallback for anything pinned local-only (never leaves the machine).
+[reasoner.routing]
+enabled = true                # false → everything local, ungraded
+cleanup = true                # false → a `hard` local draft is returned as-is
+cloud_fallback = true         # false → a local outage errors; nothing leaves the machine
+
+# On-device endpoint; also the embedding model.
 ollama_url = "http://127.0.0.1:11434"
-ollama_model = "llama3.1"
+ollama_model = "deepseek-coder:33b"
 
 # Pin privacy-sensitive sources here to force on-device Ollama instead of Claude.
 local_only_sources = []
@@ -562,6 +949,17 @@ non-negotiables that keep an "AI ops helper" trustworthy.
    broadly applicable** without needing root cause. "The most expensive stretch
    of an outage is the time when users can see it."
 
+   The catalog is keyword-matched, and engineering prose is full of words like
+   "fails", "error", and "slow" — so the gate has to be on the *nature* of the
+   signals, not their vocabulary. An issue titled "add yaml validation to prevent
+   typos and other footguns" is a backlog item; answering it with "consider rolling
+   back the recent deploy" is noise that teaches you to ignore the panel entirely.
+   GitHub work items (assigned, review-requested, mentioned) are never incidents
+   however they're worded; alerts and failing CI are. The check is scoped to GitHub
+   on purpose — a *Slack* mention is conversation, and someone saying "pool
+   exhausted, cpu saturated" in an incident channel is exactly when first moves are
+   wanted.
+
 4. **Explainability by construction.** Every summary, correlation, and
    suggestion cites the signals it came from. No black-box "trust me."
 
@@ -578,11 +976,12 @@ non-negotiables that keep an "AI ops helper" trustworthy.
    docs, status pages) as a refreshed, summarized context library — grounding you
    own and can inspect, not a black box.
 
-8. **Local-first storage; reasoning via Claude.** Signals live on your machine
-   (SQLite). Reasoning defaults to Claude — Sonnet ambiently, Opus for deep work
-   — while sources you pin in `local_only_sources` are reasoned over on-device
-   with Ollama and never leave the machine. There is no MuggleBot-operated
-   backend; only your machine and the LLM provider you route to.
+8. **Local-first storage and local-first reasoning.** Signals live on your machine
+   (SQLite), and so does the default model — reasoning runs on-device unless the
+   task grades hard enough to be worth escalating, with tagging, repo crawling,
+   and anything touching handled threads pinned local regardless. Cloud tiers are
+   an escalation you can see and switch off, not the baseline. There is no
+   MuggleBot-operated backend; only your machine and the provider you route to.
 
 ---
 
@@ -625,6 +1024,23 @@ Live-thread detection via your Slack id, debounced re-analysis (1 min / 5 min
 cap), grounded hints + suggestions, and correctness/risk flags that drive LCARS
 red-alert + Critical notifications. Multimodal agent chat (screenshots, files)
 over the same grounding and tools.
+
+**Phase 5 — Reaching outside the notification stream.** ✅
+The first four phases all reason over signals that arrived on their own. This one
+goes and gets what's missing:
+
+- **Local-first routing.** Difficulty-graded model selection with an on-device
+  default, so the always-on work stops being metered work.
+- **Browser investigation.** Read the dashboard behind an alert link, in the
+  operator's authenticated Chrome, read-only.
+- **Root-cause investigation.** A code-derived repo index, then issue/PR/commit
+  search over it, producing cited candidate causes.
+- **Assigned-issue triage.** Every assigned issue on the board whether or not it
+  notified, checked out and read, with distinct patch approaches proposed and a
+  plain-English rendering.
+
+The through-line: correlation tells you *what* happened; this phase is about
+*why*, and about the work you already own that no event will remind you of.
 
 ---
 

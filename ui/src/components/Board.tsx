@@ -1,6 +1,7 @@
 import { createMemo, createSignal, For, type JSX, Show } from "solid-js";
 import { api } from "../api";
 import { entityHref } from "../entities";
+import { AttentionBadge } from "./Attention";
 import { renderMarkdown } from "../markdown";
 import { patchThreadSignalState, threads } from "../state";
 import { SEVERITY_RANK, type Signal, type ThreadView } from "../types";
@@ -141,9 +142,9 @@ function Topic(props: {
             <span class="kind">
               {t().signals.length} EVENT{t().signals.length === 1 ? "" : "S"}
             </span>
-            <span class={`state state-${t().state}`}>{t().state.toUpperCase()}</span>
             <time>{new Date(t().updated_at).toLocaleTimeString()}</time>
           </div>
+          <AttentionBadge attention={t().attention} />
         </header>
 
         <Show when={t().summary}>
