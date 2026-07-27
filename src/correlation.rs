@@ -1,118 +1,18 @@
-//! Correlation & de-duplication.
+//! Correlation: the relation graph over subjects.
 //!
-//! Phase 1: deterministic grouping of signals into threads by shared entities +
-//! time proximity (see [`Correlator::ingest`]). Phase 2: an LLM judges candidate
-//! thread pairs — `same` / `related` / `distinct` — building a persisted relation
-//! graph, with human override pins (provenance `user`) that always win and
-//! trigger a re-analysis constrained by those pins.
+//! Attribution is deterministic and lives in [`crate::subject::resolve`] — most of
+//! what used to need correlation is now just "which subject does this key name?".
+//! What's left is the genuinely ambiguous part, and it stays a model's job: two
+//! issues filed for one bug, an alert thread and the issue about it, a PR that
+//! fixes something already fixed.
 //!
-//! This module defines the correlation domain types and the engine. The engine
-//! lives in [`engine`] to keep the type surface (shared with the store, server,
-//! and MCP tools) readable.
+//! So this module owns the **edges**: an LLM judges candidate subject pairs —
+//! `same` / `related` / `distinct` — building a persisted graph, with human
+//! override pins (provenance `user`) that always win and constrain the next
+//! re-analysis.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-
-use crate::signal::{Entity, Severity, Signal, State};
-
-/// A correlated topic: the signals grouped by shared entities + time, plus the
-/// summary and (Phase 2) relation edges. Membership is derived from
-/// `signals.thread`; this carries the thread-level metadata.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Thread {
-    pub id: String,
-    pub title: String,
-    /// Deterministic one-liner always; replaced/extended by the LLM summary once
-    /// a reasoning pass runs.
-    pub summary: Option<String>,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
-    pub last_reasoned_at: Option<DateTime<Utc>>,
-    /// The user is active in this thread (Phase 4 live-assist).
-    pub live: bool,
-    /// Tags the pre-process classified this thread into, drawn from the context
-    /// library's vocabulary — the categorical routing key for grounding.
-    #[serde(default)]
-    pub tags: Vec<String>,
-    /// The tags were set by a human (on the board) and must not be overwritten by
-    /// the classifier — mirrors relation pins.
-    #[serde(default)]
-    pub tags_pinned: bool,
-}
-
-/// A thread with its members and derived attributes, as returned to clients.
-#[derive(Debug, Clone, Serialize)]
-pub struct ThreadView {
-    #[serde(flatten)]
-    pub thread: Thread,
-    pub signals: Vec<Signal>,
-    pub entities: Vec<Entity>,
-    pub severity: Severity,
-    pub state: State,
-    pub edges: Vec<Edge>,
-    pub context: Vec<ThreadContext>,
-    /// Does this need the operator, and has the AI actually looked at it?
-    pub attention: Attention,
-}
-
-/// The two questions the board exists to answer.
-///
-/// The five-state triage machine (`Unseen`/`Seen`/`Acknowledged`/`Resolved`/
-/// `Snoozed`) is bookkeeping — it records what you *did*, which is not what you want
-/// to read at a glance. What you want is: **does this need me**, and **has the AI
-/// been over it** (and at whose expense). So the board renders those two, and the
-/// underlying state stays available for filtering without being the headline.
-#[derive(Debug, Clone, Serialize)]
-pub struct Attention {
-    /// Needs a human. Derived — not a stored flag to keep in sync.
-    pub needed: bool,
-    /// Why, in a few words, so the badge is explainable rather than mysterious.
-    pub reason: Option<String>,
-    /// Which AI decorations exist on this thread. This is the "has the AI paid
-    /// attention?" indicator: an undecorated thread is one you're reading raw.
-    pub decorated: Decorations,
-}
-
-/// Per-facet record of what the AI has produced for a thread, and where the work
-/// ran.
-///
-/// Split by tier because "has the AI paid attention" and "what did it cost me" are
-/// different questions: `local_passes` is work that ran on this machine (fans up,
-/// battery down), `cloud_passes` is metered.
-#[derive(Debug, Clone, Default, Serialize)]
-pub struct Decorations {
-    /// A grounded summary has been written (not just the deterministic one-liner).
-    pub summary: bool,
-    /// Routing tags were classified.
-    pub tags: bool,
-    /// Tailored mitigations were generated and cached.
-    pub mitigations: bool,
-    /// A dashboard behind a linked alert was actually read.
-    pub dashboard: bool,
-    /// Root-cause investigation status: `complete`, `running`, `failed`, or absent.
-    pub root_cause: Option<String>,
-    /// Assigned-issue triage status, if this thread is an assigned issue.
-    pub triage: Option<String>,
-    /// How many associated pull requests have been judged.
-    pub prs_judged: usize,
-    /// Completed AI artifacts produced on-device.
-    pub local_passes: u32,
-    /// Completed AI artifacts that cost a metered call.
-    pub cloud_passes: u32,
-}
-
-impl Decorations {
-    /// Has the AI done anything at all here?
-    pub fn any(&self) -> bool {
-        self.summary
-            || self.tags
-            || self.mitigations
-            || self.dashboard
-            || self.root_cause.is_some()
-            || self.triage.is_some()
-            || self.prs_judged > 0
-    }
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -162,11 +62,11 @@ impl Provenance {
     }
 }
 
-/// An edge in the relation graph between two threads.
+/// An edge in the relation graph between two subjects.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Edge {
-    pub thread_a: String,
-    pub thread_b: String,
+    pub subject_a: String,
+    pub subject_b: String,
     pub kind: RelationKind,
     pub provenance: Provenance,
     pub confidence: f64,
@@ -199,19 +99,17 @@ impl ContextKind {
     }
 }
 
-/// Ad-hoc grounding attached to a single thread (free text or a URL). Attaching
-/// or editing it re-runs that thread's analysis.
+/// Ad-hoc grounding attached to a single subject (free text or a URL). Attaching
+/// or editing it re-runs that subject's analysis.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ThreadContext {
+pub struct SubjectContext {
     pub id: String,
-    pub thread_id: String,
+    pub subject_key: String,
     pub kind: ContextKind,
     pub content: String,
     pub summary: Option<String>,
     pub created_at: DateTime<Utc>,
 }
 
-pub mod engine;
 pub mod llm;
-pub use engine::Correlator;
 pub use llm::Analyst;

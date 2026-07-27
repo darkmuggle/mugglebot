@@ -36,18 +36,19 @@ use crate::comments::CommentJudge;
 use crate::correlation::{Analyst, RelationKind};
 use crate::github::{GithubClient, PullFile, PullRequest};
 use crate::reasoner::{self, CompletionRequest, Reasoner};
-use crate::store::{IssueTriage, PrFix, Store};
+pub use crate::store::PrFix;
+use crate::store::{IssueTriage, Store};
 
 /// What a PR is being judged *against*.
 ///
 /// Two callers need this: assigned-issue triage (the issue you own) and root-cause
-/// investigation (a thread that correlated up to an issue or PR). Naming the subject
-/// explicitly, rather than taking a triage row, is what lets an investigated thread
+/// investigation (a subject that correlated up to an issue or PR). Naming the subject
+/// explicitly, rather than taking a triage row, is what lets an investigated subject
 /// have its associated PRs judged too — the association is worthless if nothing
 /// reads it.
 #[derive(Debug, Clone)]
 pub struct Subject {
-    /// Storage key: `owner/repo#number` for an issue, else the thread id.
+    /// Storage key: `owner/repo#number` for an issue, else the subject id.
     pub key: String,
     pub repo: String,
     pub number: i64,
@@ -79,44 +80,39 @@ const REVIEW_CHARS: usize = 4_000;
 
 pub struct PrFixFinder {
     store: Arc<Store>,
-    /// Local coder model — reads diffs. First choice.
+    /// Local coder model — reads diffs. The only model that judges a PR.
     coder: Arc<dyn Reasoner>,
-    /// Small cloud model — first escalation.
-    brief: Arc<dyn Reasoner>,
-    /// Routed tier — last escalation.
-    routed: Arc<dyn Reasoner>,
+    /// A second attempt when the first returns nothing parseable, at a higher
+    /// temperature. Same model: this used to be an escalation ladder to a cloud tier, and
+    /// what it was actually recovering from was a model that had answered in prose, which
+    /// a retry fixes as well as a metered call did.
+    retry: Arc<dyn Reasoner>,
     /// Scores the PR's reviews so the critique accounts for what reviewers said.
     comments: CommentJudge,
-    /// Used to lump issues that one PR resolves into a single thread.
+    /// Used to lump issues that one PR resolves into a single subject.
     analyst: Option<Arc<Analyst>>,
 }
 
 impl PrFixFinder {
-    pub fn new(
-        store: Arc<Store>,
-        coder: Arc<dyn Reasoner>,
-        brief: Arc<dyn Reasoner>,
-        routed: Arc<dyn Reasoner>,
-    ) -> Self {
+    pub fn new(store: Arc<Store>, coder: Arc<dyn Reasoner>, retry: Arc<dyn Reasoner>) -> Self {
         Self {
             store,
             comments: CommentJudge::new(coder.clone()),
             coder,
-            brief,
-            routed,
+            retry,
             analyst: None,
         }
     }
 
     /// Attach the analyst so a PR that fixes several issues can collapse them onto
-    /// one thread. Optional because the investigator constructs a finder before the
+    /// one subject. Optional because the investigator constructs a finder before the
     /// analyst exists.
     pub fn with_analyst(mut self, analyst: Arc<Analyst>) -> Self {
         self.analyst = Some(analyst);
         self
     }
 
-    /// Collapse the issues one PR fixes into a single thread.
+    /// Collapse the issues one PR fixes into a single subject.
     ///
     /// If a patch resolves #1204, #1178 and #660, those are one piece of work with
     /// three issue numbers. Leaving them as three cards means reading the same
@@ -142,19 +138,19 @@ impl PrFixFinder {
                 return;
             }
         };
-        // Thread ids for those issues, deduplicated.
-        let mut threads: Vec<String> = Vec::new();
+        // Subject ids for those issues, deduplicated.
+        let mut subjects: Vec<String> = Vec::new();
         for key in &issues {
-            if let Ok(Some(tid)) = self.store.thread_for_issue(key) {
-                if !threads.contains(&tid) {
-                    threads.push(tid);
+            if let Ok(Some(tid)) = self.store.subject_for_issue(key) {
+                if !subjects.contains(&tid.to_string()) {
+                    subjects.push(tid);
                 }
             }
         }
-        if threads.len() < 2 {
+        if subjects.len() < 2 {
             return;
         }
-        let (keep, rest) = threads.split_first().expect("checked len >= 2");
+        let (keep, rest) = subjects.split_first().expect("checked len >= 2");
         for other in rest {
             match analyst.relate(keep, other, RelationKind::Same).await {
                 Ok(_) => debug!(
@@ -457,6 +453,10 @@ impl PrFixFinder {
              close the issue is a claim, not a verification. If a reviewer has already raised \
              something, say so and defer to it: a human who read this change and objected is better \
              evidence than your own reading>\", \
+             \"conversation\":\"<1-3 sentences summarizing what REVIEWERS said, or \\\"\\\" if \
+             there is no discussion. Report their positions, not your own: who is blocking on what, \
+             what was asked and answered, what is still open. If a reviewer objected, lead with the \
+             objection>\", \
              \"also_fixes\":[{\"reference\":\"<verbatim entry from the other-issues list>\", \
              \"why\":\"<one sentence naming the specific change in THIS diff that resolves that \
              other issue>\"}]}\n\
@@ -489,12 +489,10 @@ impl PrFixFinder {
             issue.number,
         );
 
-        // Local first; escalate only when a tier can't produce usable JSON.
-        for (tier, reasoner) in [
-            ("local", &self.coder),
-            ("brief", &self.brief),
-            ("routed", &self.routed),
-        ] {
+        // One local attempt, then one retry — both on the local model. What the old
+        // three-rung cloud ladder recovered from was an answer in prose rather than JSON,
+        // and a second ask fixes that.
+        for (tier, reasoner) in [("local", &self.coder), ("local-retry", &self.retry)] {
             let mut req = CompletionRequest::single(prompt.clone())
                 .with_system(system)
                 .max_tokens(900);
@@ -554,6 +552,15 @@ impl PrFixFinder {
             .and_then(|x| x.as_str())
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())?;
+        // What reviewers actually said. Distinct from the critique, which is
+        // MuggleBot's own reading of the diff — and deliberately shown separately on
+        // the board, because "a reviewer already objected to this" is much better
+        // evidence than a model's opinion of the same change.
+        let conversation = v
+            .get("conversation")
+            .and_then(|x| x.as_str())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
         let also_fixes = parse_also_fixes(&v, other_open_issues);
         let now = Utc::now().to_rfc3339();
         Some(PrFix {
@@ -563,8 +570,12 @@ impl PrFixFinder {
             pr_title: pr.title.clone(),
             pr_url: Some(pr.url.clone()),
             pr_author: pr.author.clone(),
+            // `merged` is its own state here, not GitHub's `closed`: a change that shipped
+            // and a change that was abandoned read as the same string upstream.
             pr_state: Some(if pr.draft {
                 "draft".to_string()
+            } else if pr.merged_at.is_some() {
+                "merged".to_string()
             } else {
                 pr.state.clone()
             }),
@@ -577,6 +588,7 @@ impl PrFixFinder {
                 .clamp(0.0, 1.0),
             implementation,
             critique: Some(critique),
+            conversation,
             also_fixes,
             analyzed_by: Some(tier.to_string()),
             created_at: now.clone(),
@@ -709,6 +721,7 @@ mod tests {
             labels: vec![],
             head_ref: Some("octocat:fix-pool".into()),
             updated_at: None,
+            merged_at: None,
         }
     }
 

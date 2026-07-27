@@ -1,11 +1,11 @@
 //! HTTP + WebSocket server backing the LCARS web UI.
 //!
 //! The WebSocket streams a full [`Snapshot`] on connect and then incremental
-//! [`Event`]s (new signals, thread updates, live-assist hints, red-alert). The
+//! [`Event`]s (new signals, subject updates, live-assist hints, red-alert). The
 //! REST surface is thin: typed convenience routes for the board and triage, a
 //! generic `/api/tool/:name` that dispatches through the shared [`crate::tools`]
 //! surface (so the UI and MCP share one implementation), the agent-chat endpoint,
-//! and database-backed credential management for the config page.
+//! and write-only credential management for the config page.
 //!
 //! The Rust server both serves the built LCARS UI (from `ui/dist`, same-origin)
 //! and exposes the API + WebSocket, so opening `http://<ui.listen>` is all you
@@ -37,13 +37,9 @@ use crate::event::{Event, Snapshot};
 use crate::live_engine::LiveEngine;
 use crate::notify::Notifier;
 use crate::reasoner;
-use crate::signal::State;
 use crate::store::Store;
+use crate::subject::Handled;
 use crate::tools::Tools;
-
-/// Credential accounts the config page manages the presence of. Reasoning rides
-/// the CLI bridge (no LLM API keys); `ollama` is the optional Ollama Cloud key.
-const KNOWN_CREDENTIALS: &[&str] = &["github", "slack", "granola", "ollama"];
 
 #[derive(Clone)]
 pub struct AppState {
@@ -57,7 +53,7 @@ pub struct AppState {
     pub allowed_origins: Arc<Vec<String>>,
     /// Path to the TOML config file, for the editable config page.
     pub config_path: Arc<String>,
-    /// Credential store — source tokens and authed-context secrets live here.
+    /// Signal + artifact store. Credentials go through `tools.secrets`, never here.
     pub store: Arc<Store>,
 }
 
@@ -102,10 +98,10 @@ pub async fn serve(addr: String, mut state: AppState) -> anyhow::Result<()> {
     let mut app = Router::new()
         .route("/health", get(|| async { "ok" }))
         .route("/api/signals", get(list_signals))
-        .route("/api/signals/{id}/state", post(set_state))
-        .route("/api/threads", get(list_threads))
+        .route("/api/subjects/{key}/handled", post(set_handled))
+        .route("/api/subjects", get(list_subjects))
         .route("/api/board/reset", post(reset_board))
-        .route("/api/threads/{id}", get(get_thread))
+        .route("/api/subjects/{key}", get(get_subject))
         .route("/api/config", get(get_config))
         .route("/api/config/raw", get(get_config_raw).put(put_config))
         .route("/api/chat", post(chat))
@@ -116,11 +112,8 @@ pub async fn serve(addr: String, mut state: AppState) -> anyhow::Result<()> {
         )
         .route("/api/models/{provider}", get(list_models))
         .route("/api/tool/{name}", post(call_tool))
-        .route(
-            "/api/credentials",
-            get(list_credentials).post(set_credential),
-        )
-        .route("/api/credentials/{account}", delete(delete_credential))
+        .route("/api/secrets", get(list_secrets).post(set_secret))
+        .route("/api/secrets/{name}", delete(delete_secret))
         .route("/ws", get(ws_handler));
 
     if serve_ui {
@@ -156,14 +149,14 @@ async fn list_signals(
     }
 }
 
-async fn list_threads(
+async fn list_subjects(
     AxumState(st): AxumState<AppState>,
     Query(q): Query<BTreeMap<String, String>>,
 ) -> impl IntoResponse {
     let active_only = q.get("active_only").map(|v| v != "false").unwrap_or(true);
     match st
         .tools
-        .call("list_threads", &json!({ "active_only": active_only }))
+        .call("list_subjects", &json!({ "active_only": active_only }))
         .await
     {
         Ok(v) => Json(v).into_response(),
@@ -171,11 +164,11 @@ async fn list_threads(
     }
 }
 
-async fn get_thread(
+async fn get_subject(
     AxumState(st): AxumState<AppState>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    match st.tools.call("get_thread", &json!({ "id": id })).await {
+    match st.tools.call("get_subject", &json!({ "id": id })).await {
         Ok(v) => Json(v).into_response(),
         Err(e) => err_response(e),
     }
@@ -230,51 +223,67 @@ async fn put_config(
 }
 
 #[derive(serde::Deserialize)]
-struct StateBody {
-    state: State,
+struct HandledBody {
+    handled: Handled,
+    /// For `snoozed`: when it should come back on its own.
+    #[serde(default)]
+    until: Option<chrono::DateTime<chrono::Utc>>,
 }
 
-async fn set_state(
+/// Triage a *subject*. Acknowledging half a PR's CI failures was never a coherent
+/// thing to express, which is why this replaced the per-signal state route.
+async fn set_handled(
     AxumState(st): AxumState<AppState>,
-    Path(id): Path<String>,
-    Json(body): Json<StateBody>,
+    Path(key): Path<String>,
+    Json(body): Json<HandledBody>,
 ) -> impl IntoResponse {
-    if let Err(e) = st.tools.store.set_state(&id, body.state) {
+    if let Err(e) = st.tools.store.set_handled(&key, body.handled, body.until) {
         return err_response(e);
     }
-    // Rebroadcast the changed signal, then reconcile the board (a resolve can
-    // drop the thread from the active set).
-    if let Ok(Some(sig)) = st.tools.store.get_signal(&id) {
-        // Triaging a thread resets its notification dedup, so new activity on it
-        // can notify again instead of being suppressed as "already seen".
-        if let Some(tid) = &sig.thread {
-            st.notifier.clear_notified(tid);
-        }
-        let _ = st.events.send(Event::Signal(sig));
+    // Triaging resets notification dedup, so genuinely new activity can notify
+    // again instead of being suppressed as "already seen".
+    st.notifier.clear_notified(&key);
+    if let Ok(Some(view)) = st.tools.attributor.subject_view(&key) {
+        let _ = st.events.send(Event::Subject(Box::new(view)));
     }
-    if let Ok(views) = st.tools.correlator.thread_views(true) {
+    if let Ok(views) = st.tools.attributor.subject_views(true) {
         let _ = st.events.send(Event::Board(views));
     }
     StatusCode::NO_CONTENT.into_response()
 }
 
-/// Board reset: delete all persisted board events and their derived thread
-/// analysis. Source health, configuration, credentials, memories, context, and
-/// chats remain intact. An upstream source may add a still-active notification
-/// again on its next poll, because reset does not mutate the source of record.
+/// Board reset: delete all persisted board events and their derived subject analysis.
+///
+/// The dividing line is **what a thing is keyed by**. Anything keyed by a signal or a subject
+/// goes: signals, subjects, the relation graph, attached context, hints, the
+/// parent/child hierarchy, root-cause reports, explanations, browser investigations. Subject
+/// keys are stable upstream identities (`owner/repo#412`), so the next poll re-mints the same
+/// key — anything left behind under it reappears on a card the operator believes is fresh.
+///
+/// Anything keyed by a **repo** stays, and that is the point: the code index — repo cards,
+/// component cards, commit summaries, the dependency graph — is hours of local GPU time and
+/// describes the code, not the board. A reset that cost the index would be one nobody could
+/// afford to press. Configuration, credentials, memories, context, chats, source health and the
+/// completion cache stay for the same reason.
+///
+/// Attribution pins also stay, deliberately: a pin is a human correction, and its whole purpose
+/// is surviving a re-ingest of the same event.
+///
+/// An upstream source may add a still-active notification again on its next poll, because reset
+/// does not mutate the source of record.
 async fn reset_board(AxumState(st): AxumState<AppState>) -> impl IntoResponse {
-    let (cleared, threads) = match st.tools.store.clear_board_events() {
+    let (cleared, subjects) = match st.tools.store.clear_board_events() {
         Ok(v) => v,
         Err(e) => return err_response(e),
     };
-    // Reset notification dedup for removed thread ids. A newly ingested event
-    // must be allowed to notify even if it happens to reuse a prior thread id.
-    for tid in &threads {
+    // Reset notification dedup for removed subject ids. A newly ingested event
+    // must be allowed to notify even if it happens to reuse a prior subject id.
+    for tid in &subjects {
         st.notifier.clear_notified(tid);
     }
-    // Push the authoritative active board so resolved threads drop out for every
+    // Push the authoritative active board so resolved subjects drop out for every
     // connected client (reconcile removes anything no longer in the active set).
-    if let Ok(views) = st.tools.correlator.thread_views(true) {
+    if let Ok(views) = st.tools.attributor.subject_views(true) {
         let _ = st.events.send(Event::Board(views));
     }
     Json(json!({ "cleared": cleared })).into_response()
@@ -295,23 +304,23 @@ async fn call_tool(
     }
 }
 
-/// After a write tool that changes threads, push the authoritative active-thread
-/// set so clients reconcile (and drop threads that merged or split away).
+/// After a write tool that changes subjects, push the authoritative active-subject
+/// set so clients reconcile (and drop subjects that merged or split away).
 async fn broadcast_after(st: &AppState, tool: &str) {
     let touches_threads = matches!(
         tool,
         "relate"
-            | "split_thread"
-            | "attach_thread_context"
+            | "split_subject"
+            | "attach_subject_context"
             | "reanalyze"
-            | "set_thread_tags"
+            | "set_subject_tags"
             | "record_browser_investigation"
-            // An investigation rewrites the thread's summary (its findings feed the
+            // An investigation rewrites the subject's summary (its findings feed the
             // summary prompt), so the board needs the refreshed view.
             | "investigate_root_cause"
     );
     if touches_threads {
-        if let Ok(views) = st.tools.correlator.thread_views(true) {
+        if let Ok(views) = st.tools.attributor.subject_views(true) {
             let _ = st.events.send(Event::Board(views));
         }
     }
@@ -338,7 +347,7 @@ use crate::reasoner::provider_label;
 async fn chat(AxumState(st): AxumState<AppState>, Json(body): Json<ChatBody>) -> impl IntoResponse {
     let result = match (&body.provider, &body.model) {
         (Some(provider), Some(model)) if !model.trim().is_empty() => {
-            let ollama_key = st.store.credential_get("ollama").ok().flatten();
+            let ollama_key = st.tools.secrets.get_opt("ollama");
             let reasoner = reasoner::build(
                 provider_label(provider),
                 model,
@@ -409,7 +418,7 @@ async fn list_models(
     AxumState(st): AxumState<AppState>,
     Path(provider): Path<String>,
 ) -> impl IntoResponse {
-    let ollama_key = st.store.credential_get("ollama").ok().flatten();
+    let ollama_key = st.tools.secrets.get_opt("ollama");
     match reasoner::list_models(
         provider_label(&provider),
         &st.tools.config.reasoner,
@@ -422,39 +431,40 @@ async fn list_models(
     }
 }
 
-async fn list_credentials(AxumState(st): AxumState<AppState>) -> impl IntoResponse {
-    let mut out = serde_json::Map::new();
-    for &acc in KNOWN_CREDENTIALS {
-        let present = st.store.credential_get(acc).ok().flatten().is_some();
-        out.insert(acc.to_string(), Value::Bool(present));
+/// Which secrets are set, and when each last changed. **Never values** — this is
+/// the whole API surface for reading the credential store, and it is deliberately
+/// incapable of returning one.
+async fn list_secrets(AxumState(st): AxumState<AppState>) -> impl IntoResponse {
+    match st.tools.secrets.status(crate::secrets::KNOWN_SECRETS) {
+        Ok(list) => Json(json!({ "secrets": list })).into_response(),
+        Err(e) => err_response(e),
     }
-    Json(Value::Object(out))
 }
 
 #[derive(serde::Deserialize)]
-struct CredentialBody {
-    account: String,
-    secret: String,
+struct SecretBody {
+    name: String,
+    value: String,
 }
 
-async fn set_credential(
+async fn set_secret(
     AxumState(st): AxumState<AppState>,
-    Json(body): Json<CredentialBody>,
+    Json(body): Json<SecretBody>,
 ) -> impl IntoResponse {
-    if body.account.trim().is_empty() || body.secret.is_empty() {
-        return (StatusCode::BAD_REQUEST, "account and secret required").into_response();
+    if body.name.trim().is_empty() || body.value.is_empty() {
+        return (StatusCode::BAD_REQUEST, "name and value required").into_response();
     }
-    match st.store.credential_set(&body.account, &body.secret) {
+    match st.tools.secrets.set(&body.name, &body.value) {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => err_response(e),
     }
 }
 
-async fn delete_credential(
+async fn delete_secret(
     AxumState(st): AxumState<AppState>,
-    Path(account): Path<String>,
+    Path(name): Path<String>,
 ) -> impl IntoResponse {
-    match st.store.credential_delete(&account) {
+    match st.tools.secrets.delete(&name) {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => err_response(e),
     }
@@ -516,8 +526,9 @@ async fn ws_loop(mut socket: WebSocket, st: AppState) {
 async fn build_snapshot(st: &AppState) -> Option<Snapshot> {
     Some(Snapshot {
         signals: st.tools.store.recent(200).ok()?,
-        threads: st.tools.correlator.thread_views(true).ok()?,
+        subjects: st.tools.attributor.subject_views(true).ok()?,
         hints: st.tools.store.list_hints(None).ok()?,
         health: st.tools.store.source_health().ok()?,
+        dispatches: crate::dispatch::all(),
     })
 }

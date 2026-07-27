@@ -45,6 +45,20 @@ pub trait Watcher: Send + Sync {
 
     /// Fetch the latest signals since the last poll, normalized to [`Signal`].
     /// Must be idempotent — re-emitting a signal is fine, the store dedups on
-    /// `(source, external_id)`.
+    /// `(source, external_id, version)`.
     async fn poll(&self) -> Result<PollBatch>;
+
+    /// This watcher's resume point, as an opaque string.
+    ///
+    /// Stored in the `Watcher` virtual object's state so a restart resumes instead
+    /// of re-reading from the top (a replay) or from now (a gap). Watchers whose
+    /// dedup is content-based can leave this `None`.
+    fn cursor(&self) -> Option<String> {
+        None
+    }
+
+    /// Restore a cursor saved by a previous process. Called once before the first
+    /// poll; must tolerate a cursor written by an older version of the watcher —
+    /// a malformed one means "start fresh", never a crash.
+    fn restore_cursor(&self, _cursor: &str) {}
 }

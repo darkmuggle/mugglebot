@@ -26,7 +26,7 @@ use tracing::debug;
 use super::{PollBatch, SourceSnapshot, Watcher};
 use crate::config::{self, Assigned as AssignedCfg};
 use crate::github::{GithubClient, IssueHit};
-use crate::signal::{Entity, Severity, Signal, SignalKind, Source, State};
+use crate::signal::{ResolutionKey, Severity, Signal, SignalKind, Source};
 
 /// Cap per poll. More assigned issues than this and the board is not the problem.
 const MAX_ASSIGNED: usize = 100;
@@ -71,36 +71,59 @@ pub fn signal_for(issue: &IssueHit) -> Signal {
         .map(|t| t.with_timezone(&Utc))
         .unwrap_or_else(Utc::now);
 
-    let mut entities = vec![
-        Entity::new("repo", issue.repo.clone()),
-        // The same entity shape the notification watcher emits, so a notification
-        // about this issue correlates into the same thread instead of a second card.
-        Entity::new("issue", format!("{}#{}", issue.repo, issue.number)),
-    ];
+    let is_pr = issue.kind == "pull_request";
+    let mut keys = vec![ResolutionKey::new("repo", issue.repo.clone())];
+    // The same entity shape the notification watcher emits, so a notification about this item
+    // correlates into the same subject instead of minting a second card. A PR keys as a PR,
+    // which is what files it under the issue it closes rather than beside it.
+    keys.push(if is_pr {
+        ResolutionKey::new("pr", format!("{}#{}", issue.repo, issue.number))
+    } else {
+        ResolutionKey::new("issue", format!("{}#{}", issue.repo, issue.number))
+    });
+    // A PR that closes an issue is *about* that issue. Naming the issue as a key is what makes
+    // attribution file the PR underneath it — the hierarchy is Issue > PullRequest, so the issue
+    // key wins the ranked climb and the PR becomes its child rather than a second card beside it.
+    //
+    // Only GitHub's closing keywords count, via the same parser the notification watcher uses. A
+    // bare `#412` in a PR body is usually a cross-reference ("similar to #412"), and treating that
+    // as identity would merge unrelated work.
+    if is_pr {
+        if let Some(n) =
+            crate::watchers::github::linked_issue(issue.body.as_deref(), Some(&issue.title))
+        {
+            keys.push(ResolutionKey::new("issue", format!("{}#{}", issue.repo, n)));
+        }
+    }
     for label in &issue.labels {
-        entities.push(Entity::new("label", label.clone()));
+        keys.push(ResolutionKey::new("label", label.clone()));
     }
 
     Signal {
-        id: Signal::make_id(Source::GitHub, &external),
+        id: Signal::make_id(Source::GitHub, &external, None),
         source: Source::GitHub,
         external_id: external,
         kind: SignalKind::Assigned,
         title: format!(
-            "Assigned: {} ({}#{})",
-            issue.title, issue.repo, issue.number
+            "{}: {} ({}#{})",
+            if is_pr { "PR" } else { "Issue" },
+            issue.title,
+            issue.repo,
+            issue.number
         ),
         body: issue.body.clone(),
         url: Some(issue.url.clone()),
         actor: None,
-        entities,
+        keys,
         severity: Severity::Notice,
-        state: State::Unseen,
+        version: None,
+        upstream_gone: false,
         occurred_at: occurred,
         ingested_at: Utc::now(),
-        thread: None,
+        subject: None,
         raw: serde_json::json!({
             "assigned_issue": true,
+            "is_pull_request": is_pr,
             "repo": issue.repo,
             "number": issue.number,
             "issue_key": issue_key(&issue.repo, issue.number),
@@ -116,6 +139,9 @@ pub fn signal_for(issue: &IssueHit) -> Signal {
 #[async_trait]
 impl Watcher for AssignedWatcher {
     fn name(&self) -> &'static str {
+        // Unchanged despite now covering participation rather than assignment: the name is a
+        // Restate object key, and renaming it would abandon the durable poll cursor and the
+        // timer alongside it. Behaviour widened, identity kept.
         "github-assigned"
     }
 
@@ -124,8 +150,12 @@ impl Watcher for AssignedWatcher {
     }
 
     async fn poll(&self) -> Result<PollBatch> {
-        let issues = self.client.assigned_issues(MAX_ASSIGNED).await?;
-        debug!("assigned: {} open issue(s)", issues.len());
+        let issues = self.client.participating_issues(MAX_ASSIGNED).await?;
+        let prs = issues.iter().filter(|i| i.kind == "pull_request").count();
+        debug!(
+            "participating: {} open item(s), {prs} of them pull requests",
+            issues.len()
+        );
         let signals: Vec<Signal> = issues.iter().map(signal_for).collect();
         // A full listing, so the reconciler can resolve issues that were closed or
         // unassigned since the last poll rather than leaving them on the board.
@@ -142,6 +172,97 @@ impl Watcher for AssignedWatcher {
 
 #[cfg(test)]
 mod tests {
+    /// A PR that closes an issue nests under it.
+    ///
+    /// The mechanism is the *key*, not a later fix-up: naming the issue makes attribution's ranked
+    /// climb land on the issue (Issue outranks PullRequest), so the PR becomes its child. Without
+    /// this the PR is a second card beside the issue it resolves, which is the shape the board
+    /// exists to avoid.
+    #[test]
+    fn a_pull_request_that_closes_an_issue_nests_under_it() {
+        let mut pr = hit();
+        pr.kind = "pull_request".into();
+        pr.number = 987;
+        pr.title = "Raise the pool ceiling".into();
+        pr.body = Some("Fixes #412 by bumping max_connections.".into());
+
+        let sig = signal_for(&pr);
+        let issue_keys: Vec<&str> = sig
+            .keys
+            .iter()
+            .filter(|k| k.kind == "issue")
+            .map(|k| k.value.as_str())
+            .collect();
+        assert_eq!(
+            issue_keys,
+            vec![format!("{}#412", pr.repo).as_str()],
+            "the closed issue must be named as a key: {:?}",
+            sig.keys
+        );
+        // Still identifies as a PR, or it would *become* the issue rather than nest under it.
+        assert!(sig
+            .keys
+            .iter()
+            .any(|k| k.kind == "pr" && k.value.ends_with("#987")));
+    }
+
+    /// A bare reference is not a resolution.
+    ///
+    /// "Similar to #412" is a cross-reference, and treating it as identity would file unrelated
+    /// work under someone else's issue.
+    #[test]
+    fn a_bare_issue_reference_does_not_nest_the_pr() {
+        let mut pr = hit();
+        pr.kind = "pull_request".into();
+        pr.body = Some("Similar to #412, but for the other pool.".into());
+        let sig = signal_for(&pr);
+        assert!(
+            !sig.keys.iter().any(|k| k.kind == "issue"),
+            "a cross-reference must not nest: {:?}",
+            sig.keys
+        );
+    }
+
+    /// A pull request the user is involved in becomes a PR-ranked signal.
+    ///
+    /// It used to become nothing at all: the query filtered pull requests out one line before
+    /// they would have been used, so a user's own PRs never reached the board. The rank matters as
+    /// much as the presence — keyed as `pr`, it files under the issue it closes; keyed as `issue`
+    /// it would sit beside it as a second card.
+    #[test]
+    fn a_participating_pull_request_keys_as_a_pr() {
+        let mut hit = hit();
+        hit.kind = "pull_request".into();
+        let sig = signal_for(&hit);
+
+        assert!(
+            sig.keys.iter().any(|k| k.kind == "pr"),
+            "a PR must key as a PR: {:?}",
+            sig.keys
+        );
+        assert!(
+            !sig.keys.iter().any(|k| k.kind == "issue"),
+            "keying it as an issue would mint a card beside the one it closes"
+        );
+        assert!(sig.title.starts_with("PR:"), "{}", sig.title);
+        assert_eq!(
+            sig.raw.get("is_pull_request").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn a_participating_issue_still_keys_as_an_issue() {
+        let sig = signal_for(&hit());
+        assert!(sig.keys.iter().any(|k| k.kind == "issue"));
+        assert!(!sig.keys.iter().any(|k| k.kind == "pr"));
+        assert!(sig.title.starts_with("Issue:"), "{}", sig.title);
+        assert_eq!(
+            sig.raw.get("is_pull_request").and_then(|v| v.as_bool()),
+            Some(false)
+        );
+    }
+
     use super::*;
 
     fn hit() -> IssueHit {
@@ -176,11 +297,11 @@ mod tests {
     fn carries_the_issue_entity_for_correlation() {
         let s = signal_for(&hit());
         assert!(s
-            .entities
-            .contains(&Entity::new("issue", "restatedev/restate#412")));
+            .keys
+            .contains(&ResolutionKey::new("issue", "restatedev/restate#412")));
         assert!(s
-            .entities
-            .contains(&Entity::new("repo", "restatedev/restate")));
+            .keys
+            .contains(&ResolutionKey::new("repo", "restatedev/restate")));
     }
 
     #[test]

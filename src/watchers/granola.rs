@@ -16,7 +16,7 @@ use tracing::warn;
 
 use super::{PollBatch, Watcher};
 use crate::config::{self, GranolaSource};
-use crate::signal::{Entity, Severity, Signal, SignalKind, Source, State};
+use crate::signal::{ResolutionKey, Severity, Signal, SignalKind, Source};
 
 pub struct GranolaWatcher {
     client: reqwest::Client,
@@ -52,6 +52,16 @@ impl Watcher for GranolaWatcher {
 
     fn interval(&self) -> Duration {
         self.interval
+    }
+
+    fn cursor(&self) -> Option<String> {
+        self.cursor.lock().ok()?.clone()
+    }
+
+    fn restore_cursor(&self, cursor: &str) {
+        if let Ok(mut c) = self.cursor.lock() {
+            *c = Some(cursor.to_string());
+        }
     }
 
     async fn poll(&self) -> Result<PollBatch> {
@@ -156,28 +166,30 @@ pub fn normalize_document(doc: &serde_json::Value) -> Option<Signal> {
         Severity::Notice
     };
 
-    let mut entities = vec![Entity::new("meeting", &title)];
+    let mut keys = vec![ResolutionKey::new("meeting", &title)];
     for owner in extract_owners(&actions) {
-        entities.push(Entity::new("person", owner));
+        keys.push(ResolutionKey::new("person", owner));
     }
 
-    // Fold the updated timestamp into the dedup key so an edited meeting re-notifies.
-    let external_id = format!("{id}@{}", updated.as_deref().unwrap_or("0"));
+    // The updated timestamp is the version, so an edited meeting re-notifies.
+    let external_id = id.to_string();
+    let version = Some(updated.clone().unwrap_or_else(|| "0".into()));
     Some(Signal {
-        id: Signal::make_id(Source::Granola, &external_id),
+        id: Signal::make_id(Source::Granola, &external_id, version.as_deref()),
         source: Source::Granola,
         external_id,
+        version,
         kind: SignalKind::MeetingNote,
         title,
         body: Some(body.trim_end().to_string()),
         url: doc.get("url").and_then(|v| v.as_str()).map(str::to_string),
         actor: None,
-        entities,
+        keys,
         severity,
-        state: State::Unseen,
+        upstream_gone: false,
         occurred_at,
         ingested_at: Utc::now(),
-        thread: None,
+        subject: None,
         raw: doc.clone(),
         tags: Vec::new(),
     })
@@ -296,11 +308,11 @@ mod tests {
         assert!(body.contains("ship the fix"));
         assert!(body.contains("roll back the deploy"));
         assert!(s
-            .entities
+            .keys
             .iter()
             .any(|e| e.kind == "person" && e.value == "ben"));
         assert!(s
-            .entities
+            .keys
             .iter()
             .any(|e| e.kind == "meeting" && e.value == "Weekly sync"));
     }
@@ -312,12 +324,17 @@ mod tests {
     }
 
     #[test]
-    fn dedup_key_includes_timestamp() {
+    fn dedup_key_separates_the_id_from_the_version() {
         let doc = serde_json::json!({
             "id": "doc1", "title": "T", "updated_at": "2026-07-20T10:00:00Z",
             "notes": "- [ ] do a thing",
         });
         let s = normalize_document(&doc).unwrap();
-        assert_eq!(s.external_id, "doc1@2026-07-20T10:00:00Z");
+        // The id is the meeting; the timestamp is the version. Keeping them in
+        // separate fields is what lets the ingress idempotency key and the store's
+        // unique index agree without either re-parsing a composite string.
+        assert_eq!(s.external_id, "doc1");
+        assert_eq!(s.version.as_deref(), Some("2026-07-20T10:00:00Z"));
+        assert_eq!(s.dedup_key(), "granola:doc1:2026-07-20T10:00:00Z");
     }
 }

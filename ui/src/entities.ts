@@ -1,6 +1,6 @@
 // Deep links for entity chips. GitHub-derived entities (repo/pr/issue/…) point
 // at their page on github.com; a bare Slack channel or meeting isn't browsable.
-import type { Entity } from "./types";
+import type { ResolutionKey } from "./types";
 
 // "owner/name#123" → ["owner/name", "123"]; undefined if not that shape.
 function repoAndNumber(value: string): [string, string] | undefined {
@@ -12,7 +12,7 @@ function repoAndNumber(value: string): [string, string] | undefined {
 const GH_LOGIN = /^[a-z\d](?:[a-z\d]|-(?=[a-z\d])){0,38}$/i;
 
 /** A browser URL for an entity chip, or undefined when it isn't linkable. */
-export function entityHref(e: Entity): string | undefined {
+export function entityHref(e: ResolutionKey): string | undefined {
   const v = e.value.trim();
   switch (e.kind) {
     case "repo":

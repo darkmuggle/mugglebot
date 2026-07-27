@@ -1,0 +1,396 @@
+//! The remaining workflows: `BrowserRead`, `PrCritique`, `RepoIndex`, `Merge`,
+//! `ContextIngest`.
+//!
+//! Each replaces a hand-rolled loop, and each replacement removes a specific piece of
+//! machinery rather than just relocating it:
+//!
+//! | Workflow | Replaces | What goes away |
+//! |---|---|---|
+//! | `BrowserRead` | a claim-a-row worker over `browser_investigations` | the `status` column as a queue, and a job left `running` when the daemon died inside it |
+//! | `PrCritique` | an inline call during triage | re-judging a PR whose diff hasn't moved |
+//! | `RepoIndex` | a `tokio` interval loop | a refresh silently skipped because the process restarted mid-cycle |
+//! | `ContextIngest` | two interval loops (URL refresh, directory sync) | re-summarizing a page whose ETag hasn't changed |
+//! | `Merge` | the Analyst's inline auto-merge | a half-applied merge — signals moved, edges not rewritten |
+//!
+//! The keys are the interesting part in every case: `{investigation-id}`,
+//! `{pr}@{sha}`, `{org}@{bucket}`, `{context-id}@{etag|mtime}`, `{a}+{b}`. A
+//! redundant submission is a refused key rather than repeated work.
+
+use std::sync::Arc;
+
+use restate_sdk::prelude::*;
+
+use super::{split_versioned, WorkflowOps};
+use crate::restate::scopes;
+
+// ---- BrowserRead -------------------------------------------------------------
+
+/// Read the dashboard behind an alert link, in the operator's authenticated Chrome.
+///
+/// Keyed by investigation id. Runs in the `browser` scope with concurrency 1, because
+/// there is one Chrome — which is what the claim-a-row worker loop was for. The
+/// difference is that a crashed investigation releases its slot, where a claimed row
+/// stayed claimed forever.
+pub struct BrowserRead {
+    ops: Arc<WorkflowOps>,
+}
+
+impl BrowserRead {
+    pub fn new(ops: Arc<WorkflowOps>) -> Self {
+        Self { ops }
+    }
+    pub const SCOPE: &'static str = scopes::BROWSER;
+}
+
+#[restate_sdk::workflow]
+impl BrowserRead {
+    /// Capped retries. A permanently unreachable link must stop consuming the single
+    /// browser slot rather than being retried forever — which is what Restate does by
+    /// default, and what the old worker's `max_attempts` column existed to prevent.
+    ///
+    /// Reports itself to the dispatch strip: the submitting call returned as soon as the
+    /// ingress accepted this, so `Running` / `Done` / `Failed` can only come from here.
+    #[handler(invocation_retry_policy(max_attempts = 4))]
+    async fn run(&self, ctx: WorkflowContext<'_>) -> HandlerResult<Json<serde_json::Value>> {
+        let key = ctx.key().to_string();
+        super::tracked("BrowserRead", &key, self.read(ctx)).await
+    }
+}
+
+impl BrowserRead {
+    async fn read(&self, ctx: WorkflowContext<'_>) -> HandlerResult<Json<serde_json::Value>> {
+        let id = ctx.key().to_string();
+        let ops = self.ops.clone();
+        let value = ctx
+            .run(|| {
+                let ops = ops.clone();
+                let id = id.clone();
+                async move {
+                    let out = ops.browser_read(&id).await.map_err(browser_classify)?;
+                    Ok(Json(out))
+                }
+            })
+            .await?
+            .into_inner();
+        Ok(Json(value))
+    }
+}
+
+/// No Chrome on the port, no `npx`, or an unparseable response is **transient** — the
+/// operator may simply not have started Chrome with `--remote-debugging-port` yet, and
+/// retrying is exactly right. A 404 or an auth wall is terminal: that link will never
+/// load, and a permanently unreachable page must stop consuming the single browser
+/// slot rather than spinning forever.
+fn browser_classify(e: anyhow::Error) -> HandlerError {
+    let msg = format!("{e:#}");
+    let lower = msg.to_ascii_lowercase();
+    let terminal = [
+        "404",
+        "not found",
+        "403",
+        "unauthorized",
+        "no such investigation",
+    ]
+    .iter()
+    .any(|m| lower.contains(m));
+    if terminal {
+        TerminalError::new(msg).into()
+    } else {
+        HandlerError::from(anyhow::anyhow!(msg))
+    }
+}
+
+// ---- PrCritique --------------------------------------------------------------
+
+/// Judge whether an open PR actually fixes an assigned issue.
+///
+/// Keyed `{owner}/{repo}!{n}@{sha}`: the same diff is the same judgment, so a re-run
+/// on an unchanged PR is a refused key rather than another read of the diff and its
+/// reviews. Runs on-device — reading a diff is exactly the work that shouldn't leave
+/// the machine.
+pub struct PrCritique {
+    ops: Arc<WorkflowOps>,
+}
+
+impl PrCritique {
+    pub fn new(ops: Arc<WorkflowOps>) -> Self {
+        Self { ops }
+    }
+    pub const SCOPE: &'static str = scopes::LOCAL_LLM;
+}
+
+#[restate_sdk::workflow]
+impl PrCritique {
+    /// Reports itself to the dispatch strip: the submitting call returned as soon as the
+    /// ingress accepted this, so `Running` / `Done` / `Failed` can only come from here.
+    #[handler]
+    async fn run(&self, ctx: WorkflowContext<'_>) -> HandlerResult<Json<serde_json::Value>> {
+        let key = ctx.key().to_string();
+        super::tracked("PrCritique", &key, self.critique(ctx)).await
+    }
+}
+
+impl PrCritique {
+    async fn critique(&self, ctx: WorkflowContext<'_>) -> HandlerResult<Json<serde_json::Value>> {
+        let (pr, sha) = split_versioned(ctx.key());
+        let (pr, sha) = (pr.to_string(), sha.to_string());
+        let ops = self.ops.clone();
+        let value = ctx
+            .run(|| {
+                let ops = ops.clone();
+                let (pr, sha) = (pr.clone(), sha.clone());
+                async move {
+                    let out = ops
+                        .pr_critique(&pr, &sha)
+                        .await
+                        .map_err(|e| HandlerError::from(TerminalError::new(format!("{e:#}"))))?;
+                    Ok(Json(out))
+                }
+            })
+            .await?
+            .into_inner();
+        Ok(Json(value))
+    }
+}
+
+// ---- RepoIndex ---------------------------------------------------------------
+
+/// Re-read the watched org's repositories and distil an index card per repo from its
+/// **code** — the routing table for symptom → repo.
+///
+/// Keyed `{org}@{bucket}` where the bucket is a coarse time slice, so two refreshes in
+/// the same window collapse. Runs in the `github` scope: indexing an org is otherwise
+/// a self-inflicted rate limit.
+pub struct RepoIndex {
+    ops: Arc<WorkflowOps>,
+}
+
+impl RepoIndex {
+    pub fn new(ops: Arc<WorkflowOps>) -> Self {
+        Self { ops }
+    }
+    /// Its own scope at concurrency 1, not `github` at 4: the crawl's hazard is two of
+    /// *itself* running, which a shared API-burst scope does not express.
+    pub const SCOPE: &'static str = scopes::REPO_INDEX;
+}
+
+#[restate_sdk::workflow]
+impl RepoIndex {
+    /// Reports itself to the dispatch strip: the submitting call returned as soon as the
+    /// ingress accepted this, so `Running` / `Done` / `Failed` can only come from here.
+    #[handler]
+    async fn run(&self, ctx: WorkflowContext<'_>) -> HandlerResult<u64> {
+        let key = ctx.key().to_string();
+        super::tracked("RepoIndex", &key, self.sync(ctx)).await
+    }
+}
+
+impl RepoIndex {
+    async fn sync(&self, ctx: WorkflowContext<'_>) -> HandlerResult<u64> {
+        let (org, bucket) = split_versioned(ctx.key());
+        let (org, bucket) = (org.to_string(), bucket.to_string());
+        let ops = self.ops.clone();
+        let summarized = ctx
+            .run(|| {
+                let ops = ops.clone();
+                async move {
+                    ops.repos
+                        .sync()
+                        .await
+                        .map(|n| n as u64)
+                        .map_err(|e| HandlerError::from(anyhow::anyhow!("{e:#}")))
+                }
+            })
+            .await?;
+        tracing::info!("repo index for {org} ({bucket}): {summarized} card(s) rebuilt");
+        Ok(summarized)
+    }
+}
+
+// ---- PrDiff ------------------------------------------------------------------
+
+/// Read a pull request's diff, summarize it, and store it on the pull request.
+///
+/// Keyed `{owner}/{repo}!{n}@{watermark}`: the same activity is the same diff, so a
+/// re-submission for a PR nothing has happened to is a refused key rather than another API
+/// call and another model pass. That refusal is what makes it safe to submit this from every
+/// analysis pass — see [`crate::prdiff`] for why the report is kept at all.
+///
+/// The result goes to the object rather than back to the caller. Nothing awaits this: the
+/// pane reads the object's state, and a diff that is not there yet is fetched inline once.
+pub struct PrDiff {
+    ops: Arc<WorkflowOps>,
+}
+
+impl PrDiff {
+    pub fn new(ops: Arc<WorkflowOps>) -> Self {
+        Self { ops }
+    }
+    /// The local model does the summarizing, so this belongs in the same queue as every
+    /// other on-device pass — one GPU, one lane.
+    pub const SCOPE: &'static str = scopes::LOCAL_LLM;
+}
+
+#[restate_sdk::workflow]
+impl PrDiff {
+    /// Reports itself to the dispatch strip: the submitting call returned as soon as the
+    /// ingress accepted this, so `Running` / `Done` / `Failed` can only come from here.
+    #[handler]
+    async fn run(&self, ctx: WorkflowContext<'_>) -> HandlerResult<bool> {
+        let key = ctx.key().to_string();
+        super::tracked("PrDiff", &key, self.read(ctx)).await
+    }
+}
+
+impl PrDiff {
+    async fn read(&self, ctx: WorkflowContext<'_>) -> HandlerResult<bool> {
+        let (pr, watermark) = split_versioned(ctx.key());
+        let (pr, watermark) = (pr.to_string(), watermark.to_string());
+        let Some((repo, number)) = crate::prdiff::parse_pr_key(&pr) else {
+            return Err(TerminalError::new(format!("{pr} does not name a pull request")).into());
+        };
+
+        let ops = self.ops.clone();
+        let stored = ctx
+            .run(|| {
+                let ops = ops.clone();
+                let (repo, watermark) = (repo.clone(), watermark.clone());
+                async move {
+                    let report = ops.diff_reader().read(&repo, number).await;
+                    // A PR whose diff could not be read is stored *with* its error rather
+                    // than left absent: absent means "never looked", and the pane would
+                    // fetch it again on every open, paying the same failing call each time.
+                    Ok(Json(crate::prdiff::StoredDiff {
+                        watermark,
+                        fetched_at: chrono::Utc::now(),
+                        report: crate::prdiff::trim_for_state(report),
+                    }))
+                }
+            })
+            .await?
+            .into_inner();
+
+        let ok = stored.report.error.is_none();
+        ctx.object_client::<crate::restate::objects::pull_request::PullRequestClient>(pr.clone())
+            .put_diff(Json(stored))
+            .send();
+        tracing::info!("diff for {pr} (watermark {watermark}): stored, ok={ok}");
+        Ok(ok)
+    }
+}
+
+// ---- ContextIngest -----------------------------------------------------------
+
+/// Fetch → normalize → summarize → embed → store, for one context source.
+///
+/// Keyed `{context-id}@{etag|mtime}`: an unchanged source is a refused key, which is
+/// the whole point — the old interval loop re-checked every source on a timer and
+/// relied on conditional requests to avoid re-summarizing. Now "nothing changed" costs
+/// nothing at all.
+pub struct ContextIngest {
+    ops: Arc<WorkflowOps>,
+}
+
+impl ContextIngest {
+    pub fn new(ops: Arc<WorkflowOps>) -> Self {
+        Self { ops }
+    }
+    pub const SCOPE: &'static str = scopes::LOCAL_LLM;
+}
+
+#[restate_sdk::workflow]
+impl ContextIngest {
+    /// Reports itself to the dispatch strip: the submitting call returned as soon as the
+    /// ingress accepted this, so `Running` / `Done` / `Failed` can only come from here.
+    #[handler]
+    async fn run(&self, ctx: WorkflowContext<'_>) -> HandlerResult<bool> {
+        let key = ctx.key().to_string();
+        super::tracked("ContextIngest", &key, self.ingest(ctx)).await
+    }
+}
+
+impl ContextIngest {
+    async fn ingest(&self, ctx: WorkflowContext<'_>) -> HandlerResult<bool> {
+        let (id, version) = split_versioned(ctx.key());
+        let (id, version) = (id.to_string(), version.to_string());
+        let ops = self.ops.clone();
+        let changed = ctx
+            .run(|| {
+                let ops = ops.clone();
+                let id = id.clone();
+                async move {
+                    ops.context_refresh(&id)
+                        .await
+                        .map_err(|e| HandlerError::from(anyhow::anyhow!("{e:#}")))
+                }
+            })
+            .await?;
+        tracing::debug!("context {id} @{version}: changed = {changed}");
+        Ok(changed)
+    }
+}
+
+// ---- Merge -------------------------------------------------------------------
+
+/// Collapse two subjects into one.
+///
+/// Keyed `{a}+{b}`. Multi-step and it must be exactly-once: re-pointing the signals,
+/// rewriting the relation edges, carrying the artifacts, and forwarding future
+/// activity are four writes that used to happen inline, so a failure between them left
+/// a half-merged pair — signals moved to a subject whose edges still pointed at the
+/// old one. Journalled, a retry finishes the merge instead of starting a second.
+pub struct Merge {
+    ops: Arc<WorkflowOps>,
+}
+
+impl Merge {
+    pub fn new(ops: Arc<WorkflowOps>) -> Self {
+        Self { ops }
+    }
+
+    /// `{keep}+{drop}`. Deliberately not sorted: which subject survives is a decision
+    /// (the canonical one), not an implementation detail, so it has to be recoverable
+    /// from the key.
+    pub fn key(keep: &str, drop: &str) -> String {
+        format!("{keep}+{drop}")
+    }
+}
+
+#[restate_sdk::workflow]
+impl Merge {
+    /// Reports itself to the dispatch strip: the submitting call returned as soon as the
+    /// ingress accepted this, so `Running` / `Done` / `Failed` can only come from here.
+    #[handler]
+    async fn run(&self, ctx: WorkflowContext<'_>) -> HandlerResult<String> {
+        let key = ctx.key().to_string();
+        super::tracked("Merge", &key, self.merge(ctx)).await
+    }
+}
+
+impl Merge {
+    async fn merge(&self, ctx: WorkflowContext<'_>) -> HandlerResult<String> {
+        let raw = ctx.key().to_string();
+        let Some((keep, drop)) = raw.split_once('+') else {
+            return Err(TerminalError::new(format!(
+                "'{raw}' is not a merge key (expected keep+drop)"
+            ))
+            .into());
+        };
+        let (keep, drop) = (keep.to_string(), drop.to_string());
+        let ops = self.ops.clone();
+        let canonical = ctx
+            .run(|| {
+                let ops = ops.clone();
+                let (keep, drop) = (keep.clone(), drop.clone());
+                async move {
+                    // A merge that fails is a data problem, not a flake: retrying it
+                    // forever would keep re-attempting the same impossible rewrite.
+                    ops.merge(&keep, &drop)
+                        .await
+                        .map_err(|e| HandlerError::from(TerminalError::new(format!("{e:#}"))))
+                }
+            })
+            .await?;
+        Ok(canonical)
+    }
+}

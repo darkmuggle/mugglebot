@@ -80,8 +80,10 @@ pub struct Triager {
     github: Option<GithubClient>,
     /// Local coder model: reads the source, characterizes, proposes patches.
     coder: Arc<dyn Reasoner>,
-    /// Small fast cloud model: plain-English rendering only.
-    brief: Arc<dyn Reasoner>,
+    /// Plain-English rendering only — turning a characterization the coder model already
+    /// produced into a sentence an operator reads at a glance. Local: rewriting settled
+    /// conclusions is the easiest thing asked of any model here.
+    writer: Arc<dyn Reasoner>,
     /// Finds open PRs that may already fix the issue — possibly somebody else's.
     pr_fixes: crate::prfix::PrFixFinder,
     /// Scores the issue's comments so the discussion is read on merit.
@@ -96,8 +98,7 @@ impl Triager {
         checkouts: Arc<CheckoutCache>,
         token: Option<String>,
         coder: Arc<dyn Reasoner>,
-        brief: Arc<dyn Reasoner>,
-        routed: Arc<dyn Reasoner>,
+        writer: Arc<dyn Reasoner>,
         analyst: Arc<crate::correlation::Analyst>,
         cfg: AssignedCfg,
     ) -> Self {
@@ -105,11 +106,11 @@ impl Triager {
             store: store.clone(),
             checkouts,
             github: token.and_then(|t| GithubClient::new(t).ok()),
-            pr_fixes: crate::prfix::PrFixFinder::new(store, coder.clone(), brief.clone(), routed)
+            pr_fixes: crate::prfix::PrFixFinder::new(store, coder.clone(), writer.clone())
                 .with_analyst(analyst),
             comments: CommentJudge::new(coder.clone()),
             coder,
-            brief,
+            writer,
             cfg,
         }
     }
@@ -124,6 +125,31 @@ impl Triager {
     /// entirely from the completion cache — correct, but not what "re-triage"
     /// means. So a repeat run against the *same* commit forces fresh calls; a run
     /// against new code is a natural cache miss anyway.
+    /// Judge the open PRs that may already fix one assigned issue.
+    ///
+    /// The same pass [`Self::triage`] runs as its step 5, exposed so the `PrCritique`
+    /// workflow can run it on its own — keyed by the PR's head sha, so an unchanged
+    /// diff is a refused key rather than another read of it.
+    pub async fn judge_pr_fixes(&self, issue_key: &str) -> Result<Vec<crate::prfix::PrFix>> {
+        let Some(gh) = &self.github else {
+            anyhow::bail!("pr critique is unavailable: no GitHub token stored");
+        };
+        let Some(t) = self.store.get_issue_triage(issue_key)? else {
+            anyhow::bail!("no assigned issue {issue_key}");
+        };
+        let issue_text = t.title.clone();
+        let others = self.other_open_issues(&t);
+        self.pr_fixes
+            .find(
+                gh,
+                &crate::prfix::Subject::from(&t),
+                &issue_text,
+                &others,
+                false,
+            )
+            .await
+    }
+
     pub async fn triage(&self, issue_key: &str) -> Result<IssueTriage> {
         let Some(mut t) = self.store.get_issue_triage(issue_key)? else {
             anyhow::bail!("no triage row for {issue_key}");
@@ -558,7 +584,7 @@ impl Triager {
             t.characterization.as_deref().unwrap_or("(none)")
         );
         match self
-            .brief
+            .writer
             .complete(
                 &CompletionRequest::single(prompt)
                     .with_system(system)
@@ -573,65 +599,6 @@ impl Triager {
                 None
             }
         }
-    }
-}
-
-/// The queue worker. Triage is slow (a clone plus several local model passes on a
-/// 33b model), so it runs one at a time, off the poll path.
-pub struct TriageWorker {
-    store: Arc<Store>,
-    triager: Arc<Triager>,
-    on_complete: Arc<dyn Fn(IssueTriage) + Send + Sync>,
-}
-
-impl TriageWorker {
-    pub fn new(
-        store: Arc<Store>,
-        triager: Arc<Triager>,
-        on_complete: Arc<dyn Fn(IssueTriage) + Send + Sync>,
-    ) -> Self {
-        Self {
-            store,
-            triager,
-            on_complete,
-        }
-    }
-
-    pub async fn run(self: Arc<Self>) {
-        if !self.triager.enabled() {
-            debug!("triage worker: disabled");
-            return;
-        }
-        match self.store.requeue_running_issue_triage() {
-            Ok(n) if n > 0 => info!("triage worker: requeued {n} interrupted triage(s)"),
-            Ok(_) => {}
-            Err(e) => warn!("triage worker: requeue failed: {e:#}"),
-        }
-        loop {
-            match self.step().await {
-                Ok(true) => continue,
-                Ok(false) => {}
-                Err(e) => warn!("triage worker: {e:#}"),
-            }
-            tokio::time::sleep(std::time::Duration::from_secs(15)).await;
-        }
-    }
-
-    async fn step(&self) -> Result<bool> {
-        let Some(job) = self.store.claim_issue_triage()? else {
-            return Ok(false);
-        };
-        info!("triage worker: analyzing {}", job.issue_key);
-        let done = self.triager.triage(&job.issue_key).await?;
-        if done.status == "complete" {
-            info!(
-                "triage worker: {} complete ({} patch option(s))",
-                done.issue_key,
-                done.patches.as_array().map(Vec::len).unwrap_or(0)
-            );
-        }
-        (self.on_complete)(done);
-        Ok(true)
     }
 }
 

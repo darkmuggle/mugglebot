@@ -44,7 +44,9 @@ export function SignalModal(props: { signal: Signal; onClose: () => void }) {
       <div class="modal" role="dialog" aria-modal="true" onClick={(e) => e.stopPropagation()}>
         <div class="modal-head">
           <span class={`src src-${s().source}`}>{s().source.toUpperCase()}</span>
-          <span class={`state state-${s().state}`}>{s().state}</span>
+          <Show when={s().upstream_gone}>
+            <span class="state state-resolved">gone upstream</span>
+          </Show>
           <button class="modal-close" title="Close (Esc)" onClick={props.onClose}>
             ✕
           </button>
@@ -66,9 +68,9 @@ export function SignalModal(props: { signal: Signal; onClose: () => void }) {
         <Show when={s().body?.trim()}>
           <div class="md modal-body" innerHTML={renderMessage(s().body!)} />
         </Show>
-        <Show when={s().entities.length}>
+        <Show when={s().keys.length}>
           <div class="chips">
-            <For each={s().entities}>
+            <For each={s().keys}>
               {(e) => {
                 const href = entityHref(e);
                 return (

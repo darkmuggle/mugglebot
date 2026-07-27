@@ -98,11 +98,14 @@ const MAX_BODY: usize = 20_000;
 
 pub struct ContextManager {
     store: Arc<Store>,
+    /// Authed URL sources name a credential; it's resolved at fetch time so a
+    /// rotated token takes effect on the next refresh.
+    secrets: Arc<crate::secrets::Secrets>,
     embedder: Arc<dyn Embedder>,
     /// Cheap/ambient reasoner: summaries and the fast initial tag pass.
     reasoner: Arc<dyn Reasoner>,
     /// Heavy reasoner: the refining tag pass that runs after the cheap one.
-    heavy: Arc<dyn Reasoner>,
+    refiner: Arc<dyn Reasoner>,
     client: reqwest::Client,
     default_interval: String,
 }
@@ -110,16 +113,18 @@ pub struct ContextManager {
 impl ContextManager {
     pub fn new(
         store: Arc<Store>,
+        secrets: Arc<crate::secrets::Secrets>,
         embedder: Arc<dyn Embedder>,
         reasoner: Arc<dyn Reasoner>,
-        heavy: Arc<dyn Reasoner>,
+        refiner: Arc<dyn Reasoner>,
         default_interval: String,
     ) -> Self {
         Self {
             store,
+            secrets,
             embedder,
             reasoner,
-            heavy,
+            refiner,
             client: reqwest::Client::builder()
                 .user_agent("mugglebot")
                 .build()
@@ -281,8 +286,8 @@ impl ContextManager {
         Ok(true)
     }
 
-    /// Two-tier auto-tagging: a cheap pass proposes initial tags so the entry is
-    /// routable immediately, then a heavy pass refines them. Each pass persists,
+    /// Two-pass auto-tagging: a first pass proposes initial tags so the entry is
+    /// routable immediately, then a refining pass revises them. Each pass persists,
     /// and registers new tags (with their summaries) in the vocabulary. Skipped
     /// entirely for human-pinned tags. Best-effort: a failing pass is logged and
     /// leaves whatever the previous pass wrote.
@@ -297,7 +302,7 @@ impl ContextManager {
         }
         // Heavy refining pass — sees the cheap pass's tags in the vocabulary.
         let vocab = self.store.list_tags().unwrap_or_default();
-        if let Some(sugg) = tags::suggest(self.heavy.as_ref(), &vocab, &body).await {
+        if let Some(sugg) = tags::suggest(self.refiner.as_ref(), &vocab, &body).await {
             if let Err(e) = self.apply_suggestions(&ctx.id, &sugg) {
                 tracing::warn!("context {}: refine autotag store failed: {e:#}", ctx.id);
             }
@@ -452,7 +457,7 @@ impl ContextManager {
             }
         }
         if let Some(account) = &ctx.credential {
-            if let Some(secret) = self.store.credential_get(account)? {
+            if let Some(secret) = self.secrets.get(account)? {
                 let header = ctx.header.clone().unwrap_or_else(|| "Authorization".into());
                 if let (Ok(name), Ok(val)) = (
                     HeaderName::from_bytes(header.as_bytes()),
@@ -759,12 +764,13 @@ mod tests {
 
         let store = Arc::new(Store::open_in_memory().unwrap());
         let embedder = Arc::new(HashEmbedder);
-        // Both passes return the same suggestion; the heavy pass just re-confirms.
+        // Both passes return the same suggestion; the refining pass just re-confirms.
         let reasoner: Arc<dyn Reasoner> = Arc::new(MockReasoner::new(
             r#"[{"tag":"Database","summary":"DB recovery runbooks"}]"#,
         ));
         let mgr = ContextManager::new(
             store.clone(),
+            crate::secrets::Secrets::for_tests(store.clone()),
             embedder,
             reasoner.clone(),
             reasoner,
@@ -817,6 +823,7 @@ mod tests {
             Arc::new(MockReasoner::new(r#"[{"tag":"autotag","summary":"x"}]"#));
         let mgr = ContextManager::new(
             store.clone(),
+            crate::secrets::Secrets::for_tests(store.clone()),
             embedder,
             reasoner.clone(),
             reasoner,
@@ -868,6 +875,7 @@ mod tests {
             Arc::new(MockReasoner::new(r#"[{"tag":"autotag","summary":"x"}]"#));
         let mgr = ContextManager::new(
             store.clone(),
+            crate::secrets::Secrets::for_tests(store.clone()),
             embedder,
             reasoner.clone(),
             reasoner,

@@ -1,11 +1,46 @@
 # MuggleBot configuration — non-secret behavior only.
-# Credentials live in the macOS Keychain (service "dev.mugglebot", account =
-# source name), set via the config page or `security add-generic-password`.
-# Copy this to config.toml and edit.
+# Credentials live in the `secrets` table of MuggleBot's SQLite database (not the
+# Keychain: a background service endpoint can't read a session-scoped keychain
+# without a GUI prompt). Set them on the config page, or with `set_secret` over
+# MCP. Copy this to config.toml and edit.
 
 [general]
-data_dir = "~/.mugglebot"      # SQLite DB (event store + memory + context) lives here
+data_dir = "~/.mugglebot"      # SQLite DB (signals + grounding + secrets) lives here
 quiet_hours = "22:00-08:00"    # suppress non-Critical notifications (local time)
+
+[secrets]
+# Seal stored credentials under a key derived from $MUGGLEBOT_MASTER_KEY.
+# Off by default, and deliberately so: it is a real improvement against a stolen
+# backup and none at all against a process running as you, and the DB already
+# holds every signal body MuggleBot has ingested. Protect the file.
+encrypt = false
+
+[restate]
+# The local Restate server (Tilt starts it) and this process's service endpoint.
+# Restate holds the work in flight — virtual-object state, invocation journals,
+# durable timers, vqueue occupancy. SQLite holds the record. That split is why
+# wiping data/restate costs only in-flight work, which matters because enabling
+# vqueues requires a fresh cluster.
+ingress = "http://127.0.0.1:8080"     # where the daemon submits signals and actions
+admin = "http://127.0.0.1:9070"       # registration, the rule book, SQL introspection
+endpoint_listen = "127.0.0.1:9080"    # where this process serves its handlers
+register_on_boot = true               # Restate discovers handlers at registration
+vqueues = true                        # needs RESTATE_EXPERIMENTAL_ENABLE_VQUEUES
+
+# Concurrency per scope. Concurrency is not rate: GitHub's per-hour budget is a
+# separate token bucket.
+#
+# NONE OF THIS APPLIES UNLESS `vqueues = true` under [restate] above. They are separate
+# settings, and a tuned block with the flag off is a config that reads as configured and
+# behaves as unconfigured. MuggleBot warns at boot if it finds that combination.
+[restate.limits]
+local_llm = 1                  # one Ollama, one GPU — a queue of one beats four
+cloud_llm = 3                  # every concurrent invocation is real money
+github = 4
+browser = 1                    # one Chrome, one investigation
+checkout = 2                   # disk-bound; per-repo limit keys prevent a corrupt tree
+repo_index = 1                 # one org crawl at a time: two would clone the same repo
+                               # into the same directory
 
 [sources.github]
 enabled = true
@@ -23,8 +58,8 @@ keywords = ["mugglebot", "prod down"]
 search_mentions = false                          # catch mentions of you everywhere (see below)
 # mention_query = "<@U0123ABC> OR yourname"      # override the default `<@user_id>` search
 poll_interval = "30s"
-# Token (a Slack bot/user token with channels:history + channels:read) lives in
-# the Keychain under account "slack".
+# Token (a Slack bot/user token with channels:history + channels:read) is stored
+# as the secret named "slack".
 #
 # search_mentions polls search.messages so mentions of you surface from ANY
 # conversation you can see — channels outside `channels`, private channels, and
@@ -37,7 +72,7 @@ poll_interval = "30s"
 enabled = false
 poll_interval = "2m"
 api_base = "https://api.granola.ai"              # override for a proxy/self-host
-# Token lives in the Keychain under account "granola".
+# Token is stored as the secret named "granola".
 
 [notifications]
 min_severity = "notice"        # below this: board-only, no macOS notification
@@ -61,41 +96,70 @@ red_alert = true               # red-alert + Critical notification on high-confi
 red_alert_min_confidence = 0.75
 
 [reasoner]
-# Models are chosen by TASK DIFFICULTY, not by call site. The local model is the
-# default for everything; before running a task it grades how much reasoning the
-# task actually needs, and the grade decides who answers:
+# THE LOCAL MODEL DOES THE WORK. Every pass MuggleBot runs on its own — triage,
+# correlation, PR critique, root cause, explanation, code indexing, tagging, live
+# assist — runs on `local` and nowhere else.
 #
-#   easy, medium  -> local alone
-#   hard          -> local drafts, `mid` cleans it up
-#                    (or `mid` does it outright if local fails)
-#   extra_hard    -> `heavy` directly; local doesn't attempt it
+# A cloud model is used only when you ask for one, by name, in one of two places:
 #
-# Grading is itself a local call (~10 output tokens) and is cached per call-site
-# shape, so a task type grades about once per process, not once per invocation.
+#   1. The chat pane's model picker. Picking Claude there sends that turn, and only
+#      that turn, to Claude.
+#   2. The 2ND OPINION button on a subject. It re-explains that one subject on
+#      `cloud` and shows the answer beside the local one, labelled.
+#
+# Nothing else can reach it. There is exactly one cloud-capable handle in the code
+# (`Reasoners::cloud`) and those are its only two callers, so the guarantee is
+# checkable rather than a matter of policy.
 #
 # "claude"/"chatgpt" run through the subscription CLI bridge (`claude -p` /
 # `codex exec`) riding your existing login — no API keys. "ollama_local" is the
 # on-device option (endpoint below); "ollama" is Ollama Cloud (ollama.com), which
-# needs an API key in the Keychain under account "ollama". They're separate
+# needs an API key stored as the secret named "ollama". They're separate
 # providers so a hosted model can't get routed at localhost (404) and vice versa.
 #
-# Pull the local model first:  ollama pull deepseek-coder:33b
+# Pull the local models first:
+#   ollama pull deepseek-coder:33b
+#   ollama pull qwen2.5vl:7b        # only if you drop images into chat
 local = "ollama_local"        # claude | ollama | ollama_local | chatgpt
 local_model = "deepseek-coder:33b"
+# Images dropped into chat go here. A separate setting because vision is a different
+# capability from reasoning: point this at a coder model and MuggleBot will answer
+# about a screenshot it never saw. Always built against the local Ollama endpoint.
+vision_model = "qwen2.5vl:7b"
+# The tier used ONLY when you ask for it — the chat picker or the 2ND OPINION button.
+cloud = "claude"
+cloud_model = "claude-opus-4-8"
+# Escalation tier for [reasoner.routing] below, which is OFF. Only reached if you
+# turn routing on, and then only for tasks the local model grades `hard`.
 mid = "claude"
 mid_model = "claude-sonnet-5"
-heavy = "claude"
-heavy_model = "claude-opus-4-8"
-# Plain-English rewriting only — turning an analysis another model already did
-# into something readable at a glance. Not a reasoning tier, which is why a small
-# fast model is the right choice here.
-brief = "claude"
-brief_model = "claude-haiku-4-5"
+
+# How long one local model request may take before it's abandoned. Generous, because a
+# 33B model carding a component legitimately takes minutes — but finite, which the HTTP
+# client is NOT by default. That default cost 2.5 hours of wedged indexing: one request
+# hung, and since local calls share a single permit (below) every later one queued behind
+# it forever. A bounded request is what guarantees the permit is released.
+request_timeout = "10m"
+
+# Concurrent requests allowed against a SELF-HOSTED Ollama, process-wide — every caller
+# (triage, correlation, indexing, chat, explanation) queues on this one permit. One, because
+# one Ollama is one GPU: four concurrent requests to a 33B model are slower AND worse than a
+# queue of one. Raise it only if the local model is small enough that the GPU isn't the
+# bottleneck, or if ollama_url points at a proxy in front of more than one machine.
+# Ollama Cloud is never gated by this — it's a fleet. Embeddings aren't either: they're
+# milliseconds against a small model, and queueing recall behind a generation would make
+# search feel broken.
+# One, because one Ollama is one GPU. Priority is by DEFERENCE, not by a second worker:
+# indexing stands aside whenever a foreground pass wants the slot — a notification, a PR
+# critique, an issue triage — and fills the gaps instead. Note that work already talking
+# to the model is not interrupted, so a foreground pass can wait for one carding pass to
+# finish (minutes), not for the whole batch (hours).
+local_concurrency = 1
 
 # On-device Ollama endpoint (used by "ollama_local" and by local_only_sources).
 ollama_url = "http://127.0.0.1:11434"
-# Ollama Cloud host (used by the "ollama" provider). Requires the API key in the
-# Keychain under account "ollama"; hosted models are listed once it's set.
+# Ollama Cloud host (used by the "ollama" provider). Requires the API key stored
+# as the secret named "ollama"; hosted models are listed once it's set.
 ollama_cloud_url = "https://ollama.com"
 ollama_model = "deepseek-coder:33b"  # local_only_sources
 # Embeddings are a DIFFERENT capability from chat: coder and chat models have no
@@ -105,9 +169,11 @@ ollama_model = "deepseek-coder:33b"  # local_only_sources
 embed_model = "nomic-embed-text"
 local_only_sources = []       # pin sensitive sources here to force on-device Ollama
 
-# NOTE: some work is pinned on-device regardless of grade, because it must never
-# reach a cloud model at all — tag classification, repo-index code crawling, and
-# the reopen-matching pass over snoozed/handled threads. Those bypass routing.
+# NOTE: `local_only_sources` predates the local-by-default policy and is now mostly
+# redundant — with routing off, every source is handled on-device anyway. It still
+# does one thing: it pins those sources to `ollama_model` even if you later turn
+# routing on, so a sensitive source can't be escalated by a config change made for
+# unrelated reasons.
 #
 # The [reasoner.*] sub-tables below must stay LAST in this section: in TOML every
 # key after a sub-table header belongs to that sub-table, so a plain `[reasoner]`
@@ -124,11 +190,21 @@ enabled = true
 ttl = "24h"            # how long an answer stays reusable
 max_entries = 5000     # LRU ceiling; 0 disables the size cap
 
+# Difficulty routing: the local model grades how hard a task is, and the grade can
+# send it to `mid`/`cloud` instead. OFF, because that is a cloud call nobody asked
+# for — which is the one thing the default policy exists to prevent. Grading is
+# itself a model call, so leaving it off also stops paying for a judgment whose only
+# purpose was deciding whether to escalate.
+#
+# Turn `enabled` on and MuggleBot will escalate on its own again:
+#   easy, medium  -> local alone
+#   hard          -> local drafts, `mid` cleans it up (needs cleanup = true)
+#   extra_hard    -> `cloud` directly; local doesn't attempt it
 [reasoner.routing]
-enabled = true         # false → everything runs on the local model, ungraded
-cleanup = true         # false → a `hard` local draft is returned as-is (fully local)
-cloud_fallback = true  # false → a local outage errors instead of escalating, and
-                       # nothing leaves the machine; callers' deterministic
+enabled = false        # true → grade every task and escalate on the grade
+cleanup = false        # true → a `hard` local draft is sent to `mid` to be corrected
+cloud_fallback = false # true → a local outage escalates instead of erroring;
+                       # false keeps everything on the machine, and callers''' deterministic
                        # fallbacks still apply
 
 [investigation]
@@ -236,4 +312,4 @@ stdio = true
 http_listen = "127.0.0.1:8787"
 
 [ui]
-listen = "127.0.0.1:8080"
+listen = "127.0.0.1:8081"      # 8080 belongs to the local Restate ingress

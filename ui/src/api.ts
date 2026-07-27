@@ -6,9 +6,15 @@ import type {
   ChatResponse,
   ChatSummary,
   ChatTurn,
-  State,
+  Handled,
+  IndexStatus,
+  PrDiffReport,
+  RepoIndexDetail,
+  RepoKind,
+  ScoreReport,
+  SecretStatus,
   StoredChat,
-  ThreadView,
+  SubjectView,
 } from "./types";
 
 // Resolve the backend address. Explicit VITE_BACKEND wins (Tilt injects it from
@@ -41,18 +47,133 @@ export const api = {
   },
 
   /**
-   * All threads as board views. `activeOnly` defaults to true (mirrors the live
-   * WS board); pass false to include handled — resolved/snoozed — threads.
+   * All subjects as board views. `activeOnly` defaults to true (mirrors the live
+   * WS board); pass false to include handled work and merged-away subjects.
    */
-  listThreads(activeOnly = true): Promise<ThreadView[]> {
-    return api.tool<ThreadView[]>("list_threads", { active_only: activeOnly });
+  listSubjects(activeOnly = true): Promise<SubjectView[]> {
+    return api.tool<SubjectView[]>("list_subjects", {
+      active_only: activeOnly,
+    });
   },
 
-  setSignalState(id: string, state: State): Promise<void> {
-    return fetch(`${API}/api/signals/${encodeURIComponent(id)}/state`, {
+  /**
+   * Distil a subject and everything under it, on the **local** model.
+   *
+   * `secondOpinion` asks the cloud model for its own read of the same dossier instead.
+   * That flag is the only way anything outside the chat pane reaches a metered model, so
+   * it is only ever set by a button the operator pressed.
+   *
+   * Returns whether a new run started — `false` means nothing has changed since the last
+   * explanation, which is a successful outcome, not a failure.
+   */
+  explain(
+    key: string,
+    secondOpinion = false,
+  ): Promise<{
+    submitted: boolean;
+    workflow: string;
+    produced_by: string;
+    note: string;
+  }> {
+    return api.tool("explain", {
+      subject_key: key,
+      second_opinion: secondOpinion,
+    });
+  },
+
+  /**
+   * Tag what a repo is for. Omitting `kind` drops the tag and hands it back to the crawl's
+   * name-matching guess.
+   */
+  setRepoKind(repo: string, kind: RepoKind | null): Promise<unknown> {
+    return api.tool("set_repo_kind", kind ? { repo, kind } : { repo });
+  },
+
+  /**
+   * Assemble a chat context block for a repo, or for one commit in it.
+   *
+   * Deterministic — everything the index already holds, rendered for a model to read. The chat
+   * then shells out to whichever provider is picked in the pane.
+   */
+  chatContext(
+    repo: string,
+    sha?: string,
+  ): Promise<{ prompt: string; opening: string }> {
+    return api.tool("chat_context", sha ? { repo, sha } : { repo });
+  },
+
+  /**
+   * Check a repo out and run a coding agent inside it, streaming to the board.
+   *
+   * `tool` is claude or codex — ollama has no agent mode. Unlike the chat context, the agent
+   * reads the real files rather than the index's summaries of them.
+   */
+  startAgentSession(
+    repo: string,
+    tool: string,
+    prompt?: string,
+  ): Promise<{ session_id: string; repo: string; tool: string }> {
+    return api.tool(
+      "start_agent_session",
+      prompt ? { repo, tool, prompt } : { repo, tool },
+    );
+  },
+
+  stopAgentSession(sessionId: string): Promise<{ stopped: boolean }> {
+    return api.tool("stop_agent_session", { session_id: sessionId });
+  },
+
+  /** Code-index progress across every repo, plus the indexing work in flight. */
+  indexStatus(): Promise<IndexStatus> {
+    return api.tool<IndexStatus>("index_status");
+  },
+
+  /** Everything the index holds about one repo, including its commit summaries. */
+  repoIndexDetail(repo: string, commitLimit = 25): Promise<RepoIndexDetail> {
+    return api.tool<RepoIndexDetail>("repo_index_detail", {
+      repo,
+      commit_limit: commitLimit,
+    });
+  },
+
+  /** Re-walk the org's repo list and re-card anything whose code has moved. */
+  refreshRepoIndex(): Promise<{ ok: boolean; summarized: number }> {
+    return api.tool("refresh_repo_index", {});
+  },
+
+  /**
+   * A PR's diff with a model summary. Pass a PR key for that PR, or an issue key for every PR
+   * attempting it. Fetched on demand — a diff is an API call and only interesting while open.
+   */
+  /**
+   * A subject's pull request diffs.
+   *
+   * `storedOnly` answers from the pull request's object state and fetches nothing, which
+   * is what makes it safe to call on render; without it, a PR with no stored diff is read
+   * from GitHub and summarized, which takes seconds.
+   */
+  prDiff(
+    subjectKey: string,
+    opts: { storedOnly?: boolean; refresh?: boolean } = {},
+  ): Promise<PrDiffReport> {
+    return api.tool<PrDiffReport>("pr_diff", {
+      subject_key: subjectKey,
+      stored_only: opts.storedOnly ?? false,
+      refresh: opts.refresh ?? false,
+    });
+  },
+
+  /** Rank which repo, component and change an issue is likely about. */
+  scoreIssue(key: string): Promise<ScoreReport> {
+    return api.tool<ScoreReport>("score_issue", { subject_key: key });
+  },
+
+  /** Triage a subject. `until` applies to `snoozed`. */
+  setHandled(key: string, handled: Handled, until?: string): Promise<void> {
+    return fetch(`${API}/api/subjects/${encodeURIComponent(key)}/handled`, {
       method: "POST",
       headers: JSON_HEADERS,
-      body: JSON.stringify({ state }),
+      body: JSON.stringify({ handled, until }),
     }).then(unwrap);
   },
 
@@ -133,20 +254,22 @@ export const api = {
     }).then(unwrap);
   },
 
-  credentials(): Promise<Record<string, boolean>> {
-    return fetch(`${API}/api/credentials`).then(unwrap);
+  // Write-only: the API reports whether a secret is set and when it changed, and
+  // has no route that returns a value.
+  secrets(): Promise<{ secrets: SecretStatus[] }> {
+    return fetch(`${API}/api/secrets`).then(unwrap);
   },
 
-  setCredential(account: string, secret: string): Promise<void> {
-    return fetch(`${API}/api/credentials`, {
+  setSecret(name: string, value: string): Promise<void> {
+    return fetch(`${API}/api/secrets`, {
       method: "POST",
       headers: JSON_HEADERS,
-      body: JSON.stringify({ account, secret }),
+      body: JSON.stringify({ name, value }),
     }).then(unwrap);
   },
 
-  deleteCredential(account: string): Promise<void> {
-    return fetch(`${API}/api/credentials/${encodeURIComponent(account)}`, {
+  deleteSecret(name: string): Promise<void> {
+    return fetch(`${API}/api/secrets/${encodeURIComponent(name)}`, {
       method: "DELETE",
     }).then(unwrap);
   },

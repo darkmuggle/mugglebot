@@ -54,6 +54,13 @@ impl Embedder for HashEmbedder {
 }
 
 /// Embeddings from an Ollama model via `/api/embeddings`.
+///
+/// **Deliberately outside the completion gate** in [`crate::reasoner::ollama`], for two
+/// reasons. It would deadlock the obvious caller: anything that generates text and then
+/// embeds it would be holding the permit while asking for the embedding. And it would be the
+/// wrong trade even if it were safe — an embedding is milliseconds against a small model,
+/// while a completion is tens of seconds against a 33B one, so queueing recall behind a
+/// generation would make search feel broken to save contention that barely exists.
 pub struct OllamaEmbedder {
     client: reqwest::Client,
     url: String,
@@ -66,7 +73,12 @@ pub struct OllamaEmbedder {
 impl OllamaEmbedder {
     pub fn new(url: impl Into<String>, model: impl Into<String>, api_key: Option<String>) -> Self {
         Self {
-            client: reqwest::Client::new(),
+            // Short by comparison with a generation: an embedding is milliseconds against a
+            // small model, so a minute means the server is wedged, not busy.
+            client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(60))
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new()),
             url: url.into(),
             model: model.into(),
             api_key: api_key.filter(|k| !k.trim().is_empty()),

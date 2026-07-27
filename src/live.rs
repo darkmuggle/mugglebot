@@ -94,7 +94,7 @@ impl HintState {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Hint {
     pub id: String,
-    pub thread_id: String,
+    pub subject_key: String,
     pub kind: HintKind,
     /// Set only when `kind == Flag`.
     pub flag_type: Option<FlagType>,

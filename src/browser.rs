@@ -42,14 +42,12 @@
 
 use anyhow::{bail, Context, Result};
 use serde_json::json;
-use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
-use tracing::{debug, info, warn};
+use tracing::debug;
 
 use crate::config::{self, Browser as BrowserCfg};
-use crate::store::{BrowserInvestigation, Store};
 
 /// How long the worker sleeps when the queue is empty.
 const IDLE_POLL: Duration = Duration::from_secs(10);
@@ -272,95 +270,6 @@ fn browser_error_hint(stderr: &str, browser_url: &str) -> String {
         .chars()
         .take(400)
         .collect()
-}
-
-/// The queue worker: claim a pending investigation, drive the browser, write the
-/// findings back, and let the caller re-analyze the affected thread.
-///
-/// Investigations run strictly one at a time. They share a single Chrome, so a
-/// second concurrent navigation would fight the first for the active tab.
-pub struct BrowserWorker {
-    store: Arc<Store>,
-    driver: Arc<BrowserDriver>,
-    /// Called with the investigation once findings land, so the thread can be
-    /// re-analyzed and the board pushed. Kept as a callback to avoid making the
-    /// browser module depend on the correlation engine.
-    on_complete: Arc<dyn Fn(BrowserInvestigation) + Send + Sync>,
-}
-
-impl BrowserWorker {
-    pub fn new(
-        store: Arc<Store>,
-        driver: Arc<BrowserDriver>,
-        on_complete: Arc<dyn Fn(BrowserInvestigation) + Send + Sync>,
-    ) -> Self {
-        Self {
-            store,
-            driver,
-            on_complete,
-        }
-    }
-
-    /// Run forever, draining the queue.
-    pub async fn run(self: Arc<Self>) {
-        if !self.driver.enabled() {
-            debug!("browser worker: disabled");
-            return;
-        }
-        // A job left `running` is one the daemon died inside, not one in flight.
-        match self.store.requeue_running_browser_investigations() {
-            Ok(n) if n > 0 => info!("browser worker: requeued {n} interrupted investigation(s)"),
-            Ok(_) => {}
-            Err(e) => warn!("browser worker: requeue failed: {e:#}"),
-        }
-        info!(
-            "browser worker: driving {} via {}",
-            self.driver.cfg.browser_url,
-            self.driver.bin()
-        );
-        loop {
-            match self.step().await {
-                Ok(true) => continue, // Work done — check for more immediately.
-                Ok(false) => {}
-                Err(e) => warn!("browser worker: {e:#}"),
-            }
-            tokio::time::sleep(IDLE_POLL).await;
-        }
-    }
-
-    /// Process at most one investigation. Returns whether there was work.
-    async fn step(&self) -> Result<bool> {
-        let Some(job) = self
-            .store
-            .claim_browser_investigation(self.driver.cfg.max_attempts)?
-        else {
-            return Ok(false);
-        };
-        info!("browser worker: investigating {} ({})", job.url, job.id);
-        let done = match self.driver.investigate(&job.url, &job.prompt).await {
-            Ok(findings) => {
-                let done = self
-                    .store
-                    .complete_browser_investigation(&job.id, &findings.text)?;
-                info!("browser worker: {} completed", job.id);
-                done
-            }
-            Err(e) => {
-                let message = format!("{e:#}");
-                warn!("browser worker: {} failed: {message}", job.id);
-                // Requeue for another attempt until the cap, so a transient
-                // failure (Chrome restarting) isn't terminal; past the cap the
-                // job stays `failed` and stops consuming the worker.
-                let failed = self.store.fail_browser_investigation(&job.id, &message)?;
-                if failed.attempts < self.driver.cfg.max_attempts {
-                    self.store.requeue_browser_investigation(&job.id)?;
-                }
-                return Ok(true);
-            }
-        };
-        (self.on_complete)(done);
-        Ok(true)
-    }
 }
 
 #[cfg(test)]

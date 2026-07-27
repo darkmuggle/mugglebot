@@ -17,7 +17,7 @@ use url::Url;
 
 use super::{PollBatch, SourceSnapshot, Watcher};
 use crate::config::{self, GithubSource};
-use crate::signal::{Entity, Severity, Signal, SignalKind, Source, State};
+use crate::signal::{ResolutionKey, Severity, Signal, SignalKind, Source};
 
 const NOTIFICATIONS_URL: &str = "https://api.github.com/notifications";
 const PAGE_SIZE: usize = 100;
@@ -177,7 +177,7 @@ impl GithubWatcher {
         &self,
         headers: &HeaderMap,
         n: &GhNotification,
-    ) -> (Entity, Enrichment) {
+    ) -> (ResolutionKey, Enrichment) {
         let repo = &n.repository.full_name;
 
         // CI check suites have no followable `subject.url`. Parse the branch out
@@ -187,7 +187,7 @@ impl GithubWatcher {
         if n.subject.r#type == "CheckSuite" {
             let mut e = Enrichment::default();
             let Some(branch) = ci_branch(&n.subject.title) else {
-                return (Entity::new("ci", format!("{repo}:{}", n.id)), e);
+                return (ResolutionKey::new("ci", format!("{repo}:{}", n.id)), e);
             };
             // Follow a matching Actions run for both failed and successful
             // check suites. Failures surface error lines; successful runs keep a
@@ -228,11 +228,11 @@ impl GithubWatcher {
                     // is the controlling identity and the PR rides along as a
                     // secondary entity.
                     e.extra_entities
-                        .push(Entity::new("pr", format!("{repo}#{}", pr.number)));
+                        .push(ResolutionKey::new("pr", format!("{repo}#{}", pr.number)));
                     if let Some(issue) = linked_issue(pr.body.as_deref(), pr.title.as_deref()) {
-                        return (Entity::new("issue", format!("{repo}#{issue}")), e);
+                        return (ResolutionKey::new("issue", format!("{repo}#{issue}")), e);
                     }
-                    return (Entity::new("pr", format!("{repo}#{}", pr.number)), e);
+                    return (ResolutionKey::new("pr", format!("{repo}#{}", pr.number)), e);
                 }
                 // No open PR for this branch. On a default branch that usually
                 // means the PR already merged — find it through the commit the run
@@ -247,16 +247,16 @@ impl GithubWatcher {
                             _ => format!("CI on main after PR #{}", pr.number),
                         });
                         e.extra_entities
-                            .push(Entity::new("pr", format!("{repo}#{}", pr.number)));
+                            .push(ResolutionKey::new("pr", format!("{repo}#{}", pr.number)));
                         if let Some(issue) = linked_issue(pr.body.as_deref(), pr.title.as_deref()) {
-                            return (Entity::new("issue", format!("{repo}#{issue}")), e);
+                            return (ResolutionKey::new("issue", format!("{repo}#{issue}")), e);
                         }
-                        return (Entity::new("pr", format!("{repo}#{}", pr.number)), e);
+                        return (ResolutionKey::new("pr", format!("{repo}#{}", pr.number)), e);
                     }
                 }
             }
             e.subject = Some(format!("CI on branch {branch}"));
-            return (Entity::new("branch", format!("{repo}@{branch}")), e);
+            return (ResolutionKey::new("branch", format!("{repo}@{branch}")), e);
         }
 
         // Everything else carries a subject URL we can follow directly.
@@ -272,7 +272,7 @@ impl GithubWatcher {
         if entity.kind == "pr" {
             if let Some(issue) = linked_issue(e.excerpt.as_deref(), Some(&n.subject.title)) {
                 e.extra_entities.push(entity.clone());
-                entity = Entity::new("issue", format!("{repo}#{issue}"));
+                entity = ResolutionKey::new("issue", format!("{repo}#{issue}"));
             }
         }
         // For a PR, pull the head commit's summary so the body carries the code
@@ -742,28 +742,28 @@ fn subject_html_url(
 /// back to the notification's own thread id, so successive updates of one run
 /// roll together while distinct runs stay separate. Deliberately *not* the bare
 /// repo: that over-merges every unrelated notification in a busy repo into a
-/// single thread (see `correlation::engine::entity_keys`).
+/// single thread (see `correlation::engine::resolution_keys`).
 fn subject_entity(
     subject_type: &str,
     subject_url: Option<&str>,
     repo: &str,
     notification_id: &str,
-) -> Entity {
+) -> ResolutionKey {
     let last_segment = subject_url
         .and_then(|u| Url::parse(u).ok())
         .and_then(|u| u.path_segments()?.next_back().map(str::to_owned))
         .filter(|s| !s.is_empty());
     match (subject_type, last_segment) {
-        ("PullRequest", Some(n)) => Entity::new("pr", format!("{repo}#{n}")),
-        ("Issue", Some(n)) => Entity::new("issue", format!("{repo}#{n}")),
-        ("Discussion", Some(n)) => Entity::new("discussion", format!("{repo}#{n}")),
+        ("PullRequest", Some(n)) => ResolutionKey::new("pr", format!("{repo}#{n}")),
+        ("Issue", Some(n)) => ResolutionKey::new("issue", format!("{repo}#{n}")),
+        ("Discussion", Some(n)) => ResolutionKey::new("discussion", format!("{repo}#{n}")),
         ("Commit", Some(sha)) => {
             let short = sha.get(..12).unwrap_or(&sha);
-            Entity::new("commit", format!("{repo}@{short}"))
+            ResolutionKey::new("commit", format!("{repo}@{short}"))
         }
         // CI check suites (and any subject with no number): key on the stable
         // notification thread id so one run's updates roll together.
-        _ => Entity::new("ci", format!("{repo}:{notification_id}")),
+        _ => ResolutionKey::new("ci", format!("{repo}:{notification_id}")),
     }
 }
 
@@ -787,7 +787,7 @@ fn is_default_branch(branch: &str) -> bool {
 /// Only GitHub's closing keywords count. A bare `#412` in a PR body is usually a
 /// cross-reference ("similar to #412"), and treating that as identity would merge
 /// unrelated work.
-fn linked_issue(body: Option<&str>, title: Option<&str>) -> Option<u64> {
+pub(crate) fn linked_issue(body: Option<&str>, title: Option<&str>) -> Option<u64> {
     const KEYWORDS: &[&str] = &[
         "close", "closes", "closed", "fix", "fixes", "fixed", "resolve", "resolves", "resolved",
     ];
@@ -958,7 +958,7 @@ struct Enrichment {
     /// from, when the issue that PR closes is what actually owns the thread. They
     /// still correlate (a later notification about the PR itself finds this
     /// signal) without displacing the stronger identity.
-    extra_entities: Vec<Entity>,
+    extra_entities: Vec<ResolutionKey>,
 }
 
 #[derive(Clone)]
@@ -1055,6 +1055,16 @@ impl Watcher for GithubWatcher {
 
     fn interval(&self) -> Duration {
         self.interval
+    }
+
+    fn cursor(&self) -> Option<String> {
+        self.last_modified.lock().ok()?.clone()
+    }
+
+    fn restore_cursor(&self, cursor: &str) {
+        if let Ok(mut lm) = self.last_modified.lock() {
+            *lm = Some(cursor.to_string());
+        }
     }
 
     async fn poll(&self) -> Result<PollBatch> {
@@ -1205,55 +1215,61 @@ impl Watcher for GithubWatcher {
             let body = build_body(&n.repository.full_name, &n.reason, &enrichment);
             // Primary correlation key is the resolved subject (the PR / issue /
             // branch); repo and person ride along for display and grounding.
-            let mut entities = vec![
+            let mut keys = vec![
                 subject_entity,
-                Entity::new("repo", n.repository.full_name.clone()),
+                ResolutionKey::new("repo", n.repository.full_name.clone()),
             ];
             // Secondary identities resolved on the way up the chain
             // (branch → PR → issue), so every level still correlates. Deduplicated
             // because several paths contribute and a repeated entity is noise in
             // both the chips and the correlation key set.
             for extra in &enrichment.extra_entities {
-                if !entities
+                if !keys
                     .iter()
                     .any(|e| e.kind == extra.kind && e.value == extra.value)
                 {
-                    entities.push(extra.clone());
+                    keys.push(extra.clone());
                 }
             }
             if let Some(author) = &enrichment.author {
-                entities.push(Entity::new("person", author.clone()));
+                keys.push(ResolutionKey::new("person", author.clone()));
             }
             let raw = serde_json::json!({
                 "reason": n.reason,
                 "repository": n.repository.full_name,
                 "subject_type": n.subject.r#type,
-                "thread_id": n.id,
+                "subject_key": n.id,
                 "state": enrichment.state,
                 "labels": enrichment.labels,
                 "ci_log_url": enrichment.ci_log.as_ref().and_then(|log| log.url.clone()),
                 "ci_log_kind": enrichment.ci_log.as_ref().map(|log| if log.failed { "failure" } else { "tail" }),
                 "ci_outcome": ci_outcome,
             });
-            // GitHub reuses a notification's id for the life of a thread; fold
-            // updated_at into the dedup key so each state change is a distinct,
-            // re-notified signal (AGENTS.md: "once per thread state change").
-            let external_id = format!("{}@{}", n.id, n.updated_at);
+            // GitHub reuses a notification's id for the life of a thread, so the
+            // id alone is not the event: `updated_at` is the version, and each
+            // state change is a distinct, re-notified signal (AGENTS.md: "once per
+            // subject state change"). Keeping the version in its own field — rather
+            // than glued into the id, as this used to do — is what lets the ingress
+            // idempotency key and the store's unique index agree without either of
+            // them re-parsing a composite string.
+            let external_id = n.id.clone();
+            let version = Some(n.updated_at.clone());
             out.push(Signal {
-                id: Signal::make_id(Source::GitHub, &external_id),
+                id: Signal::make_id(Source::GitHub, &external_id, version.as_deref()),
                 source: Source::GitHub,
                 external_id,
+                version,
                 kind,
                 title: n.subject.title,
                 body: Some(body),
                 url,
                 actor: enrichment.author,
-                entities,
+                keys,
                 severity,
-                state: State::Unseen,
+                upstream_gone: false,
                 occurred_at,
                 ingested_at: now,
-                thread: None,
+                subject: None,
                 raw,
                 tags: Vec::new(),
             });

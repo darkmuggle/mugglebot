@@ -42,10 +42,45 @@ use std::path::Path;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
+/// `meta` key holding how many repos the last **complete** org enumeration saw.
+///
+/// The completeness signal for the repo index, and deliberately a count from GitHub rather
+/// than a boolean: comparing it against the rows actually present distinguishes "finished" from
+/// "finished once, and then a crawl was interrupted after pruning".
+pub const ENUMERATED_KEY: &str = "repo_index_enumerated";
+
+/// `meta` key holding how many repos still want a code-derived card after the last crawl.
+///
+/// Written by the crawl itself rather than re-derived in SQL, because "does this repo want a
+/// card?" is `worth_indexing`'s judgment — archived and long-stale repos deliberately never
+/// get one, and a SQL predicate duplicating that rule would drift from it and hold the
+/// catch-up cadence on forever.
+pub const PENDING_KEY: &str = "repo_index_pending";
+
+/// Repo cards written per crawl.
+///
+/// Sized to finish **well inside** the scheduler's catch-up cadence, because two crawls
+/// running at once would pick the same uncarded repos in the same order and clone them into
+/// the same directory — a corrupt working tree, which is precisely what the `checkout` vqueue
+/// limit key protects the per-repo indexers from and what nothing protects this from.
+///
+/// Batch size is not a throughput lever here. Every card queues on the single GPU permit, so
+/// total rate is fixed by the model; a larger batch only makes one invocation longer and the
+/// overlap more likely. Keeping it small also means each run commits its progress, so a
+/// restart costs one card rather than the whole crawl.
+const CHARACTERIZE_BATCH: usize = 2;
+
+/// Repos classified by the model per crawl.
+///
+/// Higher than the card batch because the call is far cheaper — one word from metadata, no
+/// checkout — but still bounded, because every local call queues on the single GPU permit and
+/// would otherwise sit in front of component carding.
+const KIND_BATCH: usize = 8;
+
 use crate::config::Investigation as InvestigationCfg;
 use crate::github::GithubClient;
 use crate::reasoner::{CompletionRequest, Reasoner};
-use crate::store::{RepoEntry, Store};
+use crate::store::{RepoEntry, RepoKind, Store};
 
 /// Cap on repos handed to one search pass. More than this and the search API's
 /// rate limit, not the reasoning, becomes the bottleneck.
@@ -123,13 +158,16 @@ impl RepoIndex {
         checkouts: Option<Arc<crate::checkout::CheckoutCache>>,
         cfg: InvestigationCfg,
     ) -> Self {
-        let github = token.and_then(|t| match GithubClient::new(t) {
-            Ok(c) => Some(c),
-            Err(e) => {
-                warn!("repo index: GitHub client unavailable: {e:#}");
-                None
-            }
-        });
+        // Background: crawling 147 repos is the other bulk consumer of the budget.
+        let github = token.and_then(
+            |t| match GithubClient::new(t).map(GithubClient::background) {
+                Ok(c) => Some(c),
+                Err(e) => {
+                    warn!("repo index: GitHub client unavailable: {e:#}");
+                    None
+                }
+            },
+        );
         Self {
             store,
             github,
@@ -169,9 +207,52 @@ impl RepoIndex {
 
         let mut seen = BTreeSet::new();
         let mut characterized = 0usize;
+        let mut deferred = 0usize;
         let now = Utc::now().to_rfc3339();
-        for meta in repos {
+
+        // ---- pass 1: the list ------------------------------------------------------
+        //
+        // Every repo gets a row before *any* model runs or any repo is cloned. This is a
+        // separate pass rather than a step inside the loop below, and that distinction is the
+        // whole fix: with the stub written inline, rows 4..147 waited behind repo 3's clone,
+        // and an interrupted crawl left the index knowing about 2 repos out of 147 — which
+        // starves component carding, commit summaries, the dependency graph and scoring at
+        // once, because the code indexer can only arm repos that are in this table.
+        //
+        // Two API pages and a metadata card apiece. Cheap enough to redo every crawl.
+        for meta in &repos {
             seen.insert(meta.full_name.clone());
+            if self.store.get_repo(&meta.full_name)?.is_some() {
+                continue;
+            }
+            let mut stub = RepoEntry {
+                full_name: meta.full_name.clone(),
+                description: meta.description.clone(),
+                topics: meta.topics.clone(),
+                language: meta.language.clone(),
+                archived: meta.archived,
+                pushed_at: meta.pushed_at.clone(),
+                readme_etag: None,
+                readme: None,
+                summary: None,
+                indexed_sha: None,
+                digest: None,
+                // Auto-characterized from the name and topics; `None` when neither says, which
+                // the board treats as code until someone tags it.
+                kind: RepoKind::guess(&meta.full_name, &meta.topics),
+                kind_pinned: false,
+                fetched_at: now.clone(),
+            };
+            // Routable from metadata alone until a real card is written over it.
+            stub.summary = Some(self.describe_from_metadata(&stub));
+            self.store.put_repo(&stub, false)?;
+        }
+        // The list is complete from here, whatever happens to the rest of this crawl.
+        self.store
+            .meta_put(ENUMERATED_KEY, seen.len().to_string().as_bytes())?;
+
+        // ---- pass 2: the cards -----------------------------------------------------
+        for meta in repos {
             let existing = self.store.get_repo(&meta.full_name)?;
             let mut entry = RepoEntry {
                 full_name: meta.full_name.clone(),
@@ -185,6 +266,13 @@ impl RepoIndex {
                 summary: existing.as_ref().and_then(|e| e.summary.clone()),
                 indexed_sha: existing.as_ref().and_then(|e| e.indexed_sha.clone()),
                 digest: existing.as_ref().and_then(|e| e.digest.clone()),
+                // A pinned kind is the operator's answer and survives the crawl; otherwise
+                // re-guess, so a repo renamed to `foo-examples` gets re-characterized.
+                kind: match existing.as_ref() {
+                    Some(e) if e.kind_pinned => e.kind,
+                    _ => RepoKind::guess(&meta.full_name, &meta.topics),
+                },
+                kind_pinned: existing.as_ref().is_some_and(|e| e.kind_pinned),
                 fetched_at: now.clone(),
             };
 
@@ -199,6 +287,14 @@ impl RepoIndex {
                 continue;
             }
 
+            // Bounded per run, for the reason every other batch here is bounded: a crawl
+            // that characterizes 147 repos on a local model is hours inside one invocation,
+            // reports nothing until it finishes, and loses all of it on a restart.
+            if characterized >= CHARACTERIZE_BATCH {
+                self.store.put_repo(&entry, false)?;
+                deferred += 1;
+                continue;
+            }
             match self.characterize_repo(gh, &mut entry).await {
                 Ok(true) => {
                     self.store.put_repo(&entry, true)?;
@@ -223,6 +319,41 @@ impl RepoIndex {
         let pruned = self.store.prune_repos(&seen)?;
         if pruned > 0 {
             info!("repo index: pruned {pruned} repo(s) no longer in {org}");
+        }
+        // ---- pass 3: what the untagged ones are for ---------------------------------
+        //
+        // After the cards, because a repo with no component card is more useful to fix than one
+        // with no label. Bounded, and only for repos the keyword guess declined.
+        let mut classified = 0usize;
+        for repo in self.store.list_repos()? {
+            if classified >= KIND_BATCH {
+                break;
+            }
+            if repo.kind.is_some() || repo.kind_pinned || !seen.contains(&repo.full_name) {
+                continue;
+            }
+            if let Some(kind) = self.classify_kind(&repo).await {
+                // Unpinned: a model guess stays revisable, and only a human's answer is pinned.
+                self.store.put_repo_kind_guess(&repo.full_name, kind)?;
+                classified += 1;
+                debug!("repo kind: {} is {}", repo.full_name, kind.as_str());
+            }
+        }
+        if classified > 0 {
+            info!("repo index: classified {classified} untagged repo(s) with the local model");
+        }
+
+        // How much carding is still owed. Written *last*, so it records having finished the
+        // pass rather than having started it — an interrupted crawl leaves the previous
+        // (higher) count, which is what keeps the scheduler on its catch-up cadence instead
+        // of dropping to daily. See `Scheduler::cadence_now`.
+        self.store
+            .meta_put(PENDING_KEY, deferred.to_string().as_bytes())?;
+        if deferred > 0 {
+            info!(
+                "repo index: characterized {characterized}, {deferred} repo(s) deferred to the \
+                 next pass"
+            );
         }
         Ok(characterized)
     }
@@ -331,6 +462,67 @@ impl RepoIndex {
 
     /// The deterministic card: what GitHub already tells us. Used when there's no
     /// README and when no reasoner answers.
+    /// Ask the local model what an untagged repo is for.
+    ///
+    /// Only for repos the name-and-topics guess declined. That guess deliberately covers just the
+    /// unambiguous cases, which leaves a long tail — `restatedev/cli`, `restatedev/skills`,
+    /// `restatedev/relay` — where the answer is knowable from the description but not from a
+    /// keyword. Asking a model is exactly right for that: it is a one-line judgment over metadata
+    /// already in hand, with a bounded set of answers.
+    ///
+    /// Stored **unpinned**, so a human still overrides it and a later crawl can revise it. A model
+    /// guess is a guess; only the operator's answer is pinned.
+    ///
+    /// No checkout and no code: name, description, topics and the existing card are enough to tell
+    /// a demo from a service, and reading a repository to answer it would cost minutes for a
+    /// three-way classification.
+    async fn classify_kind(&self, entry: &RepoEntry) -> Option<RepoKind> {
+        let system = "You classify what a code repository is FOR. Reply with ONLY one word: \
+             `code`, `example`, or `docs`.\n\
+             - `example`: samples, demos, templates, starters, tutorials, playgrounds — things \
+               written to be read and copied, not run in production.\n\
+             - `docs`: documentation, websites, specs, handbooks.\n\
+             - `code`: everything else — services, libraries, SDKs, CLIs, operators, \
+               infrastructure. This is the default: if it could plausibly run in production, it \
+               is `code`.";
+        let prompt = format!(
+            "Repository: {}\nDescription: {}\nTopics: {}\nLanguage: {}\n\nWhat is it for?",
+            entry.full_name,
+            entry.description.as_deref().unwrap_or("(none)"),
+            if entry.topics.is_empty() {
+                "(none)".to_string()
+            } else {
+                entry.topics.join(", ")
+            },
+            entry.language.as_deref().unwrap_or("(unknown)")
+        );
+        let mut req = CompletionRequest::single(prompt);
+        req.system = Some(system.to_string());
+        // One word. A larger budget invites a paragraph that then has to be parsed out of.
+        req.max_tokens = 8;
+        let raw = match self.reasoner.complete(&req).await {
+            Ok(r) => r,
+            Err(e) => {
+                debug!(
+                    "repo kind for {}: model unavailable ({e:#})",
+                    entry.full_name
+                );
+                return None;
+            }
+        };
+        // An unparseable answer means "unclassified", not "code": leaving it NULL keeps the repo
+        // in the retry set, whereas defaulting to code would silently settle it on a non-answer.
+        let kind = RepoKind::parse(raw.trim());
+        if kind.is_none() {
+            debug!(
+                "repo kind for {}: model said {:?}, which is not one of the three",
+                entry.full_name,
+                raw.trim()
+            );
+        }
+        kind
+    }
+
     fn describe_from_metadata(&self, entry: &RepoEntry) -> String {
         let mut card = format!(
             "PURPOSE: {}",
@@ -581,6 +773,26 @@ fn truncate(s: &str, max: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// The model classifier only runs where the keyword guess declined, and only its three
+    /// answers count.
+    ///
+    /// An unparseable answer must leave the kind NULL rather than defaulting to `code`: NULL keeps
+    /// the repo in the retry set, while a default silently settles it on a non-answer.
+    #[test]
+    fn only_the_three_kinds_are_accepted_from_a_model() {
+        assert_eq!(RepoKind::parse("code"), Some(RepoKind::Code));
+        assert_eq!(RepoKind::parse("example"), Some(RepoKind::Example));
+        assert_eq!(RepoKind::parse("docs"), Some(RepoKind::Docs));
+        // The shapes a model actually emits around a one-word answer.
+        assert_eq!(RepoKind::parse("  DOCS  "), Some(RepoKind::Docs));
+        assert_eq!(RepoKind::parse("Examples"), Some(RepoKind::Example));
+        assert_eq!(RepoKind::parse("demo"), Some(RepoKind::Example));
+        // And the ones that must not be forced into a bucket.
+        for junk in ["", "library", "it depends", "`code`", "code — a service"] {
+            assert_eq!(RepoKind::parse(junk), None, "{junk:?} must not classify");
+        }
+    }
+
     use super::*;
     use crate::reasoner::MockReasoner;
 
@@ -610,6 +822,8 @@ mod tests {
                     summary: Some(summary.into()),
                     indexed_sha: None,
                     digest: None,
+                    kind: None,
+                    kind_pinned: false,
                     fetched_at: Utc::now().to_rfc3339(),
                 },
                 true,
@@ -686,6 +900,8 @@ mod tests {
             summary: None,
             indexed_sha: None,
             digest: None,
+            kind: None,
+            kind_pinned: false,
             fetched_at: Utc::now().to_rfc3339(),
         });
         assert!(card.contains("Kubernetes operator"));

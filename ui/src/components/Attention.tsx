@@ -6,12 +6,28 @@ import type { Attention as AttentionData, Decorations } from "../types";
 /// Each is rendered filled when present and hollow when not, so "the AI hasn't
 /// looked at this yet" is visible at a glance rather than inferred from an empty
 /// panel further down the page.
-function facets(d: Decorations): { key: string; label: string; on: boolean; title: string }[] {
+function facets(
+  d: Decorations,
+): { key: string; label: string; on: boolean; title: string }[] {
   return [
-    { key: "tags", label: "TAG", on: d.tags, title: "Routing tags classified (local)" },
-    { key: "summary", label: "SUM", on: d.summary, title: "Grounded summary written (cloud)" },
-    { key: "mit", label: "MIT", on: d.mitigations, title: "Tailored mitigations generated (cloud)" },
-    { key: "dash", label: "DASH", on: d.dashboard, title: "Dashboard behind an alert link was read" },
+    {
+      key: "tags",
+      label: "TAG",
+      on: d.tags,
+      title: "Routing tags classified (local)",
+    },
+    {
+      key: "summary",
+      label: "SUM",
+      on: d.summary,
+      title: "Grounded summary written (cloud)",
+    },
+    {
+      key: "dash",
+      label: "DASH",
+      on: d.dashboard,
+      title: "Dashboard behind an alert link was read",
+    },
     {
       key: "cause",
       label: "CAUSE",
@@ -42,27 +58,47 @@ function facets(d: Decorations): { key: string; label: string; on: boolean; titl
 }
 
 /// "Does this need me, and has the AI been over it?"
-export function AttentionBadge(props: { attention: AttentionData; compact?: boolean }) {
+export function AttentionBadge(props: {
+  attention: AttentionData;
+  compact?: boolean;
+}) {
   const d = () => props.attention.decorated;
   const untouched = () => !facets(d()).some((f) => f.on);
   return (
     <div class="attention">
       <Show
         when={props.attention.needed}
-        fallback={<span class="att att-clear" title="Nothing here is asking for you">CLEAR</span>}
+        fallback={
+          <span class="att att-clear" title="Nothing here is asking for you">
+            CLEAR
+          </span>
+        }
       >
-        <span class="att att-needed" title={props.attention.reason ?? "Needs your attention"}>
+        <span
+          class="att att-needed"
+          title={props.attention.reason ?? "Needs your attention"}
+        >
           NEEDS YOU
         </span>
       </Show>
-      <Show when={props.attention.reason && props.attention.needed && !props.compact}>
+      <Show
+        when={
+          props.attention.reason && props.attention.needed && !props.compact
+        }
+      >
         <span class="att-reason">{props.attention.reason}</span>
       </Show>
 
-      <span class="facets" title={untouched() ? "The AI has not analyzed this yet" : "AI analysis"}>
+      <span
+        class="facets"
+        title={untouched() ? "The AI has not analyzed this yet" : "AI analysis"}
+      >
         <For each={facets(d())}>
           {(f) => (
-            <span class={`facet ${f.on ? "facet-on" : "facet-off"}`} title={f.title}>
+            <span
+              class={`facet ${f.on ? "facet-on" : "facet-off"}`}
+              title={f.title}
+            >
               {f.label}
             </span>
           )}
@@ -73,12 +109,18 @@ export function AttentionBadge(props: { attention: AttentionData; compact?: bool
       <Show when={d().local_passes > 0 || d().cloud_passes > 0}>
         <span class="passes">
           <Show when={d().local_passes > 0}>
-            <span class="pass pass-local" title={`${d().local_passes} pass(es) ran on this machine`}>
+            <span
+              class="pass pass-local"
+              title={`${d().local_passes} pass(es) ran on this machine`}
+            >
               ⌂{d().local_passes}
             </span>
           </Show>
           <Show when={d().cloud_passes > 0}>
-            <span class="pass pass-cloud" title={`${d().cloud_passes} metered cloud call(s)`}>
+            <span
+              class="pass pass-cloud"
+              title={`${d().cloud_passes} metered cloud call(s)`}
+            >
               ☁{d().cloud_passes}
             </span>
           </Show>

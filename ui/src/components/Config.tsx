@@ -2,7 +2,9 @@ import { createResource, createSignal, For, Show } from "solid-js";
 import { api } from "../api";
 
 export default function ConfigPage() {
-  const [creds, { refetch: refetchCreds }] = createResource(() => api.credentials());
+  const [creds, { refetch: refetchCreds }] = createResource(() =>
+    api.secrets().then((r) => r.secrets),
+  );
   const [account, setAccount] = createSignal("github");
   const [secret, setSecret] = createSignal("");
   const [credMsg, setCredMsg] = createSignal("");
@@ -34,7 +36,7 @@ export default function ConfigPage() {
   const saveCred = async () => {
     if (!account().trim() || !secret()) return;
     try {
-      await api.setCredential(account(), secret());
+      await api.setSecret(account(), secret());
       setSecret("");
       setCredMsg(`stored '${account()}' in the local database — restart MuggleBot to apply source-token changes`);
       refetchCreds();
@@ -45,7 +47,7 @@ export default function ConfigPage() {
 
   const removeCred = async (acc: string) => {
     if (!confirm(`Delete credential '${acc}'?`)) return;
-    await api.deleteCredential(acc);
+    await api.deleteSecret(acc);
     setCredMsg(`deleted '${acc}' from the local database — restart MuggleBot to apply source-token changes`);
     refetchCreds();
   };
@@ -60,14 +62,20 @@ export default function ConfigPage() {
           uses the Claude/Codex CLI — no LLM API keys needed; <code>ollama</code> is the optional
           Ollama&nbsp;Cloud key.
         </p>
-        <For each={Object.entries(creds() ?? {})}>
-          {([acc, present]) => (
+        <For each={creds() ?? []}>
+          {(s) => (
             <div class="cred-row">
-              <span class={`dot ${present ? "on" : "off"}`} />
-              <span class="cred-name">{acc}</span>
-              <span class="muted">{present ? "set" : "missing"}</span>
-              <Show when={present}>
-                <button onClick={() => removeCred(acc)}>delete</button>
+              <span class={`dot ${s.set ? "on" : "off"}`} />
+              <span class="cred-name">{s.name}</span>
+              <span class="muted">
+                {s.set
+                  ? s.updated_at
+                    ? `set ${new Date(s.updated_at).toLocaleDateString()}`
+                    : "set"
+                  : "missing"}
+              </span>
+              <Show when={s.set}>
+                <button onClick={() => removeCred(s.name)}>delete</button>
               </Show>
             </div>
           )}

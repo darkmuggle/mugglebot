@@ -4,40 +4,47 @@
 import { createSignal } from "solid-js";
 import { createStore, reconcile } from "solid-js/store";
 import { WS_URL } from "./api";
-import type { Event, Hint, RedAlert, Signal, State, SourceHealth, ThreadView } from "./types";
-
-// Least-triaged member state wins for a thread's aggregate (mirrors the backend).
-const STATE_RANK: Record<State, number> = {
-  unseen: 0,
-  seen: 1,
-  acknowledged: 2,
-  snoozed: 3,
-  resolved: 4,
-};
-
-function aggregateState(sigs: Signal[]): State {
-  let best: State = "resolved";
-  for (const s of sigs) if (STATE_RANK[s.state] < STATE_RANK[best]) best = s.state;
-  return sigs.length ? best : "unseen";
-}
+import type {
+  AgentChunk,
+  Dispatch,
+  Event,
+  Handled,
+  Hint,
+  IndexProgressEvent,
+  RedAlert,
+  Signal,
+  SourceHealth,
+  SubjectView,
+} from "./types";
 
 const [connected, setConnected] = createSignal(false);
 const [signals, setSignals] = createStore<Record<string, Signal>>({});
-const [threads, setThreads] = createStore<Record<string, ThreadView>>({});
+// Keyed by subject key (`owner/repo#412`, `channel/ts`), which is also how every
+// API addresses one — no lookup table between the board and the backend.
+const [subjects, setSubjects] = createStore<Record<string, SubjectView>>({});
 const [hints, setHints] = createSignal<Hint[]>([]);
 const [health, setHealth] = createSignal<SourceHealth[]>([]);
 const [redAlert, setRedAlert] = createSignal<RedAlert | null>(null);
 
-// A pending "open this board thread as a new chat" hand-off. The board sets it
-// and switches to the chat view; the Chat component consumes it once (starting a
-// fresh conversation seeded with the thread's prompt + tags), then clears it.
+// A pending "open this subject as a new chat" hand-off. The board sets it and
+// switches to the chat view; the Chat component consumes it once (starting a fresh
+// conversation seeded with the subject's prompt + tags), then clears it.
 export interface ChatSeed {
   prompt: string;
   tags: string[];
 }
 const [chatSeed, setChatSeed] = createSignal<ChatSeed | null>(null);
 
-export { connected, signals, threads, hints, health, redAlert, chatSeed, setChatSeed };
+export {
+  connected,
+  signals,
+  subjects,
+  hints,
+  health,
+  redAlert,
+  chatSeed,
+  setChatSeed,
+};
 
 function upsertHint(h: Hint) {
   setHints((prev) => {
@@ -52,24 +59,68 @@ export function removeHint(id: string) {
   if (redAlert()?.hint_id === id) setRedAlert(null);
 }
 
-/** Locally reflect a signal state change for snappy triage. */
-export function patchSignalState(id: string, state: Signal["state"]) {
-  if (signals[id]) setSignals(id, "state", state);
+/**
+ * Optimistically reflect a subject's triage change so it feels instant — the
+ * authoritative WS `board` event reconciles moments later.
+ *
+ * One field, one write. This used to have to walk every member signal and
+ * recompute an aggregate, because triage was per signal.
+ */
+export function patchHandled(key: string, handled: Handled) {
+  if (subjects[key]) setSubjects(key, "handled", handled);
 }
 
 /**
- * Optimistically reflect a signal's state change inside its thread (what the
- * board actually renders) so triage feels instant — the authoritative WS `board`
- * event reconciles it moments later. Also recomputes the thread's aggregate state.
+ * Indexing progress pushed over the WebSocket, by repo.
+ *
+ * Kept beside the fetched baseline rather than merged into it: the fetch answers "what does the
+ * whole org look like", the events answer "what just changed", and the panel overlays the second
+ * on the first. Merging them here would mean the panel could not tell a repo it has never heard
+ * of from one whose row simply hasn't moved.
  */
-export function patchThreadSignalState(threadId: string, signalId: string, state: State) {
-  const t = threads[threadId];
-  if (!t) return;
-  const idx = t.signals.findIndex((s) => s.id === signalId);
-  if (idx < 0) return;
-  setThreads(threadId, "signals", idx, "state", state);
-  setThreads(threadId, "state", aggregateState(threads[threadId].signals));
-  patchSignalState(signalId, state);
+const [indexProgress, setIndexProgress] = createStore<
+  Record<string, IndexProgressEvent>
+>({});
+export { indexProgress };
+
+/**
+ * Agent session transcripts, by session id, in arrival order.
+ *
+ * Appended rather than replaced: the value of watching an agent is the sequence — which file it
+ * read, what it concluded, what it tried next — and a store keeping only the latest chunk would
+ * show a cursor rather than a transcript.
+ */
+const [agentLog, setAgentLog] = createStore<Record<string, AgentChunk[]>>({});
+export { agentLog };
+
+/**
+ * AI dispatches by id, pushed as each one is accepted, starts, and finishes.
+ *
+ * A flat store keyed by dispatch id rather than a per-subject list: the backend patches one
+ * row at a time, and the strip for a subject is a filter over this. Keeping the whole set
+ * also means the board can mark *which* cards have work in flight without asking.
+ */
+const [dispatches, setDispatches] = createStore<Record<string, Dispatch>>({});
+export { dispatches };
+
+/** One subject's dispatches, newest first. */
+export function dispatchesFor(subject: string): Dispatch[] {
+  return Object.values(dispatches)
+    .filter((d) => d.subject === subject)
+    .sort((a, b) => b.started_at.localeCompare(a.started_at));
+}
+
+/** Whether a subject has an AI pass accepted-but-unfinished right now. */
+export function isBusy(subject: string): boolean {
+  return Object.values(dispatches).some(
+    (d) =>
+      d.subject === subject && (d.state === "queued" || d.state === "running"),
+  );
+}
+
+/** Forget one session's transcript. */
+export function clearAgentLog(id: string) {
+  setAgentLog(id, []);
 }
 
 function apply(ev: Event) {
@@ -78,25 +129,31 @@ function apply(ev: Event) {
       const s: Record<string, Signal> = {};
       for (const sig of ev.data.signals) s[sig.id] = sig;
       setSignals(reconcile(s));
-      const t: Record<string, ThreadView> = {};
-      for (const th of ev.data.threads) t[th.id] = th;
-      setThreads(reconcile(t));
+      const t: Record<string, SubjectView> = {};
+      for (const sub of ev.data.subjects) t[sub.key] = sub;
+      setSubjects(reconcile(t));
       setHints(ev.data.hints.filter((h) => h.state === "active"));
       setHealth(ev.data.health);
+      // Reconciled, not merged: the daemon restarting is what clears in-memory dispatch
+      // state, and a client holding rows the backend has forgotten would show work that
+      // is no longer running as still in flight.
+      const d: Record<string, Dispatch> = {};
+      for (const disp of ev.data.dispatches ?? []) d[disp.id] = disp;
+      setDispatches(reconcile(d));
       break;
     }
     case "signal":
       setSignals(ev.data.id, ev.data);
       break;
-    case "thread":
-      setThreads(ev.data.id, ev.data);
+    case "subject":
+      setSubjects(ev.data.key, ev.data);
       break;
     case "board": {
-      // Authoritative active-thread set — reconcile so merged/split/resolved
-      // threads drop out of the board rather than lingering.
-      const t: Record<string, ThreadView> = {};
-      for (const th of ev.data) t[th.id] = th;
-      setThreads(reconcile(t));
+      // Authoritative active set — reconcile so merged-away or handled subjects
+      // drop off the board rather than lingering.
+      const t: Record<string, SubjectView> = {};
+      for (const sub of ev.data) t[sub.key] = sub;
+      setSubjects(reconcile(t));
       break;
     }
     case "hint":
@@ -110,6 +167,35 @@ function apply(ev: Event) {
       break;
     case "clear_alert":
       setRedAlert(null);
+      break;
+    case "agent_chunk": {
+      const id = ev.data.session_id;
+      setAgentLog(id, (prev) => {
+        const log = prev ?? [];
+        const last = log[log.length - 1];
+        // Coalesce a delta into the block it continues. Without this a streamed answer renders
+        // one word per row, which is unreadable and defeats the point of streaming it.
+        if (
+          ev.data.delta &&
+          last &&
+          last.kind === ev.data.kind &&
+          last.subagent_of === ev.data.subagent_of
+        ) {
+          const merged = { ...last, text: last.text + ev.data.text };
+          return [...log.slice(0, -1), merged];
+        }
+        return [...log, ev.data];
+      });
+      break;
+    }
+    case "dispatch":
+      // Upsert by id: submit → running → done is one row moving, not three rows.
+      setDispatches(ev.data.id, ev.data);
+      break;
+    case "index_progress":
+      // One repo, replaced wholesale. Fine-grained reactivity means only the row that moved
+      // repaints, which matters on a 147-repo list.
+      setIndexProgress(ev.data.repo, ev.data);
       break;
   }
 }

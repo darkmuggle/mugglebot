@@ -196,12 +196,18 @@ pub fn extract_json(text: &str) -> Option<serde_json::Value> {
 /// `ollama` for Ollama Cloud, `ollama_local` for the on-device instance) to the
 /// internal reasoner label that [`build`] expects. Unknown values default to
 /// Claude.
+/// Map a UI/config provider name onto a builder label.
+///
+/// Unrecognized names resolve to **local**, not to a cloud provider. The inputs here come
+/// from a request body and a TOML file, so the catch-all decides what a typo does — and
+/// under a local-by-default policy a typo must not quietly start billing. Every cloud
+/// provider has to be named exactly.
 pub fn provider_label(ui: &str) -> &'static str {
     match ui.trim().to_ascii_lowercase().as_str() {
+        "claude" | "anthropic" => "claude",
         "openai" | "chatgpt" => "chatgpt",
-        "ollama_local" | "ollama-local" => "ollama_local",
         "ollama" | "ollama_cloud" | "ollama-cloud" => "ollama",
-        _ => "claude",
+        _ => "ollama_local",
     }
 }
 
@@ -225,20 +231,32 @@ pub fn build(
     cfg: &ReasonerCfg,
     ollama_key: Option<String>,
 ) -> Arc<dyn Reasoner> {
+    // Bounded, always. An unbounded request holds the shared local permit forever.
+    let timeout = crate::config::parse_duration(&cfg.request_timeout)
+        .unwrap_or(std::time::Duration::from_secs(600));
     match provider {
-        "ollama" => Arc::new(ollama::OllamaReasoner::new(
+        "ollama" => Arc::new(ollama::OllamaReasoner::with_timeout(
             cfg.ollama_cloud_url.clone(),
             model.to_string(),
             ollama_key,
+            timeout,
         )),
-        "ollama_local" => Arc::new(ollama::OllamaReasoner::new(
+        "ollama_local" => Arc::new(ollama::OllamaReasoner::with_timeout(
             cfg.ollama_url.clone(),
             model.to_string(),
             ollama_key,
+            timeout,
         )),
         "chatgpt" => Arc::new(cli::CliReasoner::codex(model.to_string())),
-        // "claude" and anything unrecognized default to Claude.
-        _ => Arc::new(cli::CliReasoner::claude(model.to_string())),
+        "claude" => Arc::new(cli::CliReasoner::claude(model.to_string())),
+        // Anything else is local. Only the labels above reach a metered model, and
+        // `provider_label` is the only thing that produces them.
+        _ => Arc::new(ollama::OllamaReasoner::with_timeout(
+            cfg.ollama_url.clone(),
+            model.to_string(),
+            ollama_key,
+            timeout,
+        )),
     }
 }
 
@@ -292,8 +310,9 @@ pub async fn list_models(
     // Surface whichever configured models belong to this provider.
     let pinned = [
         (cfg.local.as_str(), cfg.local_model.clone()),
+        ("ollama_local", cfg.vision_model.clone()),
         (cfg.mid.as_str(), cfg.mid_model.clone()),
-        (cfg.heavy.as_str(), cfg.heavy_model.clone()),
+        (cfg.cloud.as_str(), cfg.cloud_model.clone()),
     ]
     .into_iter()
     .filter(|(p, _)| *p == provider)
@@ -327,16 +346,33 @@ fn dedup_prepend(models: &mut Vec<String>, extra: impl IntoIterator<Item = Strin
 ///
 /// [`Self::vision`] exists only because images need a model that can see them.
 #[derive(Clone)]
+/// The reasoners the daemon hands out.
+///
+/// The shape encodes the policy: **the local model does the work, and a cloud model is
+/// asked only when the operator asks for one by name.** There is exactly one
+/// cloud-capable handle here, so "does this run on Claude?" is answerable by grepping
+/// for `.cloud` rather than by reading every call site and hoping.
 pub struct Reasoners {
-    /// Difficulty-routed: local by default, escalating on grade.
-    pub routed: Arc<dyn Reasoner>,
-    /// On-device only, by policy. Never escalates.
+    /// On-device. Every automatic pass runs here.
     pub local: Arc<dyn Reasoner>,
-    /// Vision-capable tier, for multimodal chat.
+    /// Also local, unless `[reasoner.routing] enabled = true` — which re-enables
+    /// automatic escalation. Kept as a distinct handle so the call sites that would
+    /// escalate are visible, and so turning routing on doesn't mean editing them all.
+    pub routed: Arc<dyn Reasoner>,
+    /// The same local model, marked as **bulk** work so it cannot take the worker held back for
+    /// foreground passes. Held by the code indexer and the repo crawler.
+    ///
+    /// A separate handle rather than a per-call flag because the bulk callers are known and few,
+    /// and a flag would have to be threaded through every model call they make to say the same
+    /// thing in more places.
+    pub local_background: Arc<dyn Reasoner>,
+    /// Local vision model, for images dropped into chat. Separate because a coder model
+    /// has no image encoder and would silently ignore the attachment.
     pub vision: Arc<dyn Reasoner>,
-    /// Small, fast cloud model for plain-English rewriting. Not a reasoning tier —
-    /// it re-renders conclusions another model already reached.
-    pub brief: Arc<dyn Reasoner>,
+    /// **The only cloud-capable handle, and it is opt-in.** Two callers may hold it:
+    /// the chat pane when the operator picks a cloud model, and `SecondOpinion` when
+    /// they press the button. Anything else holding this is a policy break.
+    pub cloud: Arc<dyn Reasoner>,
 }
 
 impl Reasoners {
@@ -348,6 +384,9 @@ impl Reasoners {
         ollama_key: Option<String>,
         store: Option<Arc<crate::store::Store>>,
     ) -> Self {
+        // Sized before any reasoner is built, so the first call can't race past an
+        // unsized gate. First-call-wins, which is right: this runs once at boot.
+        ollama::init_gate(cfg.local_concurrency);
         // Every tier is wrapped, including the one the router uses to grade, so a
         // repeated identical request is free wherever it originates.
         let ttl = crate::config::parse_duration(&cfg.cache.ttl)
@@ -383,36 +422,54 @@ impl Reasoners {
             &cfg.mid,
             &cfg.mid_model,
         );
-        let heavy = wrap(
+        let cloud = wrap(
             build(
-                provider_label(&cfg.heavy),
-                &cfg.heavy_model,
+                provider_label(&cfg.cloud),
+                &cfg.cloud_model,
                 cfg,
                 ollama_key.clone(),
             ),
-            &cfg.heavy,
-            &cfg.heavy_model,
+            &cfg.cloud,
+            &cfg.cloud_model,
         );
-        let brief = wrap(
-            build(
-                provider_label(&cfg.brief),
-                &cfg.brief_model,
-                cfg,
-                ollama_key,
+        // The bulk handle: same endpoint and model, marked so the gate holds a worker back from
+        // it. A separate handle rather than a per-call flag because the callers are known — the
+        // indexer and the crawler — and a flag would have to be threaded through every one of
+        // their model calls to say the same thing.
+        let local_background: Arc<dyn Reasoner> = wrap(
+            Arc::new(
+                ollama::OllamaReasoner::with_timeout(
+                    cfg.ollama_url.clone(),
+                    cfg.local_model.clone(),
+                    ollama_key.clone(),
+                    crate::config::parse_duration(&cfg.request_timeout)
+                        .unwrap_or(std::time::Duration::from_secs(600)),
+                )
+                .background(),
             ),
-            &cfg.brief,
-            &cfg.brief_model,
+            &cfg.local,
+            &cfg.local_model,
+        );
+        // Vision is built against the *local* provider whatever `local` is, so a chat
+        // image goes to a local vision model rather than off the machine.
+        let vision = wrap(
+            build("ollama_local", &cfg.vision_model, cfg, ollama_key),
+            "ollama_local",
+            &cfg.vision_model,
         );
         Self {
+            // With routing off (the default) this resolves to `local` on every call and
+            // never grades, so it costs nothing to hold.
             routed: Arc::new(router::RoutingReasoner::new(
                 local.clone(),
                 mid,
-                heavy.clone(),
+                cloud.clone(),
                 cfg.routing.clone(),
             )),
             local,
-            vision: heavy,
-            brief,
+            local_background,
+            vision,
+            cloud,
         }
     }
 }
@@ -445,6 +502,61 @@ impl Reasoner for MockReasoner {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The policy, asserted on the thing that actually decides it: what `from_config`
+    /// builds. With the shipped defaults, `local`, `routed` and `vision` must all be
+    /// on-device, and `cloud` must be the only handle that isn't.
+    ///
+    /// This is the test that fails if someone "helpfully" points a tier back at Claude, or
+    /// adds a fifth handle and wires it to the cloud provider. The wiring is the guarantee,
+    /// so the wiring is what gets checked.
+    #[test]
+    fn the_shipped_config_puts_only_one_handle_in_the_cloud() {
+        let cfg = ReasonerCfg::default();
+        assert_eq!(provider_label(&cfg.local), "ollama_local");
+        // Vision is always built local regardless of what `local` says — see
+        // `from_config`. Asserted here so a config-shaped change can't quietly move it.
+        assert!(
+            cfg.vision_model.contains("vl") || cfg.vision_model.contains("llava"),
+            "vision_model `{}` does not look like a vision model",
+            cfg.vision_model
+        );
+        // Routing off means `routed` resolves to local on every call, and nothing pays for
+        // a difficulty grade.
+        assert!(!cfg.routing.enabled);
+        assert!(!cfg.routing.cleanup);
+        assert!(!cfg.routing.cloud_fallback);
+        // ...and the one cloud handle is genuinely cloud, so the second-opinion button
+        // isn't quietly asking the local model the same question twice.
+        assert_eq!(provider_label(&cfg.cloud), "claude");
+    }
+
+    /// The catch-all decides what a typo does. Under local-by-default it must resolve to
+    /// the local model: a misspelled provider in a config file or a request body must not
+    /// be the thing that starts making metered calls.
+    #[test]
+    fn an_unrecognized_provider_resolves_local_not_to_a_cloud_model() {
+        for junk in ["", "  ", "cluade", "gpt-4", "anthropc", "sonnet", "opus"] {
+            assert_eq!(
+                provider_label(junk),
+                "ollama_local",
+                "`{junk}` must not reach a metered model"
+            );
+        }
+    }
+
+    /// ...and a cloud provider still has to be reachable when it is named exactly, in
+    /// either spelling the UI and the config use.
+    #[test]
+    fn naming_a_cloud_provider_exactly_still_works() {
+        assert_eq!(provider_label("claude"), "claude");
+        assert_eq!(provider_label("anthropic"), "claude");
+        assert_eq!(provider_label("Anthropic"), "claude");
+        assert_eq!(provider_label("openai"), "chatgpt");
+        assert_eq!(provider_label("chatgpt"), "chatgpt");
+        assert_eq!(provider_label("ollama"), "ollama");
+        assert_eq!(provider_label("ollama_local"), "ollama_local");
+    }
 
     #[test]
     fn extracts_bare_json() {

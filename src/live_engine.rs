@@ -2,154 +2,96 @@
 //!
 //! Threads the user is active in (detected via their Slack `user_id`) are marked
 //! _live_ and get a **debounced** re-analysis — 1 minute after the last activity,
-//! with a 5-minute hard cap so a fast-moving thread still gets looked at. A pass
-//! produces grounded [`Hint`]s: hints (a runbook, a related thread), suggestions
-//! (a next step / generic mitigation), and **flags** on the user's own messages
+//! with a 5-minute hard cap so a fast-moving subject still gets looked at. A pass
+//! produces grounded [`Hint`]s: hints (a runbook, a related subject), suggestions
+//! (a concrete next step grounded in the runbooks), and **flags** on the user's own messages
 //! (`factual_error` / `risky_action`). A high-confidence flag flips the UI to
 //! red-alert and fires a Critical macOS notification.
 //!
 //! It is strictly advisory: it warns and cites, it never edits or sends anything.
-//! With no reachable reasoner it degrades to deterministic mitigation suggestions
+//! With no reachable reasoner it degrades to a pointer at the grounding that matched
 //! so the panel is never empty when it matters.
 
 use anyhow::Result;
 use chrono::Utc;
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::sync::Arc;
 use tokio::sync::broadcast;
-use tracing::{debug, warn};
+use tracing::debug;
 
 use crate::context::ContextManager;
-use crate::correlation::{Correlator, ThreadView};
 use crate::event::{Event, RedAlert};
 use crate::live::{FlagType, Hint, HintKind, HintState};
 use crate::memory::MemoryManager;
-use crate::mitigations;
 use crate::notify::Notifier;
 use crate::reasoner::{self, CompletionRequest, Reasoner};
 use crate::signal::{Severity, Signal, SignalKind, Source};
 use crate::store::Store;
-
-struct Pending {
-    first: Instant,
-    last: Instant,
-}
+use crate::subject::{Attributor, SubjectView};
 
 pub struct LiveEngine {
     store: Arc<Store>,
-    correlator: Arc<Correlator>,
-    /// Heavy reasoner (Opus) for the full pass on high-stakes threads.
+    attributor: Arc<Attributor>,
+    /// The local model: the triage gate and the full grounded pass both run here.
+    ///
+    /// This used to be two handles — Opus for high-stakes subjects, Sonnet for Slack
+    /// chatter. Both are the local model now, so the split said something about cost that
+    /// was no longer true, and the stakes judgment moved to where it still buys something:
+    /// [`is_operational`] skips the gate entirely for signals that obviously warrant a pass.
     reasoner: Arc<dyn Reasoner>,
-    /// Cheap reasoner (ambient/Sonnet). Runs the triage gate, and also the full
-    /// pass itself for low-stakes Slack-only threads — Slack chatter doesn't earn
-    /// an Opus call.
-    ambient: Arc<dyn Reasoner>,
     memory: Arc<MemoryManager>,
     context: Arc<ContextManager>,
     notifier: Arc<Notifier>,
     events: broadcast::Sender<Event>,
-    debounce: Duration,
-    debounce_max: Duration,
     red_alert: bool,
     red_alert_min_confidence: f64,
-    pending: Mutex<HashMap<String, Pending>>,
 }
 
 impl LiveEngine {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         store: Arc<Store>,
-        correlator: Arc<Correlator>,
+        attributor: Arc<Attributor>,
         reasoner: Arc<dyn Reasoner>,
-        ambient: Arc<dyn Reasoner>,
         memory: Arc<MemoryManager>,
         context: Arc<ContextManager>,
         notifier: Arc<Notifier>,
         events: broadcast::Sender<Event>,
-        debounce: Duration,
-        debounce_max: Duration,
         red_alert: bool,
         red_alert_min_confidence: f64,
     ) -> Self {
         Self {
             store,
-            correlator,
+            attributor,
             reasoner,
-            ambient,
             memory,
             context,
             notifier,
             events,
-            debounce,
-            debounce_max,
             red_alert,
             red_alert_min_confidence,
-            pending: Mutex::new(HashMap::new()),
         }
     }
 
-    /// Record activity in a thread: mark it live and (re)start its debounce timer.
-    pub fn on_activity(&self, thread_id: &str) {
-        let _ = self.store.set_thread_live(thread_id, true);
-        let now = Instant::now();
-        let mut pending = self.pending.lock().unwrap();
-        pending
-            .entry(thread_id.to_string())
-            .and_modify(|p| p.last = now)
-            .or_insert(Pending {
-                first: now,
-                last: now,
-            });
-        debug!("live: thread {thread_id} scheduled for re-analysis");
+    /// Mark a subject live. The *scheduling* half of this used to live here — an
+    /// in-memory pending map plus a tick loop — and is now the subject object's
+    /// durable timer, so a restart no longer drops every pending live pass. During
+    /// development that was most of them: `tilt up` rebuilds on every save.
+    pub fn on_activity(&self, subject_key: &str) {
+        let _ = self.store.set_subject_live(subject_key, true);
+        debug!("live: subject {subject_key} marked live");
     }
 
-    /// Background loop: every tick, run a live pass for threads whose debounce has
-    /// elapsed (quiet for `debounce`) or hit the `debounce_max` hard cap.
-    pub async fn run(self: Arc<Self>) {
-        let tick = self
-            .debounce
-            .min(Duration::from_secs(15))
-            .max(Duration::from_secs(2));
-        loop {
-            tokio::time::sleep(tick).await;
-            let due = self.take_due();
-            for tid in due {
-                if let Err(e) = self.analyze_thread(&tid).await {
-                    warn!("live pass for {tid} failed: {e:#}");
-                }
-            }
-        }
-    }
-
-    fn take_due(&self) -> Vec<String> {
-        let now = Instant::now();
-        let mut pending = self.pending.lock().unwrap();
-        let due: Vec<String> = pending
-            .iter()
-            .filter(|(_, p)| {
-                now.duration_since(p.last) >= self.debounce
-                    || now.duration_since(p.first) >= self.debounce_max
-            })
-            .map(|(id, _)| id.clone())
-            .collect();
-        for id in &due {
-            pending.remove(id);
-        }
-        due
-    }
-
-    /// Run one grounded live-assist pass over a thread. Public so a client can
+    /// Run one grounded live-assist pass over a subject. Public so a client can
     /// trigger it directly (and for tests).
-    pub async fn analyze_thread(&self, thread_id: &str) -> Result<()> {
-        let Some(view) = self.correlator.thread_view(thread_id)? else {
+    pub async fn analyze_thread(&self, subject_key: &str) -> Result<()> {
+        let Some(view) = self.attributor.subject_view(subject_key)? else {
             return Ok(());
         };
-        // Cheap Sonnet triage before the expensive full-context pass: a casual
-        // mention ("hi!") shouldn't cost a grounded heavy-reasoner call.
+        // A cheap classifier pass before the expensive full-context one: a casual
+        // mention ("hi!") shouldn't cost a grounded pass over the whole library.
         if !self.warrants_full_pass(&view).await {
-            debug!("live: thread {thread_id} triaged as non-operational; skipping full pass");
-            self.store.clear_active_hints(thread_id)?;
+            debug!("live: subject {subject_key} triaged as non-operational; skipping full pass");
+            self.store.clear_active_hints(subject_key)?;
             return Ok(());
         }
         let grounding = self.gather_grounding(&view).await;
@@ -162,7 +104,7 @@ impl LiveEngine {
             }
         };
 
-        self.store.clear_active_hints(thread_id)?;
+        self.store.clear_active_hints(subject_key)?;
         for hint in &hints {
             self.store.put_hint(hint)?;
             let _ = self.events.send(Event::Hint(hint.clone()));
@@ -176,7 +118,7 @@ impl LiveEngine {
                     &hint.text,
                 );
                 let _ = self.events.send(Event::RedAlert(RedAlert {
-                    thread_id: thread_id.to_string(),
+                    subject_key: subject_key.to_string(),
                     hint_id: hint.id.clone(),
                     message: hint.text.clone(),
                 }));
@@ -185,16 +127,12 @@ impl LiveEngine {
         Ok(())
     }
 
-    /// Triage gate: is this thread worth the full grounded pass on the heavy
-    /// reasoner? A genuine alert always is and bypasses the classifier; anything
-    /// else gets a cheap Sonnet yes/no. **Fails open** — any error or
-    /// unparseable answer proceeds to the full pass, so triage can never silence
-    /// a real incident, only spare the cost of obvious chatter.
-    async fn warrants_full_pass(&self, view: &ThreadView) -> bool {
-        if view.signals.iter().any(|s| {
-            s.severity >= Severity::Warning
-                || matches!(s.kind, SignalKind::Alert | SignalKind::CiFailure)
-        }) {
+    /// Triage gate: is this subject worth the full grounded pass? Anything obviously
+    /// operational bypasses the classifier ([`is_operational`]); the rest gets a cheap
+    /// yes/no. **Fails open** — any error or unparseable answer proceeds to the full pass,
+    /// so triage can never silence a real incident, only spare the cost of obvious chatter.
+    async fn warrants_full_pass(&self, view: &SubjectView) -> bool {
+        if is_operational(&view.signals) {
             return true;
         }
         let mut ev = String::new();
@@ -206,15 +144,15 @@ impl LiveEngine {
             ));
         }
         let system = "You are a fast triage filter for an ops-awareness tool. Decide whether a \
-            thread of signals needs an on-call engineer's attention: it concerns an error, failure, \
+            subject of signals needs an on-call engineer's attention: it concerns an error, failure, \
             incident, alert, degraded system, or a concrete request to review or act. Casual \
             greetings, social chatter, thanks, and FYIs do NOT. Respond with ONLY JSON: \
             {\"needs_attention\":true|false}.";
         let req =
-            CompletionRequest::single(format!("Thread: {}\nSignals:\n{ev}", view.thread.title))
+            CompletionRequest::single(format!("Subject: {}\nSignals:\n{ev}", view.subject.title))
                 .with_system(system)
                 .max_tokens(60);
-        match self.ambient.complete(&req).await {
+        match self.reasoner.complete(&req).await {
             Ok(text) => reasoner::extract_json(&text)
                 .and_then(|v| v.get("needs_attention").and_then(|x| x.as_bool()))
                 .unwrap_or(true),
@@ -225,19 +163,8 @@ impl LiveEngine {
         }
     }
 
-    /// Route the full pass by stakes: a thread touching a non-Slack source or a
-    /// real alert gets the heavy (Opus) reasoner; pure Slack chatter is handled
-    /// by the cheaper ambient (Sonnet) model.
-    fn full_pass_reasoner(&self, view: &ThreadView) -> &Arc<dyn Reasoner> {
-        if wants_heavy(&view.signals) {
-            &self.reasoner
-        } else {
-            &self.ambient
-        }
-    }
-
-    async fn gather_grounding(&self, view: &ThreadView) -> String {
-        let query = view.thread.title.clone()
+    async fn gather_grounding(&self, view: &SubjectView) -> String {
+        let query = view.subject.title.clone()
             + " "
             + &view
                 .signals
@@ -246,10 +173,10 @@ impl LiveEngine {
                 .collect::<Vec<_>>()
                 .join(" ");
         let mut out = String::new();
-        // Tag-matched memory first (the thread's tags are set by the ambient
+        // Tag-matched memory first (the subject's tags are set by the ambient
         // classifier pass), then a vector-similarity fill, de-duplicated.
         let mut mem_seen: Vec<String> = Vec::new();
-        if let Ok(tagged) = self.store.memory_by_tags(&view.thread.tags) {
+        if let Ok(tagged) = self.store.memory_by_tags(&view.subject.tags) {
             // Tag-matched is high-precision — feed the full fact, not just the gloss.
             for m in tagged.into_iter().take(3) {
                 out.push_str(&memory_block(&m.id, &m.summary, &m.text));
@@ -267,7 +194,7 @@ impl LiveEngine {
         }
         // Tag-matched context first, then a vector-similarity fill, de-duplicated.
         let mut seen: Vec<String> = Vec::new();
-        if let Ok(tagged) = self.store.context_by_tags(&view.thread.tags) {
+        if let Ok(tagged) = self.store.context_by_tags(&view.subject.tags) {
             // Tag-matched entries carry a body excerpt (runbook steps, not a gloss).
             for c in tagged.into_iter().take(3) {
                 out.push_str(&context_block(&c));
@@ -290,7 +217,7 @@ impl LiveEngine {
         out
     }
 
-    async fn llm_pass(&self, view: &ThreadView, grounding: &str) -> Result<Vec<Hint>> {
+    async fn llm_pass(&self, view: &SubjectView, grounding: &str) -> Result<Vec<Hint>> {
         let mut ev = String::new();
         for s in &view.signals {
             let is_self = s
@@ -310,16 +237,12 @@ impl LiveEngine {
                 ev.push_str(&format!("    ↳ linked page {url}: {summary}\n"));
             }
         }
-        let catalog = mitigations::CATALOG
-            .iter()
-            .map(|m| format!("- {}: {}", m.name, m.description))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let system = "You are MuggleBot's live-assist. You watch a thread the engineer is active in \
+        let system = "You are MuggleBot's live-assist. You watch a subject the engineer is active in \
             and help without acting. Produce, grounded in the provided runbooks/memory and citing by \
             id ([sig:ID], [ctx:ID], [mem:ID]): (1) hints — a relevant runbook, a past incident, a \
-            connection they may have missed; (2) suggestions — a sensible next step or a generic \
-            mitigation from the catalog; (3) flags on THEIR OWN messages only (marked YOUR MESSAGE) \
+            connection they may have missed; (2) suggestions — a concrete next step, grounded in \
+            the runbooks and past incidents provided, NOT generic advice anyone could give; \
+            (3) flags on THEIR OWN messages only (marked YOUR MESSAGE) \
             when they state something the grounding contradicts (factual_error) or propose a \
             risky/irreversible action (risky_action). Only flag with real evidence — do not cry wolf. \
             Respond with ONLY JSON: {\"hints\":[{\"text\":\"\",\"citations\":[]}],\
@@ -327,20 +250,20 @@ impl LiveEngine {
             \"flags\":[{\"signal_id\":\"\",\"flag_type\":\"factual_error|risky_action\",\"text\":\"\",\
             \"rationale\":\"\",\"confidence\":0.0,\"citations\":[]}]}.";
         let prompt = format!(
-            "Thread: {}\n\nSignals:\n{ev}\n\nGrounding:\n{grounding}\n\nGeneric mitigations catalog:\n{catalog}",
-            view.thread.title
+            "Subject: {}\n\nSignals:\n{ev}\n\nGrounding:\n{grounding}",
+            view.subject.title
         );
         let req = CompletionRequest::single(prompt)
             .with_system(system)
             .max_tokens(900)
-            .session(format!("thread:{}", view.thread.id));
-        let text = self.full_pass_reasoner(view).complete(&req).await?;
+            .session(format!("subject:{}", view.subject.key));
+        let text = self.reasoner.complete(&req).await?;
         let v = reasoner::extract_json(&text)
             .ok_or_else(|| anyhow::anyhow!("no JSON in live-assist response"))?;
-        Ok(self.parse_hints(&view.thread.id, &v))
+        Ok(self.parse_hints(view.subject.key.as_str(), &v))
     }
 
-    fn parse_hints(&self, thread_id: &str, v: &serde_json::Value) -> Vec<Hint> {
+    fn parse_hints(&self, subject_key: &str, v: &serde_json::Value) -> Vec<Hint> {
         let now = Utc::now();
         let mut out = Vec::new();
         let mk = |kind: HintKind,
@@ -350,7 +273,7 @@ impl LiveEngine {
                   confidence: f64,
                   flag_type: Option<FlagType>| Hint {
             id: format!("hint/{}", crate::store::new_id()),
-            thread_id: thread_id.to_string(),
+            subject_key: subject_key.to_string(),
             kind,
             flag_type,
             text,
@@ -441,29 +364,23 @@ impl LiveEngine {
         out
     }
 
-    /// No-LLM fallback: deterministic mitigation suggestions + a grounding pointer.
-    fn fallback_hints(&self, view: &ThreadView, grounding: &str) -> Vec<Hint> {
+    /// No-LLM fallback: a pointer at the grounding that matched.
+    ///
+    /// This used to also emit keyword-matched suggestions from a generic catalog — "read the
+    /// failing job's log and fix the specific error" and the like. That advice was the same for
+    /// every subject of a given shape, which makes it noise: it tells an on-call engineer nothing
+    /// they do not already know, and it occupied the space where a real finding would go.
+    ///
+    /// So with no reachable model the fallback now points at the runbook or past incident that
+    /// matched and stops there. Naming something specific and saying nothing else beats padding.
+    fn fallback_hints(&self, view: &SubjectView, grounding: &str) -> Vec<Hint> {
         let now = Utc::now();
         let mut out = Vec::new();
-        for m in mitigations::suggest(&view.signals).into_iter().take(2) {
-            out.push(Hint {
-                id: format!("hint/{}", crate::store::new_id()),
-                thread_id: view.thread.id.clone(),
-                kind: HintKind::Suggestion,
-                flag_type: None,
-                text: format!("{}: {}", m.mitigation.name, m.mitigation.description),
-                rationale: Some("matched the generic-mitigations catalog by keyword".into()),
-                citations: m.cited_signals,
-                confidence: 0.4,
-                state: HintState::Active,
-                created_at: now,
-            });
-        }
         if !grounding.trim().is_empty() {
             if let Some(first) = grounding.lines().next() {
                 out.push(Hint {
                     id: format!("hint/{}", crate::store::new_id()),
-                    thread_id: view.thread.id.clone(),
+                    subject_key: view.subject.key.to_string(),
                     kind: HintKind::Hint,
                     flag_type: None,
                     text: format!("Relevant grounding: {first}"),
@@ -479,9 +396,6 @@ impl LiveEngine {
     }
 }
 
-/// A thread earns the heavy (Opus) pass when it touches a non-Slack source or a
-/// real alert (Warning+, alert/CI-failure kinds); otherwise it's Slack-only
-/// chatter that the ambient (Sonnet) model handles. An empty thread is not heavy.
 fn context_line(id: &str, location: &str, summary: Option<&str>) -> String {
     format!("[ctx:{}] {} — {}\n", id, location, summary.unwrap_or(""))
 }
@@ -520,7 +434,11 @@ fn excerpt_line(body: &str) -> String {
     format!("    {excerpt}{ellipsis}\n")
 }
 
-fn wants_heavy(signals: &[Signal]) -> bool {
+/// Whether a subject is obviously operational: it touches a non-Slack source, or carries a
+/// real alert (Warning+, alert/CI-failure kinds). Such a subject skips the triage gate —
+/// asking a model "is this worth looking at?" about a CI failure spends a call to be told
+/// what the signal already said. An empty subject is not operational.
+fn is_operational(signals: &[Signal]) -> bool {
     signals.iter().any(|s| {
         s.source != Source::Slack
             || s.severity >= Severity::Warning
@@ -553,17 +471,18 @@ mod tests {
     use crate::config::Notifications;
     use crate::embed::HashEmbedder;
     use crate::reasoner::MockReasoner;
-    use crate::signal::{Entity, Severity, Signal, SignalKind, Source, State};
+    use crate::signal::{ResolutionKey, Severity, Signal, SignalKind, Source};
 
     fn engine(
         response: &str,
     ) -> (
         Arc<Store>,
-        Arc<Correlator>,
+        Arc<Attributor>,
         Arc<LiveEngine>,
         broadcast::Receiver<Event>,
     ) {
         let store = Arc::new(Store::open_in_memory().unwrap());
+        let secrets = crate::secrets::Secrets::for_tests(store.clone());
         let embedder = Arc::new(HashEmbedder);
         let reasoner: Arc<dyn Reasoner> = Arc::new(MockReasoner::new(response));
         let memory = Arc::new(MemoryManager::new(
@@ -574,34 +493,32 @@ mod tests {
         ));
         let context = Arc::new(ContextManager::new(
             store.clone(),
+            secrets.clone(),
             embedder,
             reasoner.clone(),
             reasoner.clone(),
             "6h".into(),
         ));
-        let correlator = Arc::new(Correlator::new(store.clone(), Duration::from_secs(1800)));
+        let attributor = Arc::new(Attributor::new(store.clone()));
         let notifier = Arc::new(Notifier::new(&Notifications::default(), None));
         let (tx, rx) = broadcast::channel(64);
         let engine = Arc::new(LiveEngine::new(
             store.clone(),
-            correlator.clone(),
-            reasoner.clone(),
+            attributor.clone(),
             reasoner,
             memory,
             context,
             notifier,
             tx,
-            Duration::from_secs(60),
-            Duration::from_secs(300),
             true,
             0.75,
         ));
-        (store, correlator, engine, rx)
+        (store, attributor, engine, rx)
     }
 
     fn self_msg() -> Signal {
         Signal {
-            id: Signal::make_id(Source::Slack, "m1"),
+            id: Signal::make_id(Source::Slack, "m1", None),
             source: Source::Slack,
             external_id: "m1".into(),
             kind: SignalKind::Mention,
@@ -609,12 +526,16 @@ mod tests {
             body: Some("deleting prod db now".into()),
             url: None,
             actor: Some("UME".into()),
-            entities: vec![Entity::new("channel", "#incidents")],
+            keys: vec![
+                ResolutionKey::new("channel", "#incidents"),
+                ResolutionKey::new("slack_thread", "C9/1721822400.001"),
+            ],
             severity: Severity::Warning,
-            state: State::Unseen,
+            version: None,
+            upstream_gone: false,
             occurred_at: Utc::now(),
             ingested_at: Utc::now(),
-            thread: None,
+            subject: None,
             raw: serde_json::json!({ "is_self": true }),
             tags: Vec::new(),
         }
@@ -625,14 +546,14 @@ mod tests {
         let response = r#"{"hints":[],"suggestions":[],"flags":[
             {"signal_id":"slack/m1","flag_type":"risky_action","text":"Deleting the prod database is irreversible","rationale":"runbook says never delete prod","confidence":0.95,"citations":["ctx:x"]}
         ]}"#;
-        let (store, correlator, engine, mut rx) = engine(response);
+        let (store, attributor, engine, mut rx) = engine(response);
         let s = self_msg();
         store.insert_signal(&s).unwrap();
-        let tid = correlator.ingest(&s).unwrap();
+        let tid = attributor.attach(&s).unwrap().expect("attributed");
 
-        engine.analyze_thread(&tid).await.unwrap();
+        engine.analyze_thread(tid.as_str()).await.unwrap();
 
-        let hints = store.list_hints(Some(&tid)).unwrap();
+        let hints = store.list_hints(Some(tid.as_str())).unwrap();
         assert_eq!(hints.len(), 1);
         assert_eq!(hints[0].kind, HintKind::Flag);
         assert_eq!(hints[0].flag_type, Some(FlagType::RiskyAction));
@@ -649,7 +570,7 @@ mod tests {
 
     fn casual_mention() -> Signal {
         Signal {
-            id: Signal::make_id(Source::Slack, "hi1"),
+            id: Signal::make_id(Source::Slack, "hi1", None),
             source: Source::Slack,
             external_id: "hi1".into(),
             kind: SignalKind::Mention,
@@ -657,12 +578,16 @@ mod tests {
             body: Some("HI!".into()),
             url: None,
             actor: Some("U9".into()),
-            entities: vec![Entity::new("channel", "#dev")],
+            keys: vec![
+                ResolutionKey::new("channel", "#dev"),
+                ResolutionKey::new("slack_thread", "C7/1721822400.003"),
+            ],
             severity: Severity::Notice,
-            state: State::Unseen,
+            version: None,
+            upstream_gone: false,
             occurred_at: Utc::now(),
             ingested_at: Utc::now(),
-            thread: None,
+            subject: None,
             raw: serde_json::json!({ "mentions_me": true }),
             tags: Vec::new(),
         }
@@ -672,38 +597,48 @@ mod tests {
     async fn triage_skips_full_pass_for_casual_mention() {
         // Triage (ambient) answers "not operational"; the expensive full pass
         // never runs, so no hints are produced.
-        let (store, correlator, engine, _rx) = engine(r#"{"needs_attention":false}"#);
+        let (store, attributor, engine, _rx) = engine(r#"{"needs_attention":false}"#);
         let s = casual_mention();
         store.insert_signal(&s).unwrap();
-        let tid = correlator.ingest(&s).unwrap();
-        engine.analyze_thread(&tid).await.unwrap();
-        assert!(store.list_hints(Some(&tid)).unwrap().is_empty());
+        let tid = attributor.attach(&s).unwrap().expect("attributed");
+        engine.analyze_thread(tid.as_str()).await.unwrap();
+        assert!(store.list_hints(Some(tid.as_str())).unwrap().is_empty());
     }
 
     #[test]
-    fn source_routing_keeps_slack_chatter_on_ambient() {
-        // Pure Slack, low severity → ambient (Sonnet).
-        assert!(!wants_heavy(&[casual_mention()]));
-        // A real alert in the mix → heavy (Opus).
-        assert!(wants_heavy(&[self_msg()]));
-        // A non-Slack signal → heavy, even at low severity.
+    fn only_operational_subjects_skip_the_triage_gate() {
+        // Pure Slack, low severity → must be classified before a full pass is spent.
+        assert!(!is_operational(&[casual_mention()]));
+        // A real alert in the mix → straight through.
+        assert!(is_operational(&[self_msg()]));
+        // A non-Slack signal → straight through, even at low severity: a GitHub event is
+        // operational by construction, so asking a model to confirm it is pure cost.
         let mut gh = casual_mention();
         gh.source = Source::GitHub;
         gh.severity = Severity::Info;
-        assert!(wants_heavy(&[gh]));
+        assert!(is_operational(&[gh]));
     }
 
     #[tokio::test]
     async fn fallback_when_no_json() {
-        // Reasoner returns prose (no JSON) → deterministic mitigation fallback.
-        let (store, correlator, engine, _rx) = engine("I couldn't produce JSON, sorry.");
+        // Reasoner returns prose (no JSON) → the deterministic grounding-pointer fallback.
+        //
+        // The fallback used to also emit a keyword-matched generic suggestion ("consider
+        // rolling back"). It no longer does: incident vocabulary is everywhere in
+        // engineering prose, so that path produced the same advice for every subject. What
+        // survives is the pointer at grounding the operator may not have connected, which
+        // is specific to *this* subject by construction.
+        let (store, attributor, engine, _rx) = engine("I couldn't produce JSON, sorry.");
         let mut s = self_msg();
         s.title = "connection pool exhausted, cpu saturation".into();
         s.body = Some("pool exhausted".into());
         store.insert_signal(&s).unwrap();
-        let tid = correlator.ingest(&s).unwrap();
-        engine.analyze_thread(&tid).await.unwrap();
-        let hints = store.list_hints(Some(&tid)).unwrap();
-        assert!(hints.iter().any(|h| h.kind == HintKind::Suggestion));
+        let tid = attributor.attach(&s).unwrap().expect("attributed");
+        engine.analyze_thread(tid.as_str()).await.unwrap();
+        let hints = store.list_hints(Some(tid.as_str())).unwrap();
+        assert!(
+            hints.iter().all(|h| h.kind != HintKind::Suggestion),
+            "the fallback must not invent a suggestion it cannot ground: {hints:?}"
+        );
     }
 }

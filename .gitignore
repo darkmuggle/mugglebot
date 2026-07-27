@@ -2,8 +2,8 @@
 /target
 Cargo.lock.bak
 
-# Local, user-specific config (secrets live in the Keychain, but this still holds
-# your channels/handles/paths). Ship config.example.toml instead.
+# Local, user-specific config. No secrets in here (those are in the SQLite DB),
+# but it still holds your channels/handles/paths. Ship config.example.toml instead.
 /config.toml
 
 # Local data (SQLite DB, etc.)

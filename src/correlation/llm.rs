@@ -1,5 +1,5 @@
-//! The semantic-reasoning tier (Phase 2): an LLM judges candidate thread pairs
-//! and writes the relation graph, refreshes grounded thread summaries, and
+//! The semantic-reasoning tier (Phase 2): an LLM judges candidate subject pairs
+//! and writes the relation graph, refreshes grounded subject summaries, and
 //! reconciles the graph around human override pins.
 //!
 //! Everything here degrades gracefully: with no reachable reasoner (no key, no
@@ -12,15 +12,16 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, warn};
 
-use super::{ContextKind, Correlator, Edge, Provenance, RelationKind, ThreadContext, ThreadView};
+use super::{ContextKind, Edge, Provenance, RelationKind, SubjectContext};
 use crate::context::{ContextManager, ContextSourceKind};
 use crate::memory::MemoryManager;
 use crate::reasoner::{self, CompletionRequest, Reasoner};
-use crate::signal::{Signal, State};
+use crate::signal::{Signal, SignalKind, Source};
 use crate::store::Store;
+use crate::subject::{Attributor, Handled, SubjectKey, SubjectView};
 use crate::tags;
 
-/// How many candidate threads to judge per re-analysis, most-shared first — a cap
+/// How many candidate subjects to judge per re-analysis, most-shared first — a cap
 /// on LLM calls per pass.
 const MAX_CANDIDATES: usize = 6;
 /// Top-k grounding entries folded into a summary.
@@ -31,18 +32,18 @@ const CONTEXT_BODY_CHARS: usize = 2_000;
 
 pub struct Analyst {
     store: Arc<Store>,
-    correlator: Arc<Correlator>,
+    attributor: Arc<Attributor>,
     reasoner: Arc<dyn Reasoner>,
     /// The **local** classifier (Ollama). Two jobs live here, both deliberately
     /// off the cloud: tag/classification passes (high volume, mechanical) and the
-    /// reopen-matching pass over handled threads, which by policy must never reach
+    /// reopen-matching pass over handled subjects, which by policy must never reach
     /// a cloud model at all.
     classifier: Arc<dyn Reasoner>,
     memory: Arc<MemoryManager>,
     context: Arc<ContextManager>,
     dedup_threshold: f64,
     auto_merge: bool,
-    /// Minimum local-classifier confidence to reopen a handled thread.
+    /// Minimum local-classifier confidence to reopen a handled subject.
     reopen_min_confidence: f64,
     /// Widened window for candidate discovery relative to grouping.
     window: Duration,
@@ -52,7 +53,7 @@ impl Analyst {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         store: Arc<Store>,
-        correlator: Arc<Correlator>,
+        attributor: Arc<Attributor>,
         reasoner: Arc<dyn Reasoner>,
         classifier: Arc<dyn Reasoner>,
         memory: Arc<MemoryManager>,
@@ -64,7 +65,7 @@ impl Analyst {
     ) -> Self {
         Self {
             store,
-            correlator,
+            attributor,
             reasoner,
             classifier,
             memory,
@@ -76,11 +77,11 @@ impl Analyst {
         }
     }
 
-    /// Full LLM pass over one thread: refresh its grounded summary, judge candidate
+    /// Full LLM pass over one subject: refresh its grounded summary, judge candidate
     /// pairs into relation edges, and (if `auto_merge`) collapse high-confidence
     /// duplicates. Existing user pins are honored — pinned pairs are not re-judged.
-    pub async fn reanalyze(&self, thread_id: &str) -> Result<()> {
-        self.reanalyze_with(thread_id, None).await
+    pub async fn reanalyze(&self, subject_key: &str) -> Result<()> {
+        self.reanalyze_with(subject_key, None).await
     }
 
     /// Like [`reanalyze`], but with an optional one-off reasoner override — the
@@ -88,17 +89,17 @@ impl Analyst {
     /// relation judgments on a chosen provider/model without changing the daemon's
     /// configured reasoners. `None` uses the analyst's default (heavy) reasoner.
     ///
-    /// **Handled threads are never reasoned over.** A snoozed, resolved, or
-    /// acknowledged thread is settled work; re-summarizing it, re-judging its
-    /// relations, and regenerating its mitigations spends model calls on a decision
+    /// **Handled subjects are never reasoned over.** A snoozed, resolved, or
+    /// acknowledged subject is settled work; re-summarizing it, re-judging its
+    /// relations, and re-summarizing it spends model calls on a decision
     /// the operator already made. The only model allowed to look at a handled
-    /// thread is the local classifier, via [`Self::triage_handled`], which decides
+    /// subject is the local classifier, via [`Self::triage_handled`], which decides
     /// whether new activity means it should come back. An explicit override on a
-    /// handled thread is an error rather than a silent no-op, so "reconsider" never
+    /// handled subject is an error rather than a silent no-op, so "reconsider" never
     /// looks like it worked when it was skipped.
     pub async fn reanalyze_with(
         &self,
-        thread_id: &str,
+        subject_key: &str,
         reasoner: Option<Arc<dyn Reasoner>>,
     ) -> Result<()> {
         // An explicit override is a deliberate user choice ("reconsider on model
@@ -109,31 +110,32 @@ impl Analyst {
             Some(r) => r.as_ref(),
             None => self.reasoner.as_ref(),
         };
-        let Some(view) = self.correlator.thread_view(thread_id)? else {
+        let Some(view) = self.attributor.subject_view(subject_key)? else {
             return Ok(());
         };
 
-        if crate::rootcause::is_handled(view.state) {
-            let label = crate::rootcause::state_label(view.state);
+        if view.subject.handled.is_handled() {
+            let label = view.subject.handled.as_str();
             if is_override {
                 anyhow::bail!(
-                    "thread {thread_id} is {label}; handled threads are not sent to a reasoner. \
+                    "subject {subject_key} is {label}; handled subjects are not sent to a reasoner. \
                      Reopen it first to reconsider it."
                 );
             }
-            debug!("thread {thread_id} is {label}: skipping analysis");
+            debug!("subject {subject_key} is {label}: skipping analysis");
             return Ok(());
         }
 
-        // 0. Classify the thread into tags — the categorical routing key for
+        // 0. Classify the subject into tags — the categorical routing key for
         // grounding. A human's pinned tags win and aren't reclassified.
         // Classification runs on the local classifier, not the cloud tier: it's a
         // high-volume mechanical mapping onto a fixed vocabulary.
-        let tags = if view.thread.tags_pinned {
-            view.thread.tags.clone()
+        let tags = if view.subject.tags_pinned {
+            view.subject.tags.clone()
         } else {
             let classified = self.classify_text(&grounding_query(&view)).await;
-            self.store.set_thread_tags(thread_id, &classified, false)?;
+            self.store
+                .set_subject_tags(subject_key, &classified, false)?;
             classified
         };
 
@@ -145,20 +147,23 @@ impl Analyst {
         {
             Ok(summary) if !summary.trim().is_empty() => {
                 self.store
-                    .set_thread_summary(thread_id, summary.trim(), Utc::now())?;
+                    .set_subject_summary(subject_key, summary.trim(), Utc::now())?;
             }
             Ok(_) => {}
             Err(e) if is_override => {
                 return Err(e.context("reconsider with the chosen provider/model failed"));
             }
-            Err(e) => warn!("thread {thread_id}: summary skipped: {e:#}"),
+            Err(e) => warn!("subject {subject_key}: summary skipped: {e:#}"),
         }
 
         // 2. Candidate relation edges.
         let candidates = self.candidate_threads(&view)?;
         for cand in candidates {
             // Respect an existing user pin — don't re-judge what the human decided.
-            if let Some(existing) = self.store.get_edge(thread_id, &cand.thread.id)? {
+            if let Some(existing) = self
+                .store
+                .get_edge(subject_key, cand.subject.key.as_str())?
+            {
                 if existing.provenance == Provenance::User {
                     continue;
                 }
@@ -178,181 +183,24 @@ impl Analyst {
                         && edge.kind == RelationKind::Same
                         && edge.confidence >= self.dedup_threshold
                     {
-                        debug!("auto-merging {} into {}", cand.thread.id, thread_id);
-                        self.merge(thread_id, &cand.thread.id)?;
+                        debug!("auto-merging {} into {}", cand.subject.key, subject_key);
+                        self.merge(subject_key, cand.subject.key.as_str())?;
                     }
                 }
                 Ok(None) => {}
-                Err(e) => warn!("judge {} vs {} failed: {e:#}", thread_id, cand.thread.id),
+                Err(e) => warn!(
+                    "judge {} vs {} failed: {e:#}",
+                    subject_key, cand.subject.key
+                ),
             }
         }
 
-        // 3. Refresh the cached mitigations so the UI reads them instantly rather
-        // than blocking on this (slow) reasoner round-trip when the thread opens.
-        // Best effort — a miss leaves the last cache (or the fast catalog) in place.
-        match self.generate_mitigations(thread_id, reasoner).await {
-            Ok(mits) if !mits.is_empty() => {
-                if let Err(e) = self
-                    .store
-                    .set_thread_mitigations(thread_id, &serde_json::json!(mits))
-                {
-                    warn!("thread {thread_id}: caching mitigations failed: {e:#}");
-                }
-            }
-            Ok(_) => {}
-            Err(e) => warn!("thread {thread_id}: mitigations skipped: {e:#}"),
-        }
         Ok(())
-    }
-
-    /// Ask the reasoner for mitigations tailored to this thread. Shaped like the
-    /// static catalog (id/name/description/reversible/score/cited_signals) so the
-    /// client renders both paths identically; cited ids are validated against the
-    /// thread. Runs in the background during reanalysis and is cached, so the UI
-    /// never blocks on this (slow) reasoner round-trip.
-    pub async fn generate_mitigations(
-        &self,
-        thread_id: &str,
-        reasoner: &dyn Reasoner,
-    ) -> Result<Vec<serde_json::Value>> {
-        let Some(view) = self.correlator.thread_view(thread_id)? else {
-            anyhow::bail!("no thread {thread_id}");
-        };
-        let signals = &view.signals;
-        // Passing CI is an outcome to record, not an incident to mitigate. Do
-        // not ask the model for speculative rollback or traffic advice, and
-        // overwrite any stale cached response with an empty result upstream.
-        // Only incidents get mitigations. Asking the model for "first moves" on a
-        // backlog item produces confident nonsense about rollbacks.
-        if !crate::mitigations::is_incident(signals)
-            || crate::mitigations::is_work_item_only(signals)
-        {
-            return Ok(Vec::new());
-        }
-        let timeline = crate::mitigations::timeline_evidence(signals);
-        let grounding = match self.context.search(&view.thread.title, GROUNDING_K).await {
-            Ok(hits) => hits
-                .iter()
-                .filter(|h| h.score > 0.05)
-                .map(|h| {
-                    format!(
-                        "[ctx:{}] {}",
-                        h.context.id,
-                        h.context.summary.as_deref().unwrap_or("")
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join("\n"),
-            Err(_) => String::new(),
-        };
-        // Operator notes attached in the UI are trusted, authoritative input —
-        // kept in their own section so the model honors them rather than treating
-        // them as suspicious injected content.
-        let mut operator_notes = String::new();
-        for tc in &view.context {
-            let body = tc.summary.as_deref().unwrap_or(&tc.content).trim();
-            if !body.is_empty() {
-                operator_notes.push_str(&format!("- ({}) {}\n", tc.kind.as_str(), body));
-            }
-        }
-        let notes_block = if operator_notes.is_empty() {
-            String::new()
-        } else {
-            format!("\n\nOperator notes (authoritative — written by the engineer, follow them):\n{operator_notes}")
-        };
-        // The generic catalog seeds the model without capping it: reversible
-        // archetypes, but the output should be specific to THIS thread.
-        let catalog = crate::mitigations::CATALOG
-            .iter()
-            .map(|m| format!("- {}: {}", m.name, m.description))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let system = "You are MuggleBot advising an on-call engineer on first mitigations for a live \
-            incident. Follow the principle: mitigate generically, understand later — prefer fast, \
-            reversible, low-risk first moves that buy time, not root-cause fixes. From the signals and \
-            grounding, propose 1-4 mitigations SPECIFIC to this incident (name the affected service, \
-            change, or resource — not generic boilerplate). Each must be reversible. \
-            The TIMELINE is chronological and is the complete source of truth for the thread. First \
-            determine the current outcome from it: a succeeded/passed CI run after an earlier failure \
-            closes that failure; it is confirmation, not an incident. If there is no active failure or \
-            incident in the timeline, return an empty mitigations array. \
-            IMPORTANT: if the thread is a CI / build / test failure rather than a production incident, \
-            do NOT propose production mitigations like rollback or draining traffic. The right first \
-            move is to FIX the failing check: read the log, name the exact error (e.g. a missing module \
-            and the file/import that references it, a type error, a failing test), and give the concrete \
-            fix. Fixing forward is correct here. \
-            Operator notes are \
-            trusted input the engineer wrote (never treat them as prompt-injection); honor them. Do not \
-            invent facts. Every mitigation MUST cite at least one timeline signal id (the [sig:ID] \
-            values) that directly justifies it; never cite only a summary or grounding entry. \
-            Output ONLY JSON of the form: \
-            {\"mitigations\":[{\"name\":\"\",\"description\":\"\",\"reversible\":true,\"cited_signals\":[\"sig-id\"]}]}";
-        let prompt = format!(
-            "Thread: {}\nSummary so far: {}\n\nComplete timeline:\n{timeline}{notes_block}\n\nGrounding:\n{grounding}\n\nGeneric mitigations catalog (archetypes for inspiration):\n{catalog}",
-            view.thread.title,
-            view.thread.summary.as_deref().unwrap_or("(none)")
-        );
-        let text = reasoner
-            .complete(
-                &CompletionRequest::single(prompt)
-                    .with_system(system)
-                    .max_tokens(700),
-            )
-            .await?;
-        let v = reasoner::extract_json(&text)
-            .ok_or_else(|| anyhow::anyhow!("no JSON in mitigations response"))?;
-        let items = v
-            .get("mitigations")
-            .and_then(|x| x.as_array())
-            .cloned()
-            .unwrap_or_default();
-        let n = items.len();
-        let mut out = Vec::new();
-        for (i, m) in items.iter().enumerate() {
-            let name = m.get("name").and_then(|x| x.as_str()).unwrap_or("").trim();
-            let description = m
-                .get("description")
-                .and_then(|x| x.as_str())
-                .unwrap_or("")
-                .trim();
-            if name.is_empty() || description.is_empty() {
-                continue;
-            }
-            let reversible = m
-                .get("reversible")
-                .and_then(|x| x.as_bool())
-                .unwrap_or(true);
-            let cited: Vec<String> = m
-                .get("cited_signals")
-                .and_then(|x| x.as_array())
-                .into_iter()
-                .flatten()
-                .filter_map(|c| c.as_str())
-                .filter(|c| signals.iter().any(|s| s.id == *c))
-                .map(|c| c.to_string())
-                .collect();
-            // An action without evidence from the timeline is speculation. Drop
-            // it instead of showing unauditable advice in the board.
-            if cited.is_empty() {
-                continue;
-            }
-            out.push(serde_json::json!({
-                // Synthetic id (generated, not a catalog entry) + rank-derived score
-                // so the client's best-first ordering matches the model's ordering.
-                "id": format!("gen-{i}"),
-                "name": name,
-                "description": description,
-                "reversible": reversible,
-                "score": (n - i) as f64,
-                "cited_signals": cited,
-            }));
-        }
-        Ok(out)
     }
 
     /// Pin a human-authored edge (provenance `user`) and reconcile. A `same` pin
     /// realizes as a merge; `related`/`distinct` become authoritative edges that
-    /// stop the LLM from regrouping. Returns the surviving/canonical thread id.
+    /// stop the LLM from regrouping. Returns the surviving/canonical subject id.
     pub async fn relate(&self, a: &str, b: &str, kind: RelationKind) -> Result<String> {
         if a == b {
             return Ok(a.to_string());
@@ -365,8 +213,8 @@ impl Analyst {
             }
             RelationKind::Related | RelationKind::Distinct => {
                 let edge = Edge {
-                    thread_a: a.to_string(),
-                    thread_b: b.to_string(),
+                    subject_a: a.to_string(),
+                    subject_b: b.to_string(),
                     kind,
                     provenance: Provenance::User,
                     confidence: 1.0,
@@ -382,49 +230,61 @@ impl Analyst {
         }
     }
 
-    /// Pull the given signals out of their thread into a fresh thread. Re-analyzes
-    /// both. Returns the new thread id.
-    pub async fn split_thread(&self, thread_id: &str, signal_ids: &[String]) -> Result<String> {
-        let now = Utc::now();
-        let new_id = format!("thr/{}", crate::store::new_id());
-        let mut title = None;
+    /// Detach signals the attribution got wrong.
+    ///
+    /// Under the synthetic-thread model this minted a new thread to move them into.
+    /// There is no such thing to mint now — a subject *is* an upstream identity, and
+    /// inventing one would create a card nothing can ever address again. So a split
+    /// sends the signals to the unattributed lane and records the correction, which
+    /// is also what stops a re-ingest from silently undoing it.
+    ///
+    /// Use [`Self::reattribute`] to move a signal to a *specific* subject instead.
+    pub async fn split_subject(&self, subject_key: &str, signal_ids: &[String]) -> Result<usize> {
+        let mut moved = 0;
         for sid in signal_ids {
             if let Some(sig) = self.store.get_signal(sid)? {
-                if sig.thread.as_deref() == Some(thread_id) {
-                    if title.is_none() {
-                        title = Some(sig.title.clone());
-                    }
-                    self.store.set_signal_thread(sid, Some(&new_id))?;
+                if sig.subject.as_deref() == Some(subject_key) {
+                    self.store.set_signal_subject(sid, None)?;
+                    self.store.pin_attribution(sid, None)?;
+                    moved += 1;
                 }
             }
         }
-        self.store.upsert_thread(&super::Thread {
-            id: new_id.clone(),
-            title: title.unwrap_or_else(|| "split thread".into()),
-            summary: None,
-            created_at: now,
-            updated_at: now,
-            last_reasoned_at: None,
-            live: false,
-            tags: Vec::new(),
-            tags_pinned: false,
-        })?;
-        self.correlator.refresh_thread_metadata(&new_id)?;
-        self.correlator.refresh_thread_metadata(thread_id)?;
-        self.reanalyze(&new_id).await?;
-        self.reanalyze(thread_id).await?;
-        Ok(new_id)
+        self.attributor.refresh_subject_metadata(subject_key)?;
+        self.reanalyze(subject_key).await?;
+        Ok(moved)
     }
 
-    /// Attach ad-hoc grounding to a thread (free text or a URL), then re-analyze.
+    /// Move one signal onto a specific subject, overriding the ranked climb, and
+    /// remember the override so re-ingest doesn't undo it.
+    pub async fn reattribute(&self, signal_id: &str, to: Option<&SubjectKey>) -> Result<()> {
+        let Some(sig) = self.store.get_signal(signal_id)? else {
+            anyhow::bail!("no signal {signal_id}");
+        };
+        let previous = sig.subject.clone();
+        self.store
+            .set_signal_subject(signal_id, to.map(|k| k.as_str()))?;
+        self.store.pin_attribution(signal_id, to)?;
+        if let Some(prev) = &previous {
+            self.attributor.refresh_subject_metadata(prev)?;
+            self.reanalyze(prev).await?;
+        }
+        if let Some(to) = to {
+            self.attributor.refresh_subject_metadata(to.as_str())?;
+            self.reanalyze(to.as_str()).await?;
+        }
+        Ok(())
+    }
+
+    /// Attach ad-hoc grounding to a subject (free text or a URL), then re-analyze.
     /// A URL is fetched + summarized through the same pipeline as the context
     /// library; text is used as-is.
-    pub async fn attach_thread_context(
+    pub async fn attach_subject_context(
         &self,
-        thread_id: &str,
+        subject_key: &str,
         kind: ContextKind,
         content: &str,
-    ) -> Result<ThreadContext> {
+    ) -> Result<SubjectContext> {
         let summary = match kind {
             ContextKind::Text => None,
             ContextKind::Url => {
@@ -443,71 +303,71 @@ impl Analyst {
                 }
             }
         };
-        let tc = ThreadContext {
+        let tc = SubjectContext {
             id: format!("tctx/{}", crate::store::new_id()),
-            thread_id: thread_id.to_string(),
+            subject_key: subject_key.to_string(),
             kind,
             content: content.to_string(),
             summary,
             created_at: Utc::now(),
         };
-        self.store.add_thread_context(&tc)?;
-        self.reanalyze(thread_id).await?;
+        self.store.add_subject_context(&tc)?;
+        self.reanalyze(subject_key).await?;
         Ok(tc)
     }
 
     /// Collapse `drop_id` into `keep_id`: move its signals over, refresh, and
-    /// remove the now-empty thread. Returns `keep_id`.
+    /// remove the now-empty subject. Returns `keep_id`.
     pub fn merge(&self, keep_id: &str, drop_id: &str) -> Result<String> {
         if keep_id == drop_id {
             return Ok(keep_id.to_string());
         }
-        for sig in self.store.signals_for_thread(drop_id)? {
-            self.store.set_signal_thread(&sig.id, Some(keep_id))?;
+        for sig in self.store.signals_for_subject(drop_id)? {
+            self.store.set_signal_subject(&sig.id, Some(keep_id))?;
         }
         // Move any attached context across.
-        for tc in self.store.thread_context(drop_id)? {
+        for tc in self.store.subject_context(drop_id)? {
             let mut moved = tc.clone();
-            moved.thread_id = keep_id.to_string();
-            self.store.add_thread_context(&moved)?;
+            moved.subject_key = keep_id.to_string();
+            self.store.add_subject_context(&moved)?;
         }
-        // Carry the root-cause investigation over unless the surviving thread has
+        // Carry the root-cause investigation over unless the surviving subject has
         // one already — it's expensive evidence and losing it with the collapsed
-        // thread would silently discard work.
+        // subject would silently discard work.
         if self.store.get_root_cause(keep_id)?.is_none() {
             self.store.move_root_cause(drop_id, keep_id)?;
         }
-        self.correlator.refresh_thread_metadata(keep_id)?;
-        self.store.delete_thread_if_empty(drop_id)?;
+        self.attributor.refresh_subject_metadata(keep_id)?;
+        self.store.delete_subject_if_empty(drop_id)?;
         Ok(keep_id.to_string())
     }
 
     // ---- internals ----------------------------------------------------------
 
-    fn candidate_threads(&self, view: &ThreadView) -> Result<Vec<ThreadView>> {
-        let target: std::collections::BTreeSet<String> = super::engine::entity_keys(&view.entities);
+    fn candidate_threads(&self, view: &SubjectView) -> Result<Vec<SubjectView>> {
+        let target: std::collections::BTreeSet<String> = grouping_keys(&view.keys);
         let target_tags: std::collections::BTreeSet<&str> =
-            view.thread.tags.iter().map(String::as_str).collect();
+            view.subject.tags.iter().map(String::as_str).collect();
         // When the target has no strong entity key — e.g. a standalone Slack
         // message now that channel/person no longer group — fall back to judging
-        // it against recent active threads so topic duplicates still get caught.
+        // it against recent active subjects so topic duplicates still get caught.
         // Otherwise (it has a strong identity) we only pair on shared entity/tag,
-        // to avoid re-judging every recent thread against a well-anchored one.
+        // to avoid re-judging every recent subject against a well-anchored one.
         let broaden = target.is_empty();
         // Candidates sit within a *tight time window* (a generous multiple of the
-        // grouping window) of this thread's activity — so a deploy and the
-        // incident it caused still pair up, but week-old threads aren't re-judged
+        // grouping window) of this subject's activity — so a deploy and the
+        // incident it caused still pair up, but week-old subjects aren't re-judged
         // forever.
         let span = chrono::Duration::from_std(self.window * 8)
             .unwrap_or_else(|_| chrono::Duration::hours(4));
         // (tier, overlap, recency, view) — tier 2: shares a strong entity;
-        // 1: shares a topic tag; 0: recency-only (broadening standalone threads).
-        let mut scored: Vec<(u8, usize, chrono::DateTime<Utc>, ThreadView)> = Vec::new();
-        for t in self.store.list_threads()? {
-            if t.id == view.thread.id {
+        // 1: shares a topic tag; 0: recency-only (broadening standalone subjects).
+        let mut scored: Vec<(u8, usize, chrono::DateTime<Utc>, SubjectView)> = Vec::new();
+        for t in self.store.list_subjects()? {
+            if t.key == view.subject.key {
                 continue;
             }
-            if (t.updated_at - view.thread.updated_at).abs() > span {
+            if (t.updated_at - view.subject.updated_at).abs() > span {
                 continue;
             }
             let tag_shared = t
@@ -515,12 +375,10 @@ impl Analyst {
                 .iter()
                 .filter(|tg| target_tags.contains(tg.as_str()))
                 .count();
-            let Some(cand) = self.correlator.thread_view(&t.id)? else {
+            let Some(cand) = self.attributor.subject_view(t.key.as_str())? else {
                 continue;
             };
-            let entity_shared = super::engine::entity_keys(&cand.entities)
-                .intersection(&target)
-                .count();
+            let entity_shared = grouping_keys(&cand.keys).intersection(&target).count();
             let (tier, overlap) = if entity_shared > 0 {
                 (2, entity_shared)
             } else if tag_shared > 0 {
@@ -530,7 +388,7 @@ impl Analyst {
             } else {
                 continue;
             };
-            scored.push((tier, overlap, cand.thread.updated_at, cand));
+            scored.push((tier, overlap, cand.subject.updated_at, cand));
         }
         // Best first: stronger tier, then more overlap, then more recent.
         scored.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)).then(b.2.cmp(&a.2)));
@@ -542,7 +400,7 @@ impl Analyst {
     }
 
     /// Classify arbitrary text (a thread, or a single Slack message) into
-    /// vocabulary tags — the shared classifier behind thread and per-message
+    /// vocabulary tags — the shared classifier behind subject and per-message
     /// tagging.
     ///
     /// This always runs on the **local** classifier. Tagging fires on every
@@ -571,26 +429,48 @@ impl Analyst {
         }
     }
 
-    /// Decide, **on-device**, whether new activity means a handled thread should
+    /// Decide, **on-device**, whether new activity means a handled subject should
     /// come back to the board.
     ///
-    /// A snoozed thread is muted precisely so recurring chatter doesn't keep
+    /// A snoozed subject is muted precisely so recurring chatter doesn't keep
     /// interrupting — but "the same thing is happening again, worse" is not
     /// chatter. This is the one model call allowed to look at handled work, and it
-    /// runs on the local classifier so re-examining every muted thread costs
+    /// runs on the local classifier so re-examining every muted subject costs
     /// nothing metered and no handled-issue content leaves the machine.
     ///
-    /// Returns `true` when the thread was actually reopened. Below
+    /// Returns `true` when the subject was actually reopened. Below
     /// `reopen_min_confidence`, and whenever the local model is unreachable, the
-    /// thread stays muted — the conservative direction, since a false reopen is a
+    /// subject stays muted — the conservative direction, since a false reopen is a
     /// notification the operator explicitly silenced.
-    pub async fn triage_handled(&self, thread_id: &str, new_signal: &Signal) -> Result<bool> {
-        let Some(view) = self.correlator.thread_view(thread_id)? else {
+    pub async fn triage_handled(&self, subject_key: &str, new_signal: &Signal) -> Result<bool> {
+        let Some(view) = self.attributor.subject_view(subject_key)? else {
             return Ok(false);
         };
-        if !crate::rootcause::is_handled(view.state) {
+        if !view.subject.handled.is_handled() {
             return Ok(false);
         }
+
+        // Upstream GitHub activity un-mutes deterministically, without asking the model.
+        //
+        // GitHub has already applied its own filter: a notification arrives because you are
+        // assigned, mentioned, reviewing, or your CI broke. It is not chatter, and asking a 33B
+        // model to second-guess it means an acknowledged issue that genuinely moved can stay
+        // muted on a low confidence score. The model judgment is kept for Slack, where
+        // "follow-up chatter on a resolved thread" is a real and common thing.
+        //
+        // This reverses the earlier fail-closed default *for GitHub only*, deliberately: the
+        // cost of a needless un-ack is one card back on the board, and the cost of a missed one
+        // is an issue you believe is handled and isn't.
+        if reopens_on_sight(new_signal) {
+            self.store.set_handled(subject_key, Handled::Open, None)?;
+            warn!(
+                "subject {subject_key}: reopened by new {} activity ({:?})",
+                new_signal.source.as_str(),
+                new_signal.kind
+            );
+            return Ok(true);
+        }
+
         let system = "You decide whether a muted incident should be un-muted. The engineer already \
              handled this issue (snoozed, acknowledged, or resolved it). New activity has landed on \
              it. Reply with ONLY JSON: \
@@ -601,9 +481,9 @@ impl Analyst {
              When unsure, do not reopen.";
         let prompt = format!(
             "Handled issue ({}): {}\nWhat we concluded: {}\n\nNew activity:\n{}\n{}",
-            crate::rootcause::state_label(view.state),
-            view.thread.title,
-            view.thread.summary.as_deref().unwrap_or("(no summary)"),
+            view.subject.handled.as_str(),
+            view.subject.title,
+            view.subject.summary.as_deref().unwrap_or("(no summary)"),
             new_signal.title,
             new_signal.body.as_deref().unwrap_or("")
         );
@@ -618,7 +498,7 @@ impl Analyst {
         {
             Ok(raw) => raw,
             Err(e) => {
-                debug!("thread {thread_id}: local reopen triage unavailable: {e:#}");
+                debug!("subject {subject_key}: local reopen triage unavailable: {e:#}");
                 return Ok(false);
             }
         };
@@ -633,7 +513,7 @@ impl Analyst {
             .clamp(0.0, 1.0);
         if !reopen || confidence < self.reopen_min_confidence {
             debug!(
-                "thread {thread_id}: staying muted (reopen={reopen}, confidence={confidence:.2})"
+                "subject {subject_key}: staying muted (reopen={reopen}, confidence={confidence:.2})"
             );
             return Ok(false);
         }
@@ -642,21 +522,18 @@ impl Analyst {
             .and_then(|r| r.as_str())
             .unwrap_or("new activity indicates recurrence")
             .trim();
-        // Un-mute the whole thread, not just the new signal: a thread is only as
-        // handled as its least-handled member, so leaving the older signals
-        // snoozed would keep it hidden from the active board.
-        for sig in &view.signals {
-            self.store.set_state(&sig.id, State::Unseen)?;
-        }
-        self.store.set_state(&new_signal.id, State::Unseen)?;
-        warn!("thread {thread_id}: reopened by local triage ({confidence:.2}): {reason}");
+        // Un-mute the subject. This used to have to walk every member signal,
+        // because handled-ness was per-signal and a subject was only as handled as
+        // its least-handled member; now it's one row.
+        self.store.set_handled(subject_key, Handled::Open, None)?;
+        warn!("subject {subject_key}: reopened by local triage ({confidence:.2}): {reason}");
         Ok(true)
     }
 
     /// Assemble the grounding block. For both memory and context: **tag-matched
     /// entries first** (the categorical routing), then a vector-similarity fill
     /// for the remaining budget — de-duplicated so a tagged entry isn't repeated.
-    async fn gather_grounding(&self, view: &ThreadView, tags: &[String]) -> String {
+    async fn gather_grounding(&self, view: &SubjectView, tags: &[String]) -> String {
         let query = grounding_query(view);
         let mut out = String::new();
 
@@ -704,7 +581,7 @@ impl Analyst {
     /// action look like it did nothing.
     async fn summarize_thread(
         &self,
-        view: &ThreadView,
+        view: &SubjectView,
         grounding: &str,
         reasoner: &dyn Reasoner,
         fresh: bool,
@@ -718,7 +595,7 @@ impl Analyst {
         // but it is *page content* — untrusted, like any other signal.
         if let Ok(investigations) = self
             .store
-            .browser_investigations_for_thread(&view.thread.id)
+            .browser_investigations_for_subject(view.subject.key.as_str())
         {
             for investigation in investigations {
                 if let Some(findings) = investigation.findings.filter(|f| !f.trim().is_empty()) {
@@ -731,7 +608,7 @@ impl Analyst {
         }
         // The root-cause investigation's own conclusions, cited as [cause:REF] so a
         // summary that names a suspect PR can be traced back to it.
-        if let Ok(Some(report)) = self.store.get_root_cause(&view.thread.id) {
+        if let Ok(Some(report)) = self.store.get_root_cause(view.subject.key.as_str()) {
             let evidence = crate::rootcause::report_evidence(&report);
             if !evidence.trim().is_empty() {
                 ev.push_str(&format!("Root-cause investigation:\n{evidence}"));
@@ -755,7 +632,7 @@ impl Analyst {
         } else {
             format!("\n\nGrounding (runbooks, memory):\n{grounding}")
         };
-        let system = "You are MuggleBot, an ops-awareness assistant. Summarize a correlated thread \
+        let system = "You are MuggleBot, an ops-awareness assistant. Summarize a correlated subject \
              for an on-call engineer as concise, readable Markdown — never a single dense paragraph. \
              Use exactly these three short labeled sections, each 1-2 sentences and separated by blank \
              lines: **Status:** (current outcome, including whether a later success cleared a failure), \
@@ -773,28 +650,28 @@ impl Analyst {
         let mut req = CompletionRequest::single(prompt)
             .with_system(system)
             .max_tokens(512)
-            .session(format!("thread:{}", view.thread.id));
+            .session(format!("subject:{}", view.subject.key));
         req.no_cache = fresh;
         reasoner.complete(&req).await
     }
 
     async fn judge(
         &self,
-        a: &ThreadView,
-        b: &ThreadView,
+        a: &SubjectView,
+        b: &SubjectView,
         reasoner: &dyn Reasoner,
     ) -> Result<Option<Edge>> {
-        let system = "You classify the relationship between two threads of ops signals. Answer with \
+        let system = "You classify the relationship between two subjects of ops signals. Answer with \
              exactly one of: \"same\" (both are the same underlying issue / duplicates), \"related\" \
              (distinct but connected, e.g. a deploy and the incident it caused), or \"distinct\" \
              (unrelated). Respond with ONLY a JSON object: \
              {\"verdict\":\"same|related|distinct\",\"confidence\":0.0-1.0,\"rationale\":\"one sentence\",\
              \"signals\":[\"ids of signals you weighed\"]}.";
         let prompt = format!(
-            "Thread A ({}):\n{}\nThread B ({}):\n{}",
-            a.thread.id,
+            "Subject A ({}):\n{}\nThread B ({}):\n{}",
+            a.subject.key,
             thread_evidence(a),
-            b.thread.id,
+            b.subject.key,
             thread_evidence(b),
         );
         let req = CompletionRequest::single(prompt)
@@ -831,8 +708,8 @@ impl Analyst {
             })
             .unwrap_or_default();
         Ok(Some(Edge {
-            thread_a: a.thread.id.clone(),
-            thread_b: b.thread.id.clone(),
+            subject_a: a.subject.key.to_string(),
+            subject_b: b.subject.key.to_string(),
             kind,
             provenance: Provenance::Llm,
             confidence,
@@ -843,8 +720,8 @@ impl Analyst {
     }
 }
 
-fn grounding_query(view: &ThreadView) -> String {
-    let mut q = view.thread.title.clone();
+fn grounding_query(view: &SubjectView) -> String {
+    let mut q = view.subject.title.clone();
     for s in view.signals.iter().take(4) {
         q.push(' ');
         q.push_str(&s.title);
@@ -853,7 +730,7 @@ fn grounding_query(view: &ThreadView) -> String {
             q.push_str(b);
         }
     }
-    for e in &view.entities {
+    for e in &view.keys {
         q.push(' ');
         q.push_str(&e.value);
     }
@@ -925,10 +802,10 @@ fn signal_line(s: &Signal) -> String {
     line
 }
 
-/// Render the operator-attached thread context as a trusted-notes block (empty
-/// when the thread has none). For text notes the body is the note itself; for a
+/// Render the operator-attached subject context as a trusted-notes block (empty
+/// when the subject has none). For text notes the body is the note itself; for a
 /// URL, its fetched summary if we have one, else the URL.
-fn build_operator_notes(context: &[ThreadContext]) -> String {
+fn build_operator_notes(context: &[SubjectContext]) -> String {
     let mut out = String::new();
     for tc in context {
         let body = match tc.kind {
@@ -949,9 +826,9 @@ fn signal_kind(s: &Signal) -> String {
         .unwrap_or_else(|| "other".into())
 }
 
-fn thread_evidence(v: &ThreadView) -> String {
+fn thread_evidence(v: &SubjectView) -> String {
     let mut out = String::new();
-    if let Some(sum) = &v.thread.summary {
+    if let Some(sum) = &v.subject.summary {
         out.push_str(&format!("summary: {sum}\n"));
     }
     for s in v.signals.iter().take(8) {
@@ -960,15 +837,128 @@ fn thread_evidence(v: &ThreadView) -> String {
     out
 }
 
+/// The keys two subjects can meaningfully *share*, for proposing candidate pairs.
+///
+/// Excludes anything that spans unrelated work — `repo`, `channel`, `person`, a
+/// default branch — because pairing on one of those would put every notification in
+/// a repository, or every message in a channel, up for judging against every other.
+/// That is expensive and it is also how a model gets talked into merging two
+/// unrelated things.
+fn grouping_keys(keys: &[crate::signal::ResolutionKey]) -> std::collections::BTreeSet<String> {
+    keys.iter()
+        .filter(|k| {
+            !matches!(
+                k.kind.to_ascii_lowercase().as_str(),
+                "repo" | "channel" | "person" | "label" | "ci"
+            ) && !crate::subject::resolve::is_default_branch(&k.kind, &k.value)
+        })
+        .map(|k| {
+            format!(
+                "{}:{}",
+                k.kind.to_ascii_lowercase(),
+                k.value.to_ascii_lowercase()
+            )
+        })
+        .collect()
+}
+
+/// Whether this signal un-mutes a handled subject on sight, with no model judgment.
+///
+/// True for genuine upstream GitHub events. GitHub only notifies you about work you are
+/// involved in, so the filtering has already happened upstream — a second opinion from a local
+/// model can only add false negatives, and a false negative here is an issue the operator
+/// believes is handled while it is moving.
+///
+/// Slack is excluded on purpose. A resolved thread attracts "thanks", "nice one", and status
+/// updates, and reopening on those would make acknowledging anything in a busy channel pointless.
+pub fn reopens_on_sight(sig: &Signal) -> bool {
+    if sig.source != Source::GitHub {
+        return false;
+    }
+    // `upstream_gone` is the notification being *cleared*, not new activity — reopening on it
+    // would un-ack an issue at the moment it was closed.
+    if sig.upstream_gone {
+        return false;
+    }
+    matches!(
+        sig.kind,
+        SignalKind::Assigned
+            | SignalKind::Mention
+            | SignalKind::ReviewRequested
+            | SignalKind::CiFailure
+    )
+}
+
 #[cfg(test)]
 mod tests {
+    fn probe(source: Source, kind: SignalKind) -> Signal {
+        Signal {
+            id: "s1".into(),
+            source,
+            external_id: "o/r#412".into(),
+            kind,
+            title: "something happened".into(),
+            body: None,
+            url: None,
+            actor: None,
+            keys: vec![],
+            severity: crate::signal::Severity::Notice,
+            version: None,
+            upstream_gone: false,
+            occurred_at: chrono::Utc::now(),
+            ingested_at: chrono::Utc::now(),
+            subject: None,
+            raw: serde_json::json!({}),
+            tags: vec![],
+        }
+    }
+
+    /// GitHub activity un-mutes a handled subject on sight; Slack does not.
+    ///
+    /// The asymmetry is the point. GitHub only notifies you about work you are involved in, so
+    /// the filtering already happened upstream and a model's second opinion can only add false
+    /// negatives — an issue you believe is handled while it is moving. A resolved Slack thread,
+    /// by contrast, attracts "thanks" and status updates, and reopening on those would make
+    /// acknowledging anything in a busy channel pointless.
+    #[test]
+    fn github_activity_reopens_on_sight_and_slack_chatter_does_not() {
+        for kind in [
+            SignalKind::Assigned,
+            SignalKind::Mention,
+            SignalKind::ReviewRequested,
+            SignalKind::CiFailure,
+        ] {
+            assert!(
+                reopens_on_sight(&probe(Source::GitHub, kind)),
+                "{kind:?} is real upstream activity"
+            );
+        }
+
+        // The notification being *cleared* is not new activity: reopening on it would un-ack an
+        // issue at the very moment it was closed.
+        let mut gone = probe(Source::GitHub, SignalKind::Assigned);
+        gone.upstream_gone = true;
+        assert!(!reopens_on_sight(&gone));
+
+        // Slack and Granola keep the model gate.
+        assert!(!reopens_on_sight(&probe(
+            Source::Slack,
+            SignalKind::ThreadReply
+        )));
+        assert!(!reopens_on_sight(&probe(
+            Source::Granola,
+            SignalKind::MeetingNote
+        )));
+    }
+
     use super::*;
     use crate::embed::HashEmbedder;
     use crate::reasoner::MockReasoner;
-    use crate::signal::{Entity, Severity, SignalKind, Source, State};
+    use crate::signal::{ResolutionKey, Severity, SignalKind, Source};
 
-    fn analyst(reasoner_response: &str) -> (Arc<Store>, Arc<Correlator>, Analyst) {
+    fn analyst(reasoner_response: &str) -> (Arc<Store>, Arc<Attributor>, Analyst) {
         let store = Arc::new(Store::open_in_memory().unwrap());
+        let secrets = crate::secrets::Secrets::for_tests(store.clone());
         let embedder = Arc::new(HashEmbedder);
         let reasoner: Arc<dyn Reasoner> = Arc::new(MockReasoner::new(reasoner_response));
         let memory = Arc::new(MemoryManager::new(
@@ -979,15 +969,16 @@ mod tests {
         ));
         let context = Arc::new(ContextManager::new(
             store.clone(),
+            secrets.clone(),
             embedder,
             reasoner.clone(),
             reasoner.clone(),
             "6h".into(),
         ));
-        let correlator = Arc::new(Correlator::new(store.clone(), Duration::from_secs(1800)));
+        let attributor = Arc::new(Attributor::new(store.clone()));
         let a = Analyst::new(
             store.clone(),
-            correlator.clone(),
+            attributor.clone(),
             reasoner.clone(),
             reasoner,
             memory,
@@ -997,25 +988,31 @@ mod tests {
             0.6,
             Duration::from_secs(1800),
         );
-        (store, correlator, a)
+        (store, attributor, a)
     }
 
+    /// `ent` is a Slack conversation id — the alert-thread case, which is the one
+    /// that reaches the Analyst without a GitHub artifact to anchor it.
     fn sig(ext: &str, ent: &str) -> Signal {
         Signal {
-            id: Signal::make_id(Source::Slack, ext),
+            id: Signal::make_id(Source::Slack, ext, None),
             source: Source::Slack,
             external_id: ext.into(),
+            version: None,
             kind: SignalKind::Alert,
             title: format!("alert {ext}"),
             body: Some("service degraded".into()),
             url: None,
             actor: None,
-            entities: vec![Entity::new("service", ent)],
+            keys: vec![
+                ResolutionKey::new("service", ent),
+                ResolutionKey::new("slack_thread", format!("C1/{ent}")),
+            ],
             severity: Severity::Critical,
-            state: State::Unseen,
+            upstream_gone: false,
             occurred_at: Utc::now(),
             ingested_at: Utc::now(),
-            thread: None,
+            subject: None,
             raw: serde_json::Value::Null,
             tags: Vec::new(),
         }
@@ -1023,12 +1020,12 @@ mod tests {
 
     #[tokio::test]
     async fn reanalyze_writes_summary() {
-        let (store, correlator, analyst) = analyst("Service foo is down; check the pool. [sig:x]");
+        let (store, attributor, analyst) = analyst("Service foo is down; check the pool. [sig:x]");
         let s = sig("1", "foo");
         store.insert_signal(&s).unwrap();
-        let tid = correlator.ingest(&s).unwrap();
-        analyst.reanalyze(&tid).await.unwrap();
-        let t = store.get_thread(&tid).unwrap().unwrap();
+        let tid = attributor.attach(&s).unwrap().expect("attributed");
+        analyst.reanalyze(tid.as_str()).await.unwrap();
+        let t = store.get_subject(tid.as_str()).unwrap().unwrap();
         assert_eq!(
             t.summary.as_deref(),
             Some("Service foo is down; check the pool. [sig:x]")
@@ -1036,119 +1033,131 @@ mod tests {
         assert!(t.last_reasoned_at.is_some());
     }
 
-    /// The cost/privacy guarantee: a handled thread gets no reasoning pass at all.
+    /// The cost/privacy guarantee: a handled subject gets no reasoning pass at all.
     /// The mock reasoner would happily write a summary, so a summary appearing here
     /// means the policy leaked.
     #[tokio::test]
     async fn handled_threads_are_not_reasoned_over() {
-        for state in [State::Snoozed, State::Resolved, State::Acknowledged] {
-            let (store, correlator, analyst) =
+        for state in [Handled::Snoozed, Handled::Resolved, Handled::Acknowledged] {
+            let (store, attributor, analyst) =
                 analyst("a summary the operator must not be billed for");
             let s = sig("1", "foo");
             store.insert_signal(&s).unwrap();
-            let tid = correlator.ingest(&s).unwrap();
-            store.set_state(&s.id, state).unwrap();
+            let tid = attributor.attach(&s).unwrap().expect("attributed");
+            store.set_handled(tid.as_str(), state, None).unwrap();
 
-            analyst.reanalyze(&tid).await.unwrap();
-            let t = store.get_thread(&tid).unwrap().unwrap();
+            analyst.reanalyze(tid.as_str()).await.unwrap();
+            let t = store.get_subject(tid.as_str()).unwrap().unwrap();
             assert!(
                 t.last_reasoned_at.is_none(),
-                "{state:?} thread must not reach a reasoner"
+                "a {state:?} subject must not reach a reasoner"
             );
         }
     }
 
     /// An explicit "reconsider on model X" must fail loudly rather than look like
-    /// it worked, so the operator knows to reopen the thread first.
+    /// it worked, so the operator knows to reopen the subject first.
     #[tokio::test]
     async fn explicit_reconsider_on_a_handled_thread_errors() {
-        let (store, correlator, analyst) = analyst("summary");
+        let (store, attributor, analyst) = analyst("summary");
         let s = sig("1", "foo");
         store.insert_signal(&s).unwrap();
-        let tid = correlator.ingest(&s).unwrap();
-        store.set_state(&s.id, State::Snoozed).unwrap();
+        let tid = attributor.attach(&s).unwrap().expect("attributed");
+        store
+            .set_handled(tid.as_str(), Handled::Snoozed, None)
+            .unwrap();
 
         let override_reasoner: Arc<dyn Reasoner> = Arc::new(MockReasoner::new("summary"));
         let err = analyst
-            .reanalyze_with(&tid, Some(override_reasoner))
+            .reanalyze_with(tid.as_str(), Some(override_reasoner))
             .await
-            .expect_err("handled threads reject an explicit reanalysis");
+            .expect_err("handled subjects reject an explicit reanalysis");
         assert!(format!("{err:#}").contains("snoozed"));
     }
 
     #[tokio::test]
     async fn local_triage_reopens_a_recurring_snoozed_thread() {
-        let (store, correlator, analyst) = analyst(
+        let (store, attributor, analyst) = analyst(
             r#"{"reopen": true, "confidence": 0.9, "reason": "same failure, higher error rate"}"#,
         );
         let first = sig("1", "foo");
         store.insert_signal(&first).unwrap();
-        let tid = correlator.ingest(&first).unwrap();
-        store.set_state(&first.id, State::Snoozed).unwrap();
+        let tid = attributor.attach(&first).unwrap().expect("attributed");
+        store
+            .set_handled(tid.as_str(), Handled::Snoozed, None)
+            .unwrap();
         assert!(
-            correlator.thread_views(true).unwrap().is_empty(),
-            "snoozed thread starts hidden"
+            attributor.subject_views(true).unwrap().is_empty(),
+            "a snoozed subject starts hidden"
         );
 
         let recurrence = sig("2", "foo");
         store.insert_signal(&recurrence).unwrap();
-        store.set_state(&recurrence.id, State::Snoozed).unwrap();
+        attributor.attach(&recurrence).unwrap();
 
-        assert!(analyst.triage_handled(&tid, &recurrence).await.unwrap());
-        // Every member is un-muted, or the thread stays hidden from the board.
+        assert!(analyst
+            .triage_handled(tid.as_str(), &recurrence)
+            .await
+            .unwrap());
+        // One row un-mutes the whole subject — this used to have to walk every
+        // member signal, because handled-ness was per-signal.
         assert_eq!(
-            correlator.thread_views(true).unwrap().len(),
+            attributor.subject_views(true).unwrap().len(),
             1,
-            "reopened thread returns to the active board"
+            "a reopened subject returns to the active board"
         );
     }
 
     #[tokio::test]
     async fn local_triage_leaves_mere_chatter_muted() {
         // Confident that it should NOT reopen.
-        let (store, correlator, analyst) =
+        let (store, attributor, analyst) =
             analyst(r#"{"reopen": false, "confidence": 0.95, "reason": "just an ack"}"#);
         let s = sig("1", "foo");
         store.insert_signal(&s).unwrap();
-        let tid = correlator.ingest(&s).unwrap();
-        store.set_state(&s.id, State::Snoozed).unwrap();
+        let tid = attributor.attach(&s).unwrap().expect("attributed");
+        store
+            .set_handled(tid.as_str(), Handled::Snoozed, None)
+            .unwrap();
 
-        assert!(!analyst.triage_handled(&tid, &s).await.unwrap());
-        assert!(correlator.thread_views(true).unwrap().is_empty());
+        assert!(!analyst.triage_handled(tid.as_str(), &s).await.unwrap());
+        assert!(attributor.subject_views(true).unwrap().is_empty());
     }
 
-    /// Below the threshold the thread stays muted: a false reopen re-raises a
+    /// Below the threshold the subject stays muted: a false reopen re-raises a
     /// notification the operator deliberately silenced, so uncertainty must not.
     #[tokio::test]
     async fn low_confidence_does_not_reopen() {
-        let (store, correlator, analyst) =
+        let (store, attributor, analyst) =
             analyst(r#"{"reopen": true, "confidence": 0.2, "reason": "maybe related"}"#);
         let s = sig("1", "foo");
         store.insert_signal(&s).unwrap();
-        let tid = correlator.ingest(&s).unwrap();
-        store.set_state(&s.id, State::Snoozed).unwrap();
+        let tid = attributor.attach(&s).unwrap().expect("attributed");
+        store
+            .set_handled(tid.as_str(), Handled::Snoozed, None)
+            .unwrap();
 
-        assert!(!analyst.triage_handled(&tid, &s).await.unwrap());
-        assert!(correlator.thread_views(true).unwrap().is_empty());
+        assert!(!analyst.triage_handled(tid.as_str(), &s).await.unwrap());
+        assert!(attributor.subject_views(true).unwrap().is_empty());
     }
 
-    /// Triage is only for handled threads — an active one is left to the normal
+    /// Triage is only for handled subjects — an active one is left to the normal
     /// analysis path.
     #[tokio::test]
     async fn triage_is_a_noop_on_an_active_thread() {
-        let (store, correlator, analyst) =
+        let (store, attributor, analyst) =
             analyst(r#"{"reopen": true, "confidence": 1.0, "reason": "x"}"#);
         let s = sig("1", "foo");
         store.insert_signal(&s).unwrap();
-        let tid = correlator.ingest(&s).unwrap();
-        assert!(!analyst.triage_handled(&tid, &s).await.unwrap());
+        let tid = attributor.attach(&s).unwrap().expect("attributed");
+        assert!(!analyst.triage_handled(tid.as_str(), &s).await.unwrap());
     }
 
     #[tokio::test]
     async fn classifies_thread_and_grounds_by_tag() {
         // The mock reasoner returns this for every completion, including the tag
-        // classifier — so the thread classifies to ["database"].
-        let (store, correlator, analyst) = analyst(r#"["database"]"#);
+        // classifier — so the subject classifies to ["database"].
+        let (store, attributor, analyst) = analyst(r#"["database"]"#);
         store
             .ensure_tag(
                 "database",
@@ -1177,14 +1186,14 @@ mod tests {
 
         let s = sig("1", "foo");
         store.insert_signal(&s).unwrap();
-        let tid = correlator.ingest(&s).unwrap();
-        analyst.reanalyze(&tid).await.unwrap();
+        let tid = attributor.attach(&s).unwrap().expect("attributed");
+        analyst.reanalyze(tid.as_str()).await.unwrap();
 
-        let t = store.get_thread(&tid).unwrap().unwrap();
-        assert_eq!(t.tags, vec!["database".to_string()], "thread classified");
+        let t = store.get_subject(tid.as_str()).unwrap().unwrap();
+        assert_eq!(t.tags, vec!["database".to_string()], "subject classified");
 
         // The tagged context is grounded ahead of the vector fill.
-        let view = correlator.thread_view(&tid).unwrap().unwrap();
+        let view = attributor.subject_view(tid.as_str()).unwrap().unwrap();
         let grounding = analyst
             .gather_grounding(&view, &["database".to_string()])
             .await;
@@ -1200,100 +1209,144 @@ mod tests {
 
     #[tokio::test]
     async fn pinned_thread_tags_survive_reanalysis() {
-        let (store, correlator, analyst) = analyst(r#"["database"]"#);
+        let (store, attributor, analyst) = analyst(r#"["database"]"#);
         store.ensure_tag("database", "db", Utc::now()).unwrap();
         let s = sig("1", "foo");
         store.insert_signal(&s).unwrap();
-        let tid = correlator.ingest(&s).unwrap();
+        let tid = attributor.attach(&s).unwrap().expect("attributed");
         // Human pins a different tag set.
         store
-            .set_thread_tags(&tid, &["network".to_string()], true)
+            .set_subject_tags(tid.as_str(), &["network".to_string()], true)
             .unwrap();
-        analyst.reanalyze(&tid).await.unwrap();
-        let t = store.get_thread(&tid).unwrap().unwrap();
+        analyst.reanalyze(tid.as_str()).await.unwrap();
+        let t = store.get_subject(tid.as_str()).unwrap().unwrap();
         assert_eq!(t.tags, vec!["network".to_string()], "pin not overwritten");
     }
 
     #[tokio::test]
     async fn user_relate_pins_authoritative_edge() {
-        let (store, correlator, analyst) = analyst("noop");
+        let (store, attributor, analyst) = analyst("noop");
         let a = sig("1", "foo");
         let b = sig("2", "bar");
         store.insert_signal(&a).unwrap();
         store.insert_signal(&b).unwrap();
-        let ta = correlator.ingest(&a).unwrap();
-        let tb = correlator.ingest(&b).unwrap();
+        let ta = attributor.attach(&a).unwrap().expect("attributed");
+        let tb = attributor.attach(&b).unwrap().expect("attributed");
         assert_ne!(ta, tb);
         analyst
-            .relate(&ta, &tb, RelationKind::Related)
+            .relate(ta.as_str(), tb.as_str(), RelationKind::Related)
             .await
             .unwrap();
-        let edge = store.get_edge(&ta, &tb).unwrap().unwrap();
+        let edge = store.get_edge(ta.as_str(), tb.as_str()).unwrap().unwrap();
         assert_eq!(edge.kind, RelationKind::Related);
         assert_eq!(edge.provenance, Provenance::User);
     }
 
+    /// A split detaches a wrongly-attributed signal to the unattributed lane, and
+    /// pins that so re-ingest can't undo it.
+    ///
+    /// It deliberately does *not* mint a new subject any more: a subject is an
+    /// upstream identity, so an invented one would be a card nothing could ever
+    /// address again.
     #[tokio::test]
-    async fn split_pulls_signal_into_new_thread() {
-        let (store, correlator, analyst) = analyst("noop");
+    async fn split_detaches_a_signal_and_remembers_the_correction() {
+        let (store, attributor, analyst) = analyst("noop");
         let a = sig("1", "foo");
         let b = sig("2", "foo");
         store.insert_signal(&a).unwrap();
         store.insert_signal(&b).unwrap();
-        let t = correlator.ingest(&a).unwrap();
+        let t = attributor.attach(&a).unwrap().expect("attributed");
         assert_eq!(
-            correlator.ingest(&b).unwrap(),
+            attributor.attach(&b).unwrap().expect("attributed"),
             t,
-            "shared entity groups together"
+            "one Slack conversation is one subject"
         );
 
-        let new = analyst
-            .split_thread(&t, std::slice::from_ref(&b.id))
+        let moved = analyst
+            .split_subject(t.as_str(), std::slice::from_ref(&b.id))
             .await
             .unwrap();
-        assert_ne!(new, t);
-        assert_eq!(store.signals_for_thread(&t).unwrap().len(), 1);
-        assert_eq!(store.signals_for_thread(&new).unwrap().len(), 1);
+        assert_eq!(moved, 1);
+        assert_eq!(store.signals_for_subject(t.as_str()).unwrap().len(), 1);
+        assert_eq!(
+            store.attribution_pin(&b.id).unwrap(),
+            Some(None),
+            "pinned to nothing, which is a decision rather than an absence"
+        );
+
+        // A second split of the same signal is a no-op rather than a double count — it no
+        // longer belongs to the subject being split from. This matters because the UI can
+        // re-issue a split (double click, replayed request) and the count is what it reports.
+        let again = analyst
+            .split_subject(t.as_str(), std::slice::from_ref(&b.id))
+            .await
+            .unwrap();
+        assert_eq!(again, 0);
+    }
+
+    /// Moving a signal to a *specific* subject is the other half of the override.
+    #[tokio::test]
+    async fn reattribute_moves_a_signal_and_pins_it() {
+        let (store, attributor, analyst) = analyst("noop");
+        let a = sig("1", "foo");
+        let b = sig("2", "bar");
+        store.insert_signal(&a).unwrap();
+        store.insert_signal(&b).unwrap();
+        let ta = attributor.attach(&a).unwrap().expect("attributed");
+        let tb = attributor.attach(&b).unwrap().expect("attributed");
+
+        analyst.reattribute(&b.id, Some(&ta)).await.unwrap();
+        assert_eq!(store.signals_for_subject(ta.as_str()).unwrap().len(), 2);
+        assert!(store.signals_for_subject(tb.as_str()).unwrap().is_empty());
+        assert_eq!(
+            store.attribution_pin(&b.id).unwrap(),
+            Some(Some(ta.to_string()))
+        );
     }
 
     #[tokio::test]
     async fn llm_judge_writes_relation_edge() {
         // Reasoner returns a judge verdict; summary path stores it verbatim (ignored here).
-        let (store, correlator, analyst) = analyst(
+        let (store, attributor, analyst) = analyst(
             r#"{"verdict":"related","confidence":0.9,"rationale":"same service","signals":[]}"#,
         );
+        // Two separate Slack conversations about the same service: distinct
+        // subjects, a shared grouping key, so they pair up as judge candidates.
         let a = sig("1", "foo");
-        let b = sig("2", "foo");
+        let mut b = sig("2", "foo");
+        b.keys = vec![
+            ResolutionKey::new("service", "foo"),
+            ResolutionKey::new("slack_thread", "C1/other"),
+        ];
         store.insert_signal(&a).unwrap();
         store.insert_signal(&b).unwrap();
-        let t = correlator.ingest(&a).unwrap();
-        correlator.ingest(&b).unwrap();
-        // Split so two entity-sharing threads exist as judge candidates.
-        let other = analyst
-            .split_thread(&t, std::slice::from_ref(&b.id))
-            .await
-            .unwrap();
-        analyst.reanalyze(&t).await.unwrap();
-        let edge = store.get_edge(&t, &other).unwrap().unwrap();
+        let t = attributor.attach(&a).unwrap().expect("attributed");
+        let other = attributor.attach(&b).unwrap().expect("attributed");
+        assert_ne!(t, other);
+        analyst.reanalyze(t.as_str()).await.unwrap();
+        let edge = store.get_edge(t.as_str(), other.as_str()).unwrap().unwrap();
         assert_eq!(edge.kind, RelationKind::Related);
         assert_eq!(edge.provenance, Provenance::Llm);
     }
 
     #[tokio::test]
     async fn same_pin_merges_threads() {
-        let (store, correlator, analyst) = analyst("noop");
+        let (store, attributor, analyst) = analyst("noop");
         let a = sig("1", "foo");
         let b = sig("2", "bar");
         store.insert_signal(&a).unwrap();
         store.insert_signal(&b).unwrap();
-        let ta = correlator.ingest(&a).unwrap();
-        let tb = correlator.ingest(&b).unwrap();
-        let canonical = analyst.relate(&ta, &tb, RelationKind::Same).await.unwrap();
-        assert_eq!(canonical, ta);
-        assert_eq!(store.signals_for_thread(&ta).unwrap().len(), 2);
+        let ta = attributor.attach(&a).unwrap().expect("attributed");
+        let tb = attributor.attach(&b).unwrap().expect("attributed");
+        let canonical = analyst
+            .relate(ta.as_str(), tb.as_str(), RelationKind::Same)
+            .await
+            .unwrap();
+        assert_eq!(canonical, ta.to_string());
+        assert_eq!(store.signals_for_subject(ta.as_str()).unwrap().len(), 2);
         assert!(
-            store.get_thread(&tb).unwrap().is_none(),
-            "merged thread removed"
+            store.get_subject(tb.as_str()).unwrap().is_none(),
+            "the merged-away subject is gone from the board"
         );
     }
 }

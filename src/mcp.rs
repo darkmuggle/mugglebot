@@ -207,15 +207,21 @@ async fn rpc(State(server): State<Arc<McpServer>>, Json(msg): Json<Value>) -> Js
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::correlation::{Analyst, Correlator};
+    use crate::correlation::Analyst;
     use crate::embed::HashEmbedder;
     use crate::memory::MemoryManager;
     use crate::reasoner::{MockReasoner, Reasoner};
     use crate::store::Store;
+    use crate::subject::Attributor;
     use std::time::Duration;
 
     fn server() -> Arc<McpServer> {
         let store = Arc::new(Store::open_in_memory().unwrap());
+        let secrets = crate::secrets::Secrets::for_tests(store.clone());
+        let scorer = Arc::new(crate::score::Scorer {
+            store: store.clone(),
+            embedder: Arc::new(crate::embed::HashEmbedder),
+        });
         let embedder = Arc::new(HashEmbedder);
         let reasoner: Arc<dyn Reasoner> = Arc::new(MockReasoner::new("ok"));
         let memory = Arc::new(MemoryManager::new(
@@ -226,17 +232,18 @@ mod tests {
         ));
         let context = Arc::new(crate::context::ContextManager::new(
             store.clone(),
+            secrets.clone(),
             embedder,
             reasoner.clone(),
             reasoner.clone(),
             "6h".into(),
         ));
-        let correlator = Arc::new(Correlator::new(store.clone(), Duration::from_secs(1800)));
+        let attributor = Arc::new(Attributor::new(store.clone()));
         let (investigator, repos, browser) =
-            crate::rootcause::offline_stack(store.clone(), correlator.clone(), reasoner.clone());
+            crate::rootcause::offline_stack(store.clone(), attributor.clone(), reasoner.clone());
         let analyst = Arc::new(Analyst::new(
             store.clone(),
-            correlator.clone(),
+            attributor.clone(),
             reasoner.clone(),
             reasoner.clone(),
             memory.clone(),
@@ -248,15 +255,22 @@ mod tests {
         ));
         Arc::new(McpServer::new(Arc::new(Tools {
             store,
-            correlator,
+            agents: Arc::new(crate::agent::AgentSessions::for_tests()),
+            ingress: Arc::new(crate::restate::ingress::Ingress::new(
+                &crate::config::RestateConfig::default(),
+            )),
+            scorer: scorer.clone(),
+            secrets,
+            attributor,
             analyst,
             memory,
             context,
-            reasoner,
+            reasoner: reasoner.clone(),
             config: Arc::new(crate::config::Config::default()),
             investigator,
             repos,
             browser,
+            diffs: Arc::new(crate::prdiff::DiffReader::new(None, reasoner.clone()).unwrap()),
         })))
     }
 
@@ -324,11 +338,29 @@ mod tests {
         assert!(text.contains("local_model"), "config is exposed");
         // Behavior is public; secrets are not. Credentials live in the store, and
         // this resource is built from the config struct, which never holds them.
-        for secret in ["xoxp-", "xoxb-", "ghp_", "secret", "token"] {
-            assert!(
-                !text.to_ascii_lowercase().contains(secret),
-                "config resource leaked `{secret}`"
-            );
+        //
+        // Checked over string *values*, not the serialized text: `[secrets]` is a
+        // legitimate config section (it holds `encrypt`), so a substring scan of the
+        // whole document would trip on a key name and say nothing about a leak.
+        let parsed: Value = serde_json::from_str(text).expect("config resource is JSON");
+        let mut leaked = Vec::new();
+        walk_strings(&parsed, &mut |s| {
+            let lower = s.to_ascii_lowercase();
+            for marker in ["xoxp-", "xoxb-", "ghp_", "secret", "token"] {
+                if lower.contains(marker) {
+                    leaked.push(format!("{marker} in {s:?}"));
+                }
+            }
+        });
+        assert!(leaked.is_empty(), "config resource leaked: {leaked:?}");
+    }
+
+    fn walk_strings(v: &Value, f: &mut impl FnMut(&str)) {
+        match v {
+            Value::String(s) => f(s),
+            Value::Array(items) => items.iter().for_each(|i| walk_strings(i, f)),
+            Value::Object(map) => map.values().for_each(|i| walk_strings(i, f)),
+            _ => {}
         }
     }
 }

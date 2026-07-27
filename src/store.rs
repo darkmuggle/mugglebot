@@ -1,5 +1,5 @@
 //! SQLite store. One embedded, single-file store for every access pattern:
-//! the append-mostly signal log, the thread **relation graph** (edges + joins),
+//! the append-mostly signal log, the subject **relation graph** (edges + joins),
 //! the memory + context grounding stores, and semantic recall (embeddings kept
 //! as `f32` BLOBs, ranked in-process — see [`crate::embed`]). Dedup on signals is
 //! enforced by `UNIQUE(source, external_id)`.
@@ -13,39 +13,51 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use crate::context::{Context as CtxEntry, ContextSourceKind};
-use crate::correlation::{ContextKind, Edge, Provenance, RelationKind, Thread, ThreadContext};
+use crate::correlation::{ContextKind, Edge, Provenance, RelationKind, SubjectContext};
 use crate::live::{FlagType, Hint, HintKind, HintState};
 use crate::memory::Memory;
-use crate::signal::{Entity, Severity, Signal, SignalKind, Source, State};
+use crate::signal::{ResolutionKey, Severity, Signal, SignalKind, Source};
+use crate::subject::{Handled, Subject, SubjectKey, SubjectRank};
 use crate::tags::Tag;
 
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS signals (
-    id           TEXT PRIMARY KEY,
-    source       TEXT NOT NULL,
-    external_id  TEXT NOT NULL,
-    kind         TEXT NOT NULL,
-    title        TEXT NOT NULL,
-    body         TEXT,
-    url          TEXT,
-    actor        TEXT,
-    entities     TEXT NOT NULL,
-    severity     TEXT NOT NULL,
-    state        TEXT NOT NULL,
-    occurred_at  TEXT NOT NULL,
-    ingested_at  TEXT NOT NULL,
-    thread       TEXT,
-    raw          TEXT NOT NULL,
-    tags         TEXT NOT NULL DEFAULT '[]',
-    UNIQUE(source, external_id)
+    id            TEXT PRIMARY KEY,
+    source        TEXT NOT NULL,
+    external_id   TEXT NOT NULL,
+    -- Upstream version of a mutable event. Part of the dedup key, so "the same
+    -- notification, changed" stays distinct from "the same event again".
+    version       TEXT,
+    kind          TEXT NOT NULL,
+    title         TEXT NOT NULL,
+    body          TEXT,
+    url           TEXT,
+    actor         TEXT,
+    keys          TEXT NOT NULL,
+    severity      TEXT NOT NULL,
+    -- Gone upstream (no longer unread, issue closed). A fact about the source, not
+    -- operator triage — that lives on the subject.
+    upstream_gone INTEGER NOT NULL DEFAULT 0,
+    occurred_at   TEXT NOT NULL,
+    ingested_at   TEXT NOT NULL,
+    -- The subject that owns this signal; NULL is the unattributed lane.
+    subject       TEXT,
+    raw           TEXT NOT NULL,
+    tags          TEXT NOT NULL DEFAULT '[]',
+    UNIQUE(source, external_id, version)
 );
 CREATE INDEX IF NOT EXISTS idx_signals_occurred ON signals(occurred_at DESC);
 CREATE INDEX IF NOT EXISTS idx_signals_source   ON signals(source);
-CREATE INDEX IF NOT EXISTS idx_signals_state    ON signals(state);
-CREATE INDEX IF NOT EXISTS idx_signals_thread   ON signals(thread);
+CREATE INDEX IF NOT EXISTS idx_signals_gone     ON signals(upstream_gone);
+CREATE INDEX IF NOT EXISTS idx_signals_subject  ON signals(subject);
 
-CREATE TABLE IF NOT EXISTS threads (
-    id               TEXT PRIMARY KEY,
+-- Subjects: the durable pieces of work, keyed by upstream identity
+-- (owner/repo#412, owner/repo!987, channel/thread_ts). From Phase 2 this table is
+-- the board projection of the matching Restate virtual object's state — the object
+-- is addressable only by key, and the board is a cross-key query.
+CREATE TABLE IF NOT EXISTS subjects (
+    key              TEXT PRIMARY KEY,
+    rank             TEXT NOT NULL,
     title            TEXT NOT NULL,
     summary          TEXT,
     created_at       TEXT NOT NULL,
@@ -53,30 +65,57 @@ CREATE TABLE IF NOT EXISTS threads (
     last_reasoned_at TEXT,
     live             INTEGER NOT NULL DEFAULT 0,
     tags             TEXT NOT NULL DEFAULT '[]',
-    tags_pinned      INTEGER NOT NULL DEFAULT 0
+    tags_pinned      INTEGER NOT NULL DEFAULT 0,
+    -- Operator triage, per subject rather than per signal.
+    handled          TEXT NOT NULL DEFAULT 'open',
+    snoozed_until    TEXT,
+    -- Merged away into this canonical subject; activity forwards there.
+    same_as          TEXT,
+    -- Deterministic merge key within the Slack rank (an environment id).
+    merge_key        TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_subjects_merge ON subjects(merge_key);
+
+-- The hierarchy: a PR under the issue it closes. Recorded the moment a signal names
+-- both, which is often before either card exists — a closing keyword is a fact about
+-- GitHub, not a property of a row we happen to have created.
+CREATE TABLE IF NOT EXISTS subject_links (
+    child      TEXT PRIMARY KEY,
+    parent     TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_subject_links_parent ON subject_links(parent);
+
+-- A human correction to the ranked climb, per signal. Kept so a re-ingest of the
+-- same upstream event can't silently undo it: `subject` NULL means "this belongs to
+-- nothing", which is a decision, not an absence.
+CREATE TABLE IF NOT EXISTS attribution_pins (
+    signal_id  TEXT PRIMARY KEY,
+    subject    TEXT,
+    created_at TEXT NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS thread_edges (
-    thread_a    TEXT NOT NULL,
-    thread_b    TEXT NOT NULL,
+CREATE TABLE IF NOT EXISTS subject_edges (
+    subject_a   TEXT NOT NULL,
+    subject_b   TEXT NOT NULL,
     kind        TEXT NOT NULL,
     provenance  TEXT NOT NULL,
     confidence  REAL NOT NULL,
     rationale   TEXT NOT NULL,
     signals     TEXT NOT NULL,
     created_at  TEXT NOT NULL,
-    PRIMARY KEY (thread_a, thread_b)
+    PRIMARY KEY (subject_a, subject_b)
 );
 
-CREATE TABLE IF NOT EXISTS thread_context (
+CREATE TABLE IF NOT EXISTS subject_context (
     id          TEXT PRIMARY KEY,
-    thread_id   TEXT NOT NULL,
+    subject_key TEXT NOT NULL,
     kind        TEXT NOT NULL,
     content     TEXT NOT NULL,
     summary     TEXT,
     created_at  TEXT NOT NULL
 );
-CREATE INDEX IF NOT EXISTS idx_thread_context ON thread_context(thread_id);
+CREATE INDEX IF NOT EXISTS idx_subject_context ON subject_context(subject_key);
 
 CREATE TABLE IF NOT EXISTS memory (
     id          TEXT PRIMARY KEY,
@@ -119,7 +158,7 @@ CREATE TABLE IF NOT EXISTS tags (
 
 CREATE TABLE IF NOT EXISTS hints (
     id          TEXT PRIMARY KEY,
-    thread_id   TEXT NOT NULL,
+    subject_key   TEXT NOT NULL,
     kind        TEXT NOT NULL,
     flag_type   TEXT,
     text        TEXT NOT NULL,
@@ -129,7 +168,7 @@ CREATE TABLE IF NOT EXISTS hints (
     state       TEXT NOT NULL,
     created_at  TEXT NOT NULL
 );
-CREATE INDEX IF NOT EXISTS idx_hints_thread ON hints(thread_id);
+CREATE INDEX IF NOT EXISTS idx_hints_subject ON hints(subject_key);
 CREATE INDEX IF NOT EXISTS idx_hints_state  ON hints(state);
 
 CREATE TABLE IF NOT EXISTS source_health (
@@ -141,9 +180,22 @@ CREATE TABLE IF NOT EXISTS source_health (
     cursor       TEXT
 );
 
-CREATE TABLE IF NOT EXISTS credentials (
-    account TEXT PRIMARY KEY,
-    secret  TEXT NOT NULL
+-- Credentials: source tokens, model API keys, authed-context secrets. This is the
+-- credential store — there is no Keychain involved, deliberately (see AGENTS.md →
+-- "Secrets in SQLite"). `value` is a BLOB so a sealed value needs no text
+-- encoding: byte 0 is a format tag (0x00 plaintext UTF-8, 0x01 AES-256-GCM with a
+-- 12-byte nonce ahead of the ciphertext).
+CREATE TABLE IF NOT EXISTS secrets (
+    name       TEXT PRIMARY KEY,
+    value      BLOB NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+-- Small key/value side table for store-level facts that aren't domain data: the
+-- KDF salt, schema notes. Not a config store — config is the TOML.
+CREATE TABLE IF NOT EXISTS meta (
+    key   TEXT PRIMARY KEY,
+    value BLOB NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS chats (
@@ -155,14 +207,6 @@ CREATE TABLE IF NOT EXISTS chats (
 );
 CREATE INDEX IF NOT EXISTS idx_chats_updated ON chats(updated_at DESC);
 
--- Cached LLM-generated mitigations per thread. Generation is slow (a reasoner
--- round-trip), so it runs in the background during reanalysis and the UI reads
--- the cache instead of blocking on it.
-CREATE TABLE IF NOT EXISTS thread_mitigations (
-    thread_id   TEXT PRIMARY KEY,
-    json        TEXT NOT NULL,
-    created_at  TEXT NOT NULL
-);
 
 -- An authenticated, read-only browser investigation of a dashboard link found in
 -- a signal. Queued at ingest, claimed by the browser worker, which drives Chrome
@@ -203,6 +247,14 @@ CREATE TABLE IF NOT EXISTS repo_index (
     summary      TEXT,
     indexed_sha  TEXT,
     digest       TEXT,
+    -- What kind of repo this is: 'code', 'example', 'docs'. NULL means nobody has said and
+    -- the name gave no clue, so it is treated as code until someone tags it.
+    --
+    -- Stored rather than derived on read *because* it is operator-taggable: a derivation would
+    -- overwrite the tag on the next crawl. `kind_pinned` is what protects a human's answer from
+    -- the name-matching heuristic.
+    kind         TEXT,
+    kind_pinned  INTEGER NOT NULL DEFAULT 0,
     fetched_at   TEXT NOT NULL
 );
 
@@ -225,6 +277,10 @@ CREATE TABLE IF NOT EXISTS issue_pr_fixes (
     confidence  REAL NOT NULL DEFAULT 0,
     implementation TEXT,
     critique    TEXT,
+    -- A distilled summary of the PR's review discussion, from the merit-scored
+    -- comments the critique already reads. Stored so the board can show what
+    -- reviewers actually said without re-fetching or re-judging it.
+    conversation TEXT,
     also_fixes  TEXT NOT NULL DEFAULT '[]',
     -- Which tier produced the analysis — local, or an escalation.
     analyzed_by TEXT,
@@ -259,6 +315,73 @@ CREATE TABLE IF NOT EXISTS repo_commit_windows (
 -- Cached GitHub issue/PR search results, keyed by the exact query. Symptom
 -- searches repeat across re-analyses of the same thread; this keeps the search
 -- API (30 req/min) out of the hot path.
+-- ---------------------------------------------------------------------------------
+-- The code index: what each repo is, what its components do, and what each commit
+-- changed — summarized once and embedded, so "which repo and component is this issue
+-- likely about?" is a retrieval rather than a crawl.
+--
+-- These live in SQLite and not in the `RepoIndexer` object's state, deliberately. The
+-- whole point is to rank thousands of summaries against one issue, and object state is
+-- addressable only by key — there is no cross-key query, so scoring from it would mean
+-- loading every repo's every commit. It is also the record rather than work in flight:
+-- rebuilding it costs thousands of local model calls, and `data/restate` gets wiped
+-- whenever vqueues are toggled. The object owns the *indexing*; this owns the *index*.
+
+-- One row per commit, keyed by sha — which is immutable, so a summary is computed
+-- exactly once and is valid forever.
+CREATE TABLE IF NOT EXISTS commit_summaries (
+    full_name   TEXT NOT NULL,
+    sha         TEXT NOT NULL,
+    -- What the change does, in behavioural terms: the unit a symptom is matched against.
+    summary     TEXT NOT NULL,
+    -- Components the commit touched, derived from its changed paths.
+    components  TEXT NOT NULL DEFAULT '[]',
+    -- `f32` little-endian, as elsewhere; ranked in-process by cosine similarity.
+    embedding   BLOB,
+    -- Which tier wrote it, so a re-index on a better model is identifiable.
+    model       TEXT,
+    created_at  TEXT NOT NULL,
+    PRIMARY KEY (full_name, sha)
+);
+CREATE INDEX IF NOT EXISTS idx_commit_summaries_repo ON commit_summaries(full_name);
+
+-- One row per component: a module root inside a repo. This is the granularity an
+-- engineer actually acts on — "which component" is a more useful answer than "which
+-- repo", and a far more useful one than "which commit" when the change is old.
+CREATE TABLE IF NOT EXISTS component_summaries (
+    full_name   TEXT NOT NULL,
+    -- Repo-relative directory, e.g. `crates/partition-processor`.
+    path        TEXT NOT NULL,
+    -- `PURPOSE:` — what this component runs.
+    purpose     TEXT,
+    -- `SYMPTOMS:` — the terms that should route an incident here.
+    symptoms    TEXT,
+    -- File-type/module digest the summary was derived from.
+    digest      TEXT,
+    embedding   BLOB,
+    -- The commit the summary was built from; unchanged code is not re-summarized.
+    indexed_sha TEXT,
+    created_at  TEXT NOT NULL,
+    PRIMARY KEY (full_name, path)
+);
+CREATE INDEX IF NOT EXISTS idx_component_summaries_repo ON component_summaries(full_name);
+
+-- The dependency graph, from manifests that are actually present (see `ecosystem`).
+-- What it buys over search: an issue in `restate-cloud` whose symptom matches a change
+-- in `restate` scores *through the edge*, with the hop named in the rationale.
+CREATE TABLE IF NOT EXISTS repo_deps (
+    from_repo   TEXT NOT NULL,
+    -- The resolved repo this depends on, when the dependency maps to one we index.
+    to_repo     TEXT NOT NULL,
+    -- The declared dependency name, kept as the citation.
+    dep_name    TEXT NOT NULL,
+    -- The manifest it came from, so the edge is checkable.
+    source      TEXT NOT NULL,
+    created_at  TEXT NOT NULL,
+    PRIMARY KEY (from_repo, to_repo, dep_name)
+);
+CREATE INDEX IF NOT EXISTS idx_repo_deps_to ON repo_deps(to_repo);
+
 CREATE TABLE IF NOT EXISTS repo_issue_cache (
     query      TEXT PRIMARY KEY,
     results    TEXT NOT NULL,
@@ -303,10 +426,35 @@ CREATE TABLE IF NOT EXISTS issue_triage (
 CREATE INDEX IF NOT EXISTS idx_issue_triage_signal ON issue_triage(signal_id);
 CREATE INDEX IF NOT EXISTS idx_issue_triage_status ON issue_triage(status);
 
--- The root-cause report for one thread: the ranked issue/PR/commit/code
--- candidates the investigator believes contributed, with its citations.
-CREATE TABLE IF NOT EXISTS thread_root_cause (
-    thread_id   TEXT PRIMARY KEY,
+-- A distilled explanation of one subject *and everything under it*: the PRs
+-- attempting an issue, their critiques and review conversations, the root cause, the
+-- triage, the attached context. Produced by the `Explain` workflow and keyed by the
+-- watermark it was built from, so a stale explanation is visibly stale rather than
+-- quietly wrong.
+CREATE TABLE IF NOT EXISTS subject_explanations (
+    subject_key TEXT NOT NULL,
+    -- Who wrote it: 'local' for the automatic explanation, 'cloud' for one the operator
+    -- explicitly asked a cloud model for. Part of the key, so the two coexist and can be
+    -- read side by side — the whole point of asking for a second opinion is comparing it
+    -- to the first.
+    produced_by TEXT NOT NULL,
+    -- The newest attributed signal id at the time of writing.
+    watermark   TEXT NOT NULL,
+    markdown    TEXT NOT NULL,
+    -- What went into it, for the citation strip: 'pr_critiques', 'root_cause', …
+    sources     TEXT NOT NULL DEFAULT '[]',
+    -- What the dossier check removed before this was stored, as displayable lines. Empty is
+    -- the good case; non-empty is shown, because an explanation that had claims taken out
+    -- of it is one to read more carefully.
+    removed     TEXT NOT NULL DEFAULT '[]',
+    created_at  TEXT NOT NULL,
+    PRIMARY KEY (subject_key, produced_by)
+);
+
+-- The root-cause report for one subject: the ranked issue/PR/commit/code candidates the
+-- investigator believes contributed, with its citations.
+CREATE TABLE IF NOT EXISTS subject_root_cause (
+    subject_key   TEXT PRIMARY KEY,
     status      TEXT NOT NULL,
     symptoms    TEXT NOT NULL DEFAULT '[]',
     repos       TEXT NOT NULL DEFAULT '[]',
@@ -318,21 +466,22 @@ CREATE TABLE IF NOT EXISTS thread_root_cause (
 );
 "#;
 
-/// Column list for [`row_to_browser_investigation`]. The thread id is joined off
+/// Column list for [`row_to_browser_investigation`]. The subject id is joined off
 /// the signal rather than stored, so a merge that re-homes signals moves the
 /// investigation with them.
-const BROWSER_SELECT: &str = "SELECT b.id, b.signal_id, s.thread, b.url, b.prompt, b.status, \
+const BROWSER_SELECT: &str = "SELECT b.id, b.signal_id, s.subject, b.url, b.prompt, b.status, \
      b.findings, b.error, b.attempts, b.created_at, b.updated_at \
      FROM browser_investigations b";
 
 /// Column list for [`row_to_repo`].
 const REPO_SELECT: &str = "SELECT full_name, description, topics, language, archived, pushed_at, \
-     readme_etag, readme, summary, indexed_sha, digest, fetched_at FROM repo_index";
+     readme_etag, readme, summary, indexed_sha, digest, fetched_at, kind, kind_pinned \
+     FROM repo_index";
 
 /// Column list for [`row_to_pr_fix`].
 const PR_FIX_SELECT: &str = "SELECT issue_key, pr_repo, pr_number, pr_title, pr_url, pr_author, \
-     pr_state, files, verdict, confidence, implementation, critique, also_fixes, analyzed_by, \
-     created_at, updated_at FROM issue_pr_fixes";
+     pr_state, files, verdict, confidence, implementation, critique, conversation, \
+     also_fixes, analyzed_by, created_at, updated_at FROM issue_pr_fixes";
 
 /// Column list for [`row_to_issue_triage`].
 const TRIAGE_SELECT: &str = "SELECT issue_key, repo, number, title, url, signal_id, status, \
@@ -358,7 +507,9 @@ pub struct SignalFilter {
     pub source: Option<Source>,
     pub since: Option<DateTime<Utc>>,
     pub min_severity: Option<Severity>,
-    pub state: Option<State>,
+    /// Filter on whether the signal is still present upstream. Operator triage is
+    /// a subject-level filter, not a signal-level one.
+    pub upstream_gone: Option<bool>,
     pub limit: Option<usize>,
 }
 
@@ -399,7 +550,7 @@ pub struct SourceHealth {
 pub struct BrowserInvestigation {
     pub id: String,
     pub signal_id: String,
-    pub thread_id: Option<String>,
+    pub subject_key: Option<String>,
     pub url: String,
     pub prompt: String,
     /// `pending` → `running` → `completed` | `failed`.
@@ -432,7 +583,82 @@ pub struct RepoEntry {
     /// characterization can be explained, and re-used without re-walking.
     #[serde(skip_serializing)]
     pub digest: Option<String>,
+    /// What kind of repo this is, when known. See [`RepoKind`].
+    #[serde(default)]
+    pub kind: Option<RepoKind>,
+    /// The kind was set by a human and the name-matching heuristic must not overwrite it.
+    #[serde(default)]
+    pub kind_pinned: bool,
     pub fetched_at: String,
+}
+
+/// What a repository is *for*, which decides how much attention it deserves.
+///
+/// The distinction is practical rather than taxonomic: an issue about a demo is rarely an
+/// incident, docs have no runtime behaviour to break, and grouping the board's 147 repos by this
+/// makes the twenty that can actually page you legible among the rest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RepoKind {
+    /// Production code. The default, because assuming something matters is the safe error.
+    Code,
+    /// Examples, demos, templates, playgrounds.
+    Example,
+    /// Documentation, websites, specs.
+    Docs,
+}
+
+impl RepoKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RepoKind::Code => "code",
+            RepoKind::Example => "example",
+            RepoKind::Docs => "docs",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "code" => Some(RepoKind::Code),
+            "example" | "examples" | "demo" | "demos" => Some(RepoKind::Example),
+            "docs" | "doc" | "documentation" => Some(RepoKind::Docs),
+            _ => None,
+        }
+    }
+
+    /// Guess from a repo's name and topics, or `None` when nothing in them says.
+    ///
+    /// Deliberately only the unambiguous cases. A guess that has to reach — "sdk" or "tools"
+    /// might be a demo — would mis-file production code as a toy, and the operator would have to
+    /// notice and correct something they never asked for. `None` means "you tell me", and until
+    /// they do it is treated as code, because that is the assumption that fails safe.
+    pub fn guess(full_name: &str, topics: &[String]) -> Option<Self> {
+        let name = full_name
+            .rsplit('/')
+            .next()
+            .unwrap_or(full_name)
+            .to_ascii_lowercase();
+        // Word-ish boundaries, so `demos` and `sdk-examples` match while `redemption` does not.
+        let has = |needle: &str| {
+            name.split(|c: char| !c.is_ascii_alphanumeric())
+                .any(|w| w == needle || w == format!("{needle}s"))
+        };
+        if has("example") || has("demo") || has("sample") || has("template") || has("playground") {
+            return Some(RepoKind::Example);
+        }
+        if has("doc") || has("docs") || has("documentation") || has("website") || has("handbook") {
+            return Some(RepoKind::Docs);
+        }
+        // Topics are author-declared and cheap to honour when the name is silent.
+        let topical = |needle: &str| topics.iter().any(|t| t.eq_ignore_ascii_case(needle));
+        if topical("example") || topical("examples") || topical("demo") || topical("sample") {
+            return Some(RepoKind::Example);
+        }
+        if topical("documentation") || topical("docs") {
+            return Some(RepoKind::Docs);
+        }
+        None
+    }
 }
 
 /// An open pull request that may already fix an issue, with the local model's read
@@ -454,6 +680,8 @@ pub struct PrFix {
     pub implementation: Option<String>,
     /// Whether it genuinely addresses the issue, and what it misses.
     pub critique: Option<String>,
+    /// What reviewers actually said, distilled from the merit-scored discussion.
+    pub conversation: Option<String>,
     /// Other issue references this PR would also resolve.
     pub also_fixes: Vec<String>,
     /// The tier that produced this analysis (`local`, `brief`, `mid`).
@@ -520,10 +748,109 @@ pub struct IssueTriage {
     pub updated_at: String,
 }
 
-/// The stored root-cause report for a thread.
+/// One commit's summary, as the scorer sees it.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CommitSummary {
+    pub full_name: String,
+    pub sha: String,
+    pub summary: String,
+    pub components: Vec<String>,
+}
+
+/// How far the code index has got with one repo. Everything the progress panel shows for a
+/// row, so a repaint is one query rather than one per repo per facet.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RepoIndexProgress {
+    pub full_name: String,
+    pub summary: Option<String>,
+    pub language: Option<String>,
+    pub archived: bool,
+    /// The commit the repo card was built from.
+    pub indexed_sha: Option<String>,
+    pub components: i64,
+    /// Commits fetched into the local cache — the denominator for summarizing.
+    pub commits_cached: i64,
+    pub commits_summarized: i64,
+    pub depends_on: i64,
+    pub depended_on_by: i64,
+    /// How far back history has been walked. `None` means the walk hasn't started, which is
+    /// a different state from "0 commits to do" and reads identically without this field.
+    pub history_back_to: Option<String>,
+    /// What kind of repo this is — code, example, or docs. `None` means nobody has said and
+    /// the name gave no clue.
+    pub kind: Option<RepoKind>,
+    /// Whether a human set the kind.
+    pub kind_pinned: bool,
+    /// The newest commit in the local cache — the repo's last activity, as far as the index has
+    /// seen. Distinct from `history_back_to`, which is the *oldest*: the walk runs backwards
+    /// from HEAD, so the two ends answer different questions and were being confused for each
+    /// other on the board.
+    pub last_commit: Option<String>,
+}
+
+/// One commit summary with enough of its commit to be recognizable.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CommitSummaryRow {
+    pub sha: String,
+    pub summary: String,
+    pub components: Vec<String>,
+    pub model: Option<String>,
+    /// First line of the commit message, for orientation — the summary is behavioural and
+    /// deliberately doesn't restate it.
+    pub subject: Option<String>,
+    pub author: Option<String>,
+    pub committed_at: Option<String>,
+    pub url: Option<String>,
+}
+
+/// One component of a repo — a module root, which is the granularity an engineer acts
+/// on.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ComponentSummary {
+    pub full_name: String,
+    pub path: String,
+    pub purpose: Option<String>,
+    pub symptoms: Option<String>,
+    pub digest: Option<String>,
+    pub indexed_sha: Option<String>,
+}
+
+/// A dependency edge between two indexed repos.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RepoDep {
+    pub from_repo: String,
+    pub to_repo: String,
+    pub dep_name: String,
+    pub source: String,
+}
+
+/// A distilled explanation of a subject and everything under it.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct Explanation {
+    pub subject_key: String,
+    /// The newest attributed signal at the time of writing. The board compares this
+    /// against the subject's current watermark to show whether the explanation still
+    /// describes what's there.
+    pub watermark: String,
+    pub markdown: String,
+    /// [`EXPLAIN_LOCAL`] or [`EXPLAIN_CLOUD`].
+    pub produced_by: String,
+    pub sources: Vec<String>,
+    /// Claims the dossier check removed. Shown to the operator: an explanation that needed
+    /// correcting is one to read more carefully.
+    pub removed: Vec<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+/// The automatic explanation, written by the local model.
+pub const EXPLAIN_LOCAL: &str = "local";
+/// The explanation a cloud model wrote because the operator asked for one.
+pub const EXPLAIN_CLOUD: &str = "cloud";
+
+/// The stored root-cause report for a subject.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct RootCauseReport {
-    pub thread_id: String,
+    pub subject_key: String,
     /// `running` → `complete` | `failed`.
     pub status: String,
     pub symptoms: Vec<String>,
@@ -546,8 +873,20 @@ impl Store {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
+        check_compatible(&conn, path)?;
         conn.execute_batch(SCHEMA)?;
-        migrate(&conn)?;
+        add_columns(&conn)?;
+        // Stamped after the schema is in place, so a half-applied schema (a disk error
+        // mid-batch) doesn't leave a database claiming to be current.
+        conn.execute(
+            "INSERT INTO meta (key, value) VALUES ('schema_version', ?1) \
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![SCHEMA_VERSION.to_string()],
+        )?;
+        // This file holds every ingested signal body *and* the credential store, so
+        // it is the sensitive artifact — not just the tokens inside it. WAL mode
+        // means two sidecar files carry the same content; all three get 0600.
+        restrict_permissions(path);
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -560,30 +899,31 @@ impl Store {
     // ---- signals ------------------------------------------------------------
 
     /// Insert a signal, refreshing source-provided context on duplicates while
-    /// preserving local state, thread membership, and user-applied tags.
+    /// preserving local state, subject membership, and user-applied tags.
     /// Returns `true` only when the row was newly inserted.
     pub fn insert_signal(&self, s: &Signal) -> Result<bool> {
         let conn = self.lock();
         let changed = conn.execute(
             "INSERT OR IGNORE INTO signals \
-             (id, source, external_id, kind, title, body, url, actor, entities, \
-              severity, state, occurred_at, ingested_at, thread, raw, tags) \
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
+             (id, source, external_id, version, kind, title, body, url, actor, keys, \
+              severity, upstream_gone, occurred_at, ingested_at, subject, raw, tags) \
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
             params![
                 s.id,
                 s.source.as_str(),
                 s.external_id,
+                s.version,
                 json(&s.kind)?,
                 s.title,
                 s.body,
                 s.url,
                 s.actor,
-                json(&s.entities)?,
+                json(&s.keys)?,
                 json(&s.severity)?,
-                json(&s.state)?,
+                s.upstream_gone as i64,
                 s.occurred_at.to_rfc3339(),
                 s.ingested_at.to_rfc3339(),
-                s.thread,
+                s.subject,
                 s.raw.to_string(),
                 json(&s.tags)?,
             ],
@@ -591,23 +931,29 @@ impl Store {
         if changed > 0 {
             return Ok(true);
         }
-        // GitHub keeps unread notifications stable across restarts. Refreshing
-        // the mutable source fields lets newly added enrichers (for example CI
-        // log extraction) populate already-stored notifications without
-        // resetting their triage state or correlation membership.
+        // GitHub keeps unread notifications stable across restarts. Refreshing the
+        // mutable source fields lets newly added enrichers (a CI log excerpt, say)
+        // populate an already-stored signal without resetting its attribution.
+        //
+        // Scoped to `(source, external_id, version)` — the same key the unique index
+        // uses. Matching on `(source, external_id)` alone would hit *every version* of
+        // one notification thread and overwrite the older ones' content with the
+        // newest, quietly rewriting the timeline.
         conn.execute(
-            "UPDATE signals SET kind=?3, title=?4, body=?5, url=?6, actor=?7, \
-             entities=?8, severity=?9, occurred_at=?10, ingested_at=?11, raw=?12 \
-             WHERE source=?1 AND external_id=?2",
+            "UPDATE signals SET kind=?4, title=?5, body=?6, url=?7, actor=?8, \
+             keys=?9, severity=?10, occurred_at=?11, ingested_at=?12, raw=?13, \
+             upstream_gone=0 \
+             WHERE source=?1 AND external_id=?2 AND version IS ?3",
             params![
                 s.source.as_str(),
                 s.external_id,
+                s.version,
                 json(&s.kind)?,
                 s.title,
                 s.body,
                 s.url,
                 s.actor,
-                json(&s.entities)?,
+                json(&s.keys)?,
                 json(&s.severity)?,
                 s.occurred_at.to_rfc3339(),
                 s.ingested_at.to_rfc3339(),
@@ -615,6 +961,22 @@ impl Store {
             ],
         )?;
         Ok(false)
+    }
+
+    /// Signals that resolved to no subject, newest first.
+    ///
+    /// The unattributed lane. These are deliberately *not* given subjects of their own:
+    /// minting one per unresolvable event is exactly how a board fills with
+    /// near-identical one-signal cards. They stay visible here instead, so a CI failure
+    /// on a commit with no PR is findable rather than lost.
+    pub fn unattributed_signals(&self, limit: usize) -> Result<Vec<Signal>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(&format!(
+            "{SIGNAL_SELECT} WHERE subject IS NULL AND upstream_gone = 0 \
+             ORDER BY occurred_at DESC LIMIT {limit}"
+        ))?;
+        let rows = stmt.query_map([], row_to_signal)?;
+        collect(rows)
     }
 
     /// Most recent signals, newest first.
@@ -629,18 +991,15 @@ impl Store {
     /// stored as a label, not an ordinal), which is fine at this volume.
     pub fn list_signals(&self, f: &SignalFilter) -> Result<Vec<Signal>> {
         let conn = self.lock();
-        let mut sql = String::from(
-            "SELECT id, source, external_id, kind, title, body, url, actor, entities, \
-                    severity, state, occurred_at, ingested_at, thread, raw, tags FROM signals WHERE 1=1",
-        );
+        let mut sql = format!("{SIGNAL_SELECT} WHERE 1=1");
         let mut args: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
         if let Some(src) = f.source {
             sql.push_str(" AND source = ?");
             args.push(Box::new(src.as_str().to_string()));
         }
-        if let Some(state) = f.state {
-            sql.push_str(" AND state = ?");
-            args.push(Box::new(json(&state)?));
+        if let Some(gone) = f.upstream_gone {
+            sql.push_str(" AND upstream_gone = ?");
+            args.push(Box::new(gone as i64));
         }
         if let Some(since) = f.since {
             sql.push_str(" AND occurred_at >= ?");
@@ -679,9 +1038,7 @@ impl Store {
         let conn = self.lock();
         let sig = conn
             .query_row(
-                "SELECT id, source, external_id, kind, title, body, url, actor, entities, \
-                        severity, state, occurred_at, ingested_at, thread, raw, tags \
-                 FROM signals WHERE id = ?1",
+                &format!("{SIGNAL_SELECT} WHERE id = ?1"),
                 [id],
                 row_to_signal,
             )
@@ -699,14 +1056,12 @@ impl Store {
         Ok(())
     }
 
-    pub fn signals_for_thread(&self, thread_id: &str) -> Result<Vec<Signal>> {
+    pub fn signals_for_subject(&self, subject_key: &str) -> Result<Vec<Signal>> {
         let conn = self.lock();
-        let mut stmt = conn.prepare(
-            "SELECT id, source, external_id, kind, title, body, url, actor, entities, \
-                    severity, state, occurred_at, ingested_at, thread, raw, tags \
-             FROM signals WHERE thread = ?1 ORDER BY occurred_at ASC",
-        )?;
-        let rows = stmt.query_map([thread_id], row_to_signal)?;
+        let mut stmt = conn.prepare(&format!(
+            "{SIGNAL_SELECT} WHERE subject = ?1 ORDER BY occurred_at ASC"
+        ))?;
+        let rows = stmt.query_map([subject_key], row_to_signal)?;
         collect(rows)
     }
 
@@ -723,30 +1078,23 @@ impl Store {
         let conn = self.lock();
         let escaped: String = query.chars().filter(|c| !matches!(c, '%' | '_')).collect();
         let like = format!("%{escaped}%");
-        let mut stmt = conn.prepare(
-            "SELECT id, source, external_id, kind, title, body, url, actor, entities, \
-                    severity, state, occurred_at, ingested_at, thread, raw, tags \
-             FROM signals WHERE title LIKE ?1 OR body LIKE ?1 \
-             ORDER BY occurred_at DESC LIMIT ?2",
-        )?;
+        let mut stmt = conn.prepare(&format!(
+            "{SIGNAL_SELECT} WHERE title LIKE ?1 OR body LIKE ?1 \
+             ORDER BY occurred_at DESC LIMIT ?2"
+        ))?;
         let rows = stmt.query_map(params![like, limit as i64], row_to_signal)?;
         collect(rows)
     }
 
-    pub fn set_state(&self, id: &str, state: State) -> Result<()> {
-        let conn = self.lock();
-        conn.execute(
-            "UPDATE signals SET state = ?2 WHERE id = ?1",
-            params![id, json(&state)?],
-        )?;
-        Ok(())
-    }
-
     /// Prefix marking a signal as coming from the assigned-issues watcher rather
-    /// than the notifications feed. Two watchers write GitHub signals, and each
-    /// reconciles against its own complete listing — without this split, either
-    /// one's snapshot would resolve the other's cards, since neither listing
-    /// contains the other's ids.
+    /// than the notifications feed.
+    ///
+    /// This is *only* a reconciliation scope now: each GitHub watcher is
+    /// authoritative for its own listing, and neither listing contains the other's
+    /// ids. It used to also keep one watcher's snapshot from resolving the other's
+    /// cards — a hazard that no longer exists, because both watchers key their
+    /// signals to the same subject by upstream identity rather than to a synthetic
+    /// per-watcher subject.
     pub const ASSIGNED_PREFIX: &'static str = "assigned/";
 
     /// Resolve locally active GitHub notifications that are absent from a
@@ -755,15 +1103,7 @@ impl Store {
         &self,
         active_ids: &BTreeSet<String>,
     ) -> Result<Vec<Signal>> {
-        self.resolve_missing(active_ids, false, |signal| {
-            signal
-                .raw
-                .get("thread_id")
-                .and_then(|v| v.as_str())
-                .or_else(|| signal.external_id.split_once('@').map(|(id, _)| id))
-                .unwrap_or(&signal.external_id)
-                .to_string()
-        })
+        self.resolve_missing(active_ids, false, |signal| signal.external_id.clone())
     }
 
     /// Resolve assigned-issue cards that are absent from a complete listing of
@@ -787,15 +1127,10 @@ impl Store {
         let mut conn = self.lock();
         let tx = conn.transaction()?;
         let mut candidates = {
-            let mut stmt = tx.prepare(
-                "SELECT id, source, external_id, kind, title, body, url, actor, entities, \
-                        severity, state, occurred_at, ingested_at, thread, raw, tags \
-                 FROM signals WHERE source = ?1 AND state != ?2",
-            )?;
-            let rows = stmt.query_map(
-                params![Source::GitHub.as_str(), json(&State::Resolved)?],
-                row_to_signal,
-            )?;
+            let mut stmt = tx.prepare(&format!(
+                "{SIGNAL_SELECT} WHERE source = ?1 AND upstream_gone = 0"
+            ))?;
+            let rows = stmt.query_map(params![Source::GitHub.as_str()], row_to_signal)?;
             collect(rows)?
         };
 
@@ -809,10 +1144,10 @@ impl Store {
                 continue;
             }
             tx.execute(
-                "UPDATE signals SET state = ?2 WHERE id = ?1",
-                params![signal.id, json(&State::Resolved)?],
+                "UPDATE signals SET upstream_gone = 1 WHERE id = ?1",
+                params![signal.id],
             )?;
-            signal.state = State::Resolved;
+            signal.upstream_gone = true;
             resolved.push(signal.clone());
         }
         tx.commit()?;
@@ -823,70 +1158,136 @@ impl Store {
     /// those events. Configuration, credentials, memories, context sources, and
     /// saved chats are intentionally outside this reset boundary.
     ///
-    /// Returns the number of deleted signals and the distinct thread ids that
-    /// were affected, so the caller can reset notification dedup and broadcast
-    /// the empty authoritative board.
+    /// Returns the number of deleted signals and the distinct subject keys that
+    /// were affected, so the caller can reset notification dedup and broadcast the
+    /// empty authoritative board.
     pub fn clear_board_events(&self) -> Result<(usize, Vec<String>)> {
         let mut conn = self.lock();
         let tx = conn.transaction()?;
         let mut threads = BTreeSet::new();
         {
             let mut stmt =
-                tx.prepare("SELECT DISTINCT thread FROM signals WHERE thread IS NOT NULL")?;
+                tx.prepare("SELECT DISTINCT subject FROM signals WHERE subject IS NOT NULL")?;
             let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
             for t in rows {
                 threads.insert(t?);
             }
         }
         let cleared = tx.execute("DELETE FROM signals", [])?;
-        // These tables are derived from the event/thread graph. Clearing them
-        // prevents old summaries, relation pins, hints, or recommendations from
-        // being attached to a later, unrelated board entry.
-        tx.execute("DELETE FROM thread_edges", [])?;
-        tx.execute("DELETE FROM thread_context", [])?;
-        tx.execute("DELETE FROM thread_mitigations", [])?;
+        // Everything derived from the event/subject graph goes with it. Clearing these
+        // prevents old summaries, relation pins, hints, or recommendations from being
+        // attached to a later, unrelated board entry.
+        //
+        // The rule, because getting this list wrong is invisible until it misleads someone:
+        // **anything keyed by a signal or a subject is cleared.** Subject keys are stable
+        // upstream identities (`owner/repo#412`), so the next poll re-ingests the same
+        // notification and mints the *same key* — and anything left behind under it reappears
+        // instantly on a card the operator believes is fresh.
+        tx.execute("DELETE FROM subject_edges", [])?;
+        tx.execute("DELETE FROM subject_context", [])?;
         tx.execute("DELETE FROM hints", [])?;
-        tx.execute("DELETE FROM threads", [])?;
+        // The parent/child hierarchy is derived by attribution, not chosen by anyone: a stale
+        // link would file a fresh PR card under an issue the reset removed.
+        tx.execute("DELETE FROM subject_links", [])?;
+        // Root causes and explanations are the most misleading things to leave behind — they
+        // read as conclusions about work that is, as far as the board is concerned, new.
+        tx.execute("DELETE FROM subject_root_cause", [])?;
+        tx.execute("DELETE FROM subject_explanations", [])?;
+        // Keyed by signal id, and every signal has just gone: these are orphans.
+        tx.execute("DELETE FROM browser_investigations", [])?;
+        tx.execute("DELETE FROM subjects", [])?;
         tx.commit()?;
         Ok((cleared, threads.into_iter().collect()))
     }
 
-    pub fn set_signal_thread(&self, id: &str, thread: Option<&str>) -> Result<()> {
+    pub fn set_signal_subject(&self, id: &str, subject: Option<&str>) -> Result<()> {
         let conn = self.lock();
         conn.execute(
-            "UPDATE signals SET thread = ?2 WHERE id = ?1",
-            params![id, thread],
+            "UPDATE signals SET subject = ?2 WHERE id = ?1",
+            params![id, subject],
         )?;
         Ok(())
     }
 
-    /// Thread ids still referenced by signals after their metadata row was
-    /// removed. This should never normally happen, but lets the correlator repair
-    /// an interrupted or concurrently racing merge without losing signals.
-    pub fn orphaned_thread_ids(&self) -> Result<Vec<String>> {
+    /// Pin a signal's attribution, overriding the ranked climb. `None` pins it to
+    /// the unattributed lane.
+    pub fn pin_attribution(
+        &self,
+        signal_id: &str,
+        subject: Option<&crate::subject::SubjectKey>,
+    ) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "INSERT INTO attribution_pins (signal_id, subject, created_at) VALUES (?1,?2,?3) \
+             ON CONFLICT(signal_id) DO UPDATE SET subject=excluded.subject, \
+             created_at=excluded.created_at",
+            params![
+                signal_id,
+                subject.map(|k| k.as_str()),
+                Utc::now().to_rfc3339()
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// The pinned attribution for a signal: `Some(None)` is "pinned to nothing",
+    /// `None` is "no pin". The distinction is the whole point.
+    #[allow(clippy::option_option)]
+    pub fn attribution_pin(&self, signal_id: &str) -> Result<Option<Option<String>>> {
+        let conn = self.lock();
+        conn.query_row(
+            "SELECT subject FROM attribution_pins WHERE signal_id = ?1",
+            params![signal_id],
+            |r| r.get::<_, Option<String>>(0),
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    /// Mark a signal gone upstream (or back). Distinct from operator triage.
+    pub fn set_upstream_gone(&self, id: &str, gone: bool) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE signals SET upstream_gone = ?2 WHERE id = ?1",
+            params![id, gone as i64],
+        )?;
+        Ok(())
+    }
+
+    /// Signals whose subject has no row. Under the old synthetic-thread model this
+    /// happened whenever a merge was interrupted mid-way; a subject keyed by its own
+    /// upstream identity can't be orphaned from itself, so this now only catches a
+    /// hand-deleted row — and re-creates it from the signals rather than losing them.
+    pub fn orphaned_subject_keys(&self) -> Result<Vec<String>> {
         let conn = self.lock();
         let mut stmt = conn.prepare(
-            "SELECT DISTINCT s.thread FROM signals s \
-             LEFT JOIN threads t ON t.id = s.thread \
-             WHERE s.thread IS NOT NULL AND t.id IS NULL",
+            "SELECT DISTINCT s.subject FROM signals s \
+             LEFT JOIN subjects t ON t.key = s.subject \
+             WHERE s.subject IS NOT NULL AND t.key IS NULL",
         )?;
         let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
         collect(rows)
     }
 
-    // ---- threads ------------------------------------------------------------
+    // ---- subjects -----------------------------------------------------------
 
-    pub fn upsert_thread(&self, t: &Thread) -> Result<()> {
+    pub fn upsert_subject(&self, t: &Subject) -> Result<()> {
         let conn = self.lock();
         conn.execute(
-            "INSERT INTO threads (id, title, summary, created_at, updated_at, last_reasoned_at, live, tags, tags_pinned) \
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9) \
-             ON CONFLICT(id) DO UPDATE SET \
+            "INSERT INTO subjects (key, rank, title, summary, created_at, updated_at, \
+                last_reasoned_at, live, tags, tags_pinned, handled, snoozed_until, \
+                same_as, merge_key) \
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14) \
+             ON CONFLICT(key) DO UPDATE SET \
                 title=excluded.title, summary=excluded.summary, updated_at=excluded.updated_at, \
                 last_reasoned_at=excluded.last_reasoned_at, live=excluded.live, \
-                tags=excluded.tags, tags_pinned=excluded.tags_pinned",
+                tags=excluded.tags, tags_pinned=excluded.tags_pinned, \
+                handled=excluded.handled, snoozed_until=excluded.snoozed_until, \
+                same_as=excluded.same_as, \
+                merge_key=COALESCE(excluded.merge_key, subjects.merge_key)",
             params![
-                t.id,
+                t.key.as_str(),
+                t.rank.as_str(),
                 t.title,
                 t.summary,
                 t.created_at.to_rfc3339(),
@@ -895,41 +1296,129 @@ impl Store {
                 t.live as i64,
                 json(&t.tags)?,
                 t.tags_pinned as i64,
+                t.handled.as_str(),
+                t.snoozed_until.map(|d| d.to_rfc3339()),
+                t.same_as.as_ref().map(|k| k.as_str()),
+                None::<String>,
             ],
         )?;
         Ok(())
     }
 
-    /// Cache a thread's generated mitigations (a JSON array). Overwrites any prior
-    /// set — the newest reanalysis wins.
-    pub fn set_thread_mitigations(
-        &self,
-        thread_id: &str,
-        mitigations: &serde_json::Value,
-    ) -> Result<()> {
+    /// Set the deterministic Slack-rank merge key (an environment id). Separate from
+    /// the upsert because it is set once, at creation, and must not be clobbered by
+    /// a later metadata refresh.
+    pub fn set_subject_merge_key(&self, key: &str, merge_key: &str) -> Result<()> {
         let conn = self.lock();
         conn.execute(
-            "INSERT INTO thread_mitigations (thread_id, json, created_at) VALUES (?1, ?2, ?3) \
-             ON CONFLICT(thread_id) DO UPDATE SET json=excluded.json, created_at=excluded.created_at",
-            params![thread_id, mitigations.to_string(), Utc::now().to_rfc3339()],
+            "UPDATE subjects SET merge_key = ?2 WHERE key = ?1",
+            params![key, merge_key],
         )?;
         Ok(())
     }
 
-    /// The cached mitigations for a thread, if any have been generated.
-    pub fn get_thread_mitigations(&self, thread_id: &str) -> Result<Option<serde_json::Value>> {
+    /// The Slack-rank subject already grouped under `merge_key`, if any. Two alerts
+    /// about one customer environment collapse through this without asking the LLM.
+    pub fn subject_by_merge_key(&self, merge_key: &str) -> Result<Option<Subject>> {
         let conn = self.lock();
-        let row: Option<String> = conn
-            .query_row(
-                "SELECT json FROM thread_mitigations WHERE thread_id = ?1",
-                params![thread_id],
-                |r| r.get(0),
-            )
-            .optional()?;
-        Ok(match row {
-            Some(s) => serde_json::from_str(&s).ok(),
-            None => None,
-        })
+        conn.query_row(
+            &format!(
+                "{SUBJECT_SELECT} WHERE s.merge_key = ?1 AND s.same_as IS NULL \
+                 ORDER BY s.created_at ASC LIMIT 1"
+            ),
+            params![merge_key],
+            row_to_subject,
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    /// Subjects filed under `key` — the PRs attempting an issue.
+    pub fn subject_children(&self, key: &str) -> Result<Vec<crate::subject::SubjectKey>> {
+        let conn = self.lock();
+        let mut stmt =
+            conn.prepare("SELECT child FROM subject_links WHERE parent = ?1 ORDER BY child")?;
+        let rows = stmt.query_map(params![key], |r| r.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for r in rows {
+            if let Ok(k) = crate::subject::SubjectKey::parse(&r?) {
+                out.push(k);
+            }
+        }
+        Ok(out)
+    }
+
+    /// File a PR under the issue it closes. Recorded whether or not either subject
+    /// has a row yet, because the closing keyword is a fact about GitHub — and the
+    /// signal that reveals it usually belongs to the *issue*, so waiting for the PR's
+    /// card to exist means never recording it.
+    pub fn set_subject_parent(&self, child: &str, parent: Option<&str>) -> Result<()> {
+        let conn = self.lock();
+        match parent {
+            Some(parent) => conn.execute(
+                "INSERT INTO subject_links (child, parent, created_at) VALUES (?1,?2,?3) \
+                 ON CONFLICT(child) DO UPDATE SET parent=excluded.parent",
+                params![child, parent, Utc::now().to_rfc3339()],
+            )?,
+            None => conn.execute("DELETE FROM subject_links WHERE child = ?1", params![child])?,
+        };
+        Ok(())
+    }
+
+    /// Merge `key` away into `canonical`: point it there **and move its signals**.
+    ///
+    /// Both halves are required. The board hides a subject with `same_as` set, so
+    /// setting the pointer without re-pointing the signals doesn't collapse two cards
+    /// into one — it hides one card and every signal on it.
+    ///
+    /// One transaction, because a merge that applied half of itself would leave
+    /// activity attributed to a subject nothing displays.
+    pub fn merge_subject_into(&self, key: &str, canonical: &str) -> Result<usize> {
+        if key == canonical {
+            return Ok(0);
+        }
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        tx.execute(
+            "UPDATE subjects SET same_as = ?2 WHERE key = ?1",
+            params![key, canonical],
+        )?;
+        let moved = tx.execute(
+            "UPDATE signals SET subject = ?2 WHERE subject = ?1",
+            params![key, canonical],
+        )?;
+        tx.commit()?;
+        Ok(moved)
+    }
+
+    /// Undo a merge pointer, leaving the signals where they are.
+    pub fn clear_subject_same_as(&self, key: &str) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE subjects SET same_as = NULL WHERE key = ?1",
+            params![key],
+        )?;
+        Ok(())
+    }
+
+    /// Operator triage for a subject.
+    pub fn set_handled(
+        &self,
+        key: &str,
+        handled: Handled,
+        snoozed_until: Option<DateTime<Utc>>,
+    ) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE subjects SET handled = ?2, snoozed_until = ?3, updated_at = ?4 WHERE key = ?1",
+            params![
+                key,
+                handled.as_str(),
+                snoozed_until.map(|d| d.to_rfc3339()),
+                Utc::now().to_rfc3339()
+            ],
+        )?;
+        Ok(())
     }
 
     // ---- browser investigations ---------------------------------------------
@@ -954,16 +1443,16 @@ impl Store {
             .context("browser investigation was not persisted")
     }
 
-    pub fn browser_investigations_for_thread(
+    pub fn browser_investigations_for_subject(
         &self,
-        thread_id: &str,
+        subject_key: &str,
     ) -> Result<Vec<BrowserInvestigation>> {
         let conn = self.lock();
         let mut stmt = conn.prepare(&format!(
             "{BROWSER_SELECT} JOIN signals s ON s.id=b.signal_id \
-             WHERE s.thread=?1 ORDER BY b.created_at ASC"
+             WHERE s.subject=?1 ORDER BY b.created_at ASC"
         ))?;
-        let rows = stmt.query_map([thread_id], row_to_browser_investigation)?;
+        let rows = stmt.query_map([subject_key], row_to_browser_investigation)?;
         collect(rows)
     }
 
@@ -978,46 +1467,19 @@ impl Store {
             .map_err(Into::into)
     }
 
-    /// Atomically claim the oldest pending investigation, marking it `running` so
-    /// a second worker (or a restarted one) can't pick up the same job. Only jobs
-    /// under `max_attempts` are eligible, so a link that reliably fails the
-    /// browser stops being retried forever.
-    pub fn claim_browser_investigation(
-        &self,
-        max_attempts: i64,
-    ) -> Result<Option<BrowserInvestigation>> {
+    /// Investigation ids waiting for the browser.
+    ///
+    /// A plain read, not a claim: the `BrowserRead` workflow id *is* the claim now, so
+    /// the `status` column stopped being a queue — which also ended the failure where
+    /// a worker that died left rows marked `running` forever.
+    pub fn list_browser_investigations_pending(&self) -> Result<Vec<String>> {
         let conn = self.lock();
-        let claimed: Option<String> = conn
-            .query_row(
-                "UPDATE browser_investigations SET status='running', attempts=attempts+1, updated_at=?1 \
-                 WHERE id = (SELECT id FROM browser_investigations \
-                             WHERE status='pending' AND attempts < ?2 \
-                             ORDER BY created_at ASC LIMIT 1) \
-                 RETURNING id",
-                params![Utc::now().to_rfc3339(), max_attempts],
-                |r| r.get(0),
-            )
-            .optional()?;
-        let Some(id) = claimed else {
-            return Ok(None);
-        };
-        conn.query_row(
-            &format!("{BROWSER_SELECT} LEFT JOIN signals s ON s.id=b.signal_id WHERE b.id=?1"),
-            [id],
-            row_to_browser_investigation,
-        )
-        .optional()
-        .map_err(Into::into)
-    }
-
-    /// Return any `running` job to `pending`. Called at startup: a job left
-    /// running is one the daemon died in the middle of, not one in flight.
-    pub fn requeue_running_browser_investigations(&self) -> Result<usize> {
-        let n = self.lock().execute(
-            "UPDATE browser_investigations SET status='pending', updated_at=?1 WHERE status='running'",
-            [Utc::now().to_rfc3339()],
+        let mut stmt = conn.prepare(
+            "SELECT id FROM browser_investigations WHERE status IN ('pending', 'running') \
+             ORDER BY created_at ASC",
         )?;
-        Ok(n)
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        collect(rows)
     }
 
     pub fn complete_browser_investigation(
@@ -1034,17 +1496,6 @@ impl Store {
         error: &str,
     ) -> Result<BrowserInvestigation> {
         self.finish_browser_investigation(id, "failed", None, Some(error))
-    }
-
-    /// Put a failed job back in the queue for another attempt, keeping the
-    /// recorded error so the UI can show why the last try didn't work. The
-    /// `attempts` counter is untouched, so the retry cap still applies.
-    pub fn requeue_browser_investigation(&self, id: &str) -> Result<()> {
-        self.lock().execute(
-            "UPDATE browser_investigations SET status='pending', updated_at=?2 WHERE id=?1",
-            params![id, Utc::now().to_rfc3339()],
-        )?;
-        Ok(())
     }
 
     fn finish_browser_investigation(
@@ -1097,8 +1548,8 @@ impl Store {
         conn.execute(
             "INSERT INTO repo_index \
              (full_name, description, topics, language, archived, pushed_at, readme_etag, readme, \
-              summary, indexed_sha, digest, fetched_at) \
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12) \
+              summary, indexed_sha, digest, fetched_at, kind) \
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?14) \
              ON CONFLICT(full_name) DO UPDATE SET \
                description=excluded.description, topics=excluded.topics, language=excluded.language, \
                archived=excluded.archived, pushed_at=excluded.pushed_at, fetched_at=excluded.fetched_at, \
@@ -1106,7 +1557,9 @@ impl Store {
                readme      =CASE WHEN ?13 THEN excluded.readme      ELSE readme      END, \
                summary     =CASE WHEN ?13 THEN excluded.summary     ELSE summary     END, \
                indexed_sha =CASE WHEN ?13 THEN excluded.indexed_sha ELSE indexed_sha END, \
-               digest      =CASE WHEN ?13 THEN excluded.digest      ELSE digest      END",
+               digest      =CASE WHEN ?13 THEN excluded.digest      ELSE digest      END, \
+               -- A pinned kind is the operator's answer and the crawl must not overwrite it.
+               kind        =CASE WHEN kind_pinned THEN kind ELSE excluded.kind END",
             params![
                 repo.full_name,
                 repo.description,
@@ -1121,6 +1574,7 @@ impl Store {
                 repo.digest,
                 repo.fetched_at,
                 recharacterized,
+                repo.kind.as_ref().map(|k| k.as_str()),
             ],
         )?;
         Ok(())
@@ -1132,14 +1586,15 @@ impl Store {
         self.lock().execute(
             "INSERT INTO issue_pr_fixes \
              (issue_key, pr_repo, pr_number, pr_title, pr_url, pr_author, pr_state, files, \
-              verdict, confidence, implementation, critique, also_fixes, analyzed_by, \
-              created_at, updated_at) \
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?15) \
+              verdict, confidence, implementation, critique, conversation, also_fixes, \
+              analyzed_by, created_at, updated_at) \
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?16) \
              ON CONFLICT(issue_key, pr_repo, pr_number) DO UPDATE SET \
                pr_title=excluded.pr_title, pr_url=excluded.pr_url, pr_author=excluded.pr_author, \
                pr_state=excluded.pr_state, files=excluded.files, verdict=excluded.verdict, \
                confidence=excluded.confidence, implementation=excluded.implementation, \
-               critique=excluded.critique, also_fixes=excluded.also_fixes, \
+               critique=excluded.critique, conversation=excluded.conversation, \
+               also_fixes=excluded.also_fixes, \
                analyzed_by=excluded.analyzed_by, updated_at=excluded.updated_at",
             params![
                 f.issue_key,
@@ -1154,6 +1609,7 @@ impl Store {
                 f.confidence,
                 f.implementation,
                 f.critique,
+                f.conversation,
                 json(&f.also_fixes)?,
                 f.analyzed_by,
                 Utc::now().to_rfc3339(),
@@ -1188,11 +1644,12 @@ impl Store {
         collect(rows)
     }
 
-    /// The thread an issue's signals belong to, if any.
-    pub fn thread_for_issue(&self, issue_key: &str) -> Result<Option<String>> {
+    /// The subject an issue's signals belong to, if any.
+    pub fn subject_for_issue(&self, issue_key: &str) -> Result<Option<String>> {
         self.lock()
             .query_row(
-                "SELECT s.thread FROM issue_triage t JOIN signals s ON s.id = t.signal_id                  WHERE t.issue_key = ?1 AND s.thread IS NOT NULL LIMIT 1",
+                "SELECT s.subject FROM issue_triage t JOIN signals s ON s.id = t.signal_id \
+                 WHERE t.issue_key = ?1 AND s.subject IS NOT NULL LIMIT 1",
                 [issue_key],
                 |r| r.get(0),
             )
@@ -1481,14 +1938,14 @@ impl Store {
             .map_err(Into::into)
     }
 
-    /// Triage rows for the issues on one thread, matched through their signals.
-    pub fn issue_triage_for_thread(&self, thread_id: &str) -> Result<Vec<IssueTriage>> {
+    /// Triage rows for the issues on one subject, matched through their signals.
+    pub fn issue_triage_for_subject(&self, subject_key: &str) -> Result<Vec<IssueTriage>> {
         let conn = self.lock();
         let mut stmt = conn.prepare(&format!(
-            "{TRIAGE_SELECT} WHERE signal_id IN (SELECT id FROM signals WHERE thread=?1) \
+            "{TRIAGE_SELECT} WHERE signal_id IN (SELECT id FROM signals WHERE subject=?1) \
              ORDER BY updated_at DESC"
         ))?;
-        let rows = stmt.query_map([thread_id], row_to_issue_triage)?;
+        let rows = stmt.query_map([subject_key], row_to_issue_triage)?;
         collect(rows)
     }
 
@@ -1497,42 +1954,6 @@ impl Store {
         let mut stmt = conn.prepare(&format!("{TRIAGE_SELECT} ORDER BY updated_at DESC"))?;
         let rows = stmt.query_map([], row_to_issue_triage)?;
         collect(rows)
-    }
-
-    /// Claim the oldest un-triaged issue, marking it `running` so a restart or a
-    /// second worker doesn't redo it.
-    pub fn claim_issue_triage(&self) -> Result<Option<IssueTriage>> {
-        let conn = self.lock();
-        let claimed: Option<String> = conn
-            .query_row(
-                "UPDATE issue_triage SET status='running', updated_at=?1 \
-                 WHERE issue_key = (SELECT issue_key FROM issue_triage \
-                                    WHERE status='pending' ORDER BY created_at ASC LIMIT 1) \
-                 RETURNING issue_key",
-                [Utc::now().to_rfc3339()],
-                |r| r.get(0),
-            )
-            .optional()?;
-        let Some(key) = claimed else {
-            return Ok(None);
-        };
-        conn.query_row(
-            &format!("{TRIAGE_SELECT} WHERE issue_key=?1"),
-            [key],
-            row_to_issue_triage,
-        )
-        .optional()
-        .map_err(Into::into)
-    }
-
-    /// Return `running` rows to `pending` — a triage left running is one the
-    /// daemon died inside.
-    pub fn requeue_running_issue_triage(&self) -> Result<usize> {
-        let n = self.lock().execute(
-            "UPDATE issue_triage SET status='pending', updated_at=?1 WHERE status='running'",
-            [Utc::now().to_rfc3339()],
-        )?;
-        Ok(n)
     }
 
     /// Queue an issue for triage unless it already has usable analysis. Returns
@@ -1602,15 +2023,15 @@ impl Store {
 
     pub fn put_root_cause(&self, r: &RootCauseReport) -> Result<()> {
         self.lock().execute(
-            "INSERT INTO thread_root_cause \
-             (thread_id, status, symptoms, repos, candidates, verdict, error, created_at, updated_at) \
+            "INSERT INTO subject_root_cause \
+             (subject_key, status, symptoms, repos, candidates, verdict, error, created_at, updated_at) \
              VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?8) \
-             ON CONFLICT(thread_id) DO UPDATE SET \
+             ON CONFLICT(subject_key) DO UPDATE SET \
                status=excluded.status, symptoms=excluded.symptoms, repos=excluded.repos, \
                candidates=excluded.candidates, verdict=excluded.verdict, error=excluded.error, \
                updated_at=excluded.updated_at",
             params![
-                r.thread_id,
+                r.subject_key,
                 r.status,
                 json(&r.symptoms)?,
                 json(&r.repos)?,
@@ -1623,75 +2044,87 @@ impl Store {
         Ok(())
     }
 
-    pub fn get_root_cause(&self, thread_id: &str) -> Result<Option<RootCauseReport>> {
+    pub fn get_root_cause(&self, subject_key: &str) -> Result<Option<RootCauseReport>> {
         self.lock()
             .query_row(
-                "SELECT thread_id, status, symptoms, repos, candidates, verdict, error, created_at, updated_at \
-                 FROM thread_root_cause WHERE thread_id=?1",
-                [thread_id],
+                "SELECT subject_key, status, symptoms, repos, candidates, verdict, error, created_at, updated_at \
+                 FROM subject_root_cause WHERE subject_key=?1",
+                [subject_key],
                 row_to_root_cause,
             )
             .optional()
             .map_err(Into::into)
     }
 
-    /// Move a report from one thread to another — called when threads merge, so
-    /// the surviving thread keeps the investigation rather than losing it with
-    /// the thread that was collapsed.
+    /// Move a report from one subject to another — called when subjects merge, so
+    /// the surviving subject keeps the investigation rather than losing it with
+    /// the subject that was collapsed.
     pub fn move_root_cause(&self, from: &str, to: &str) -> Result<()> {
         self.lock().execute(
-            "UPDATE OR REPLACE thread_root_cause SET thread_id=?2 WHERE thread_id=?1",
+            "UPDATE OR REPLACE subject_root_cause SET subject_key=?2 WHERE subject_key=?1",
             params![from, to],
         )?;
         Ok(())
     }
 
-    /// Set a thread's tags. `pinned` marks them human-authored so the classifier
+    /// Set a subject's tags. `pinned` marks them human-authored so the classifier
     /// won't overwrite them on the next pass.
-    pub fn set_thread_tags(&self, id: &str, tags: &[String], pinned: bool) -> Result<()> {
+    pub fn set_subject_tags(&self, id: &str, tags: &[String], pinned: bool) -> Result<()> {
         let conn = self.lock();
         conn.execute(
-            "UPDATE threads SET tags=?2, tags_pinned=?3 WHERE id=?1",
+            "UPDATE subjects SET tags=?2, tags_pinned=?3 WHERE key=?1",
             params![id, json(&tags)?, pinned as i64],
         )?;
         Ok(())
     }
 
-    pub fn get_thread(&self, id: &str) -> Result<Option<Thread>> {
+    pub fn get_subject(&self, id: &str) -> Result<Option<Subject>> {
         let conn = self.lock();
         Ok(conn
             .query_row(
-                "SELECT id, title, summary, created_at, updated_at, last_reasoned_at, live, tags, tags_pinned \
-                 FROM threads WHERE id = ?1",
+                &format!("{SUBJECT_SELECT} WHERE s.key = ?1"),
                 [id],
-                row_to_thread,
+                row_to_subject,
             )
             .optional()?)
     }
 
-    pub fn list_threads(&self) -> Result<Vec<Thread>> {
+    pub fn list_subjects(&self) -> Result<Vec<Subject>> {
         let conn = self.lock();
-        let mut stmt = conn.prepare(
-            "SELECT id, title, summary, created_at, updated_at, last_reasoned_at, live, tags, tags_pinned \
-             FROM threads ORDER BY updated_at DESC",
-        )?;
-        let rows = stmt.query_map([], row_to_thread)?;
+        let mut stmt = conn.prepare(&format!("{SUBJECT_SELECT} ORDER BY s.updated_at DESC"))?;
+        let rows = stmt.query_map([], row_to_subject)?;
         collect(rows)
     }
 
-    /// Delete a thread if it has no member signals. Returns whether it was removed.
-    pub fn delete_thread_if_empty(&self, id: &str) -> Result<bool> {
+    /// Delete a subject if it has no member signals. Returns whether it was removed.
+    pub fn delete_subject_if_empty(&self, id: &str) -> Result<bool> {
         let conn = self.lock();
+        // A merged-away subject with no signals is not an empty subject — it is the
+        // forwarding tombstone. Deleting it drops the `same_as` pointer, so the *next*
+        // message addressed to it would mint a fresh subject instead of forwarding, and
+        // the board would grow a second card for work already filed elsewhere. That
+        // failure surfaces one message after the merge, nowhere near the merge.
+        let merged_away: bool = conn
+            .query_row(
+                "SELECT same_as IS NOT NULL FROM subjects WHERE key = ?1",
+                [id],
+                |r| r.get(0),
+            )
+            .optional()?
+            .unwrap_or(false);
+        if merged_away {
+            return Ok(false);
+        }
         let count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM signals WHERE thread = ?1",
+            "SELECT COUNT(*) FROM signals WHERE subject = ?1",
             [id],
             |r| r.get(0),
         )?;
         if count == 0 {
-            conn.execute("DELETE FROM threads WHERE id = ?1", [id])?;
-            conn.execute("DELETE FROM thread_context WHERE thread_id = ?1", [id])?;
+            conn.execute("DELETE FROM subjects WHERE key = ?1", [id])?;
+            conn.execute("DELETE FROM subject_context WHERE subject_key = ?1", [id])?;
             conn.execute(
-                "DELETE FROM thread_edges WHERE thread_a = ?1 OR thread_b = ?1",
+                "DELETE FROM subject_edges WHERE subject_a = ?1 OR subject_b = ?1",
                 [id],
             )?;
             Ok(true)
@@ -1700,7 +2133,7 @@ impl Store {
         }
     }
 
-    pub fn set_thread_summary(
+    pub fn set_subject_summary(
         &self,
         id: &str,
         summary: &str,
@@ -1708,16 +2141,16 @@ impl Store {
     ) -> Result<()> {
         let conn = self.lock();
         conn.execute(
-            "UPDATE threads SET summary=?2, last_reasoned_at=?3, updated_at=?3 WHERE id=?1",
+            "UPDATE subjects SET summary=?2, last_reasoned_at=?3, updated_at=?3 WHERE key=?1",
             params![id, summary, reasoned_at.to_rfc3339()],
         )?;
         Ok(())
     }
 
-    pub fn set_thread_live(&self, id: &str, live: bool) -> Result<()> {
+    pub fn set_subject_live(&self, id: &str, live: bool) -> Result<()> {
         let conn = self.lock();
         conn.execute(
-            "UPDATE threads SET live=?2 WHERE id=?1",
+            "UPDATE subjects SET live=?2 WHERE key=?1",
             params![id, live as i64],
         )?;
         Ok(())
@@ -1733,7 +2166,7 @@ impl Store {
         if e.provenance == Provenance::Llm {
             let existing: Option<String> = conn
                 .query_row(
-                    "SELECT provenance FROM thread_edges WHERE thread_a=?1 AND thread_b=?2",
+                    "SELECT provenance FROM subject_edges WHERE subject_a=?1 AND subject_b=?2",
                     params![a, b],
                     |r| r.get(0),
                 )
@@ -1743,9 +2176,9 @@ impl Store {
             }
         }
         conn.execute(
-            "INSERT INTO thread_edges (thread_a, thread_b, kind, provenance, confidence, rationale, signals, created_at) \
+            "INSERT INTO subject_edges (subject_a, subject_b, kind, provenance, confidence, rationale, signals, created_at) \
              VALUES (?1,?2,?3,?4,?5,?6,?7,?8) \
-             ON CONFLICT(thread_a, thread_b) DO UPDATE SET \
+             ON CONFLICT(subject_a, subject_b) DO UPDATE SET \
                 kind=excluded.kind, provenance=excluded.provenance, confidence=excluded.confidence, \
                 rationale=excluded.rationale, signals=excluded.signals, created_at=excluded.created_at",
             params![
@@ -1762,11 +2195,11 @@ impl Store {
         Ok(())
     }
 
-    pub fn edges_for_thread(&self, id: &str) -> Result<Vec<Edge>> {
+    pub fn edges_for_subject(&self, id: &str) -> Result<Vec<Edge>> {
         let conn = self.lock();
         let mut stmt = conn.prepare(
-            "SELECT thread_a, thread_b, kind, provenance, confidence, rationale, signals, created_at \
-             FROM thread_edges WHERE thread_a=?1 OR thread_b=?1",
+            "SELECT subject_a, subject_b, kind, provenance, confidence, rationale, signals, created_at \
+             FROM subject_edges WHERE subject_a=?1 OR subject_b=?1",
         )?;
         let rows = stmt.query_map([id], row_to_edge)?;
         collect(rows)
@@ -1777,8 +2210,8 @@ impl Store {
         let conn = self.lock();
         Ok(conn
             .query_row(
-                "SELECT thread_a, thread_b, kind, provenance, confidence, rationale, signals, created_at \
-                 FROM thread_edges WHERE thread_a=?1 AND thread_b=?2",
+                "SELECT subject_a, subject_b, kind, provenance, confidence, rationale, signals, created_at \
+                 FROM subject_edges WHERE subject_a=?1 AND subject_b=?2",
                 params![a, b],
                 row_to_edge,
             )
@@ -1788,23 +2221,23 @@ impl Store {
     pub fn all_edges(&self) -> Result<Vec<Edge>> {
         let conn = self.lock();
         let mut stmt = conn.prepare(
-            "SELECT thread_a, thread_b, kind, provenance, confidence, rationale, signals, created_at \
-             FROM thread_edges",
+            "SELECT subject_a, subject_b, kind, provenance, confidence, rationale, signals, created_at \
+             FROM subject_edges",
         )?;
         let rows = stmt.query_map([], row_to_edge)?;
         collect(rows)
     }
 
-    // ---- per-thread context -------------------------------------------------
+    // ---- per-subject context -------------------------------------------------
 
-    pub fn add_thread_context(&self, c: &ThreadContext) -> Result<()> {
+    pub fn add_subject_context(&self, c: &SubjectContext) -> Result<()> {
         let conn = self.lock();
         conn.execute(
-            "INSERT INTO thread_context (id, thread_id, kind, content, summary, created_at) \
+            "INSERT INTO subject_context (id, subject_key, kind, content, summary, created_at) \
              VALUES (?1,?2,?3,?4,?5,?6)",
             params![
                 c.id,
-                c.thread_id,
+                c.subject_key,
                 c.kind.as_str(),
                 c.content,
                 c.summary,
@@ -1814,13 +2247,13 @@ impl Store {
         Ok(())
     }
 
-    pub fn thread_context(&self, thread_id: &str) -> Result<Vec<ThreadContext>> {
+    pub fn subject_context(&self, subject_key: &str) -> Result<Vec<SubjectContext>> {
         let conn = self.lock();
         let mut stmt = conn.prepare(
-            "SELECT id, thread_id, kind, content, summary, created_at \
-             FROM thread_context WHERE thread_id=?1 ORDER BY created_at ASC",
+            "SELECT id, subject_key, kind, content, summary, created_at \
+             FROM subject_context WHERE subject_key=?1 ORDER BY created_at ASC",
         )?;
-        let rows = stmt.query_map([thread_id], row_to_thread_context)?;
+        let rows = stmt.query_map([subject_key], row_to_subject_context)?;
         collect(rows)
     }
 
@@ -2076,7 +2509,7 @@ impl Store {
         Ok(())
     }
 
-    /// Rewrite a tag across all tagged content — contexts, memories, threads, and
+    /// Rewrite a tag across all tagged content — contexts, memories, subjects, and
     /// signals. `into = Some(x)` renames/merges `from`→`x` (de-duplicated, pin
     /// flags preserved); `into = None` strips the tag. Returns the rows changed.
     /// The vocabulary row itself is managed by the caller (delete/ensure).
@@ -2094,9 +2527,13 @@ impl Store {
                 changed += 1;
             }
         }
-        for t in self.list_threads()? {
+        for t in self.list_subjects()? {
             if t.tags.iter().any(|x| x == from) {
-                self.set_thread_tags(&t.id, &remap_tags(&t.tags, from, into), t.tags_pinned)?;
+                self.set_subject_tags(
+                    t.key.as_str(),
+                    &remap_tags(&t.tags, from, into),
+                    t.tags_pinned,
+                )?;
                 changed += 1;
             }
         }
@@ -2111,11 +2548,7 @@ impl Store {
     /// kebab-case alphanumerics, so the substring match has no false positives.
     fn signals_with_tag(&self, tag: &str) -> Result<Vec<Signal>> {
         let conn = self.lock();
-        let mut stmt = conn.prepare(
-            "SELECT id, source, external_id, kind, title, body, url, actor, entities, \
-                    severity, state, occurred_at, ingested_at, thread, raw, tags \
-             FROM signals WHERE tags LIKE ?1",
-        )?;
+        let mut stmt = conn.prepare(&format!("{SIGNAL_SELECT} WHERE tags LIKE ?1"))?;
         let pattern = format!("%\"{tag}\"%");
         let rows = stmt.query_map([pattern], row_to_signal)?;
         collect(rows)
@@ -2126,7 +2559,7 @@ impl Store {
     pub fn put_hint(&self, h: &Hint) -> Result<()> {
         let conn = self.lock();
         conn.execute(
-            "INSERT INTO hints (id, thread_id, kind, flag_type, text, rationale, citations, confidence, state, created_at) \
+            "INSERT INTO hints (id, subject_key, kind, flag_type, text, rationale, citations, confidence, state, created_at) \
              VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10) \
              ON CONFLICT(id) DO UPDATE SET \
                 kind=excluded.kind, flag_type=excluded.flag_type, text=excluded.text, \
@@ -2134,7 +2567,7 @@ impl Store {
                 state=excluded.state",
             params![
                 h.id,
-                h.thread_id,
+                h.subject_key,
                 h.kind.as_str(),
                 h.flag_type.map(|f| f.as_str()),
                 h.text,
@@ -2152,7 +2585,7 @@ impl Store {
         let conn = self.lock();
         Ok(conn
             .query_row(
-                "SELECT id, thread_id, kind, flag_type, text, rationale, citations, confidence, state, created_at \
+                "SELECT id, subject_key, kind, flag_type, text, rationale, citations, confidence, state, created_at \
                  FROM hints WHERE id=?1",
                 [id],
                 row_to_hint,
@@ -2160,21 +2593,21 @@ impl Store {
             .optional()?)
     }
 
-    /// Active hints, optionally scoped to one thread.
-    pub fn list_hints(&self, thread_id: Option<&str>) -> Result<Vec<Hint>> {
+    /// Active hints, optionally scoped to one subject.
+    pub fn list_hints(&self, subject_key: Option<&str>) -> Result<Vec<Hint>> {
         let conn = self.lock();
         let mut out = Vec::new();
-        if let Some(tid) = thread_id {
+        if let Some(tid) = subject_key {
             let mut stmt = conn.prepare(
-                "SELECT id, thread_id, kind, flag_type, text, rationale, citations, confidence, state, created_at \
-                 FROM hints WHERE thread_id=?1 AND state='active' ORDER BY created_at DESC",
+                "SELECT id, subject_key, kind, flag_type, text, rationale, citations, confidence, state, created_at \
+                 FROM hints WHERE subject_key=?1 AND state='active' ORDER BY created_at DESC",
             )?;
             for r in stmt.query_map([tid], row_to_hint)? {
                 out.push(r?);
             }
         } else {
             let mut stmt = conn.prepare(
-                "SELECT id, thread_id, kind, flag_type, text, rationale, citations, confidence, state, created_at \
+                "SELECT id, subject_key, kind, flag_type, text, rationale, citations, confidence, state, created_at \
                  FROM hints WHERE state='active' ORDER BY created_at DESC",
             )?;
             for r in stmt.query_map([], row_to_hint)? {
@@ -2192,11 +2625,11 @@ impl Store {
         Ok(())
     }
 
-    /// Clear a thread's active hints before a fresh live-assist pass re-populates them.
-    pub fn clear_active_hints(&self, thread_id: &str) -> Result<()> {
+    /// Clear a subject's active hints before a fresh live-assist pass re-populates them.
+    pub fn clear_active_hints(&self, subject_key: &str) -> Result<()> {
         self.lock().execute(
-            "DELETE FROM hints WHERE thread_id=?1 AND state='active'",
-            [thread_id],
+            "DELETE FROM hints WHERE subject_key=?1 AND state='active'",
+            [subject_key],
         )?;
         Ok(())
     }
@@ -2243,37 +2676,551 @@ impl Store {
         collect(rows)
     }
 
-    // ---- credentials --------------------------------------------------------
+    // ---- the code index -----------------------------------------------------
 
-    /// Fetch a stored secret by account name. Returns `Ok(None)` when absent.
-    pub fn credential_get(&self, account: &str) -> Result<Option<String>> {
+    /// Store a commit's summary. Keyed by sha, so this is written once per commit.
+    pub fn put_commit_summary(
+        &self,
+        full_name: &str,
+        sha: &str,
+        summary: &str,
+        components: &[String],
+        embedding: Option<&[u8]>,
+        model: Option<&str>,
+    ) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "INSERT INTO commit_summaries (full_name, sha, summary, components, embedding, \
+                model, created_at) VALUES (?1,?2,?3,?4,?5,?6,?7) \
+             ON CONFLICT(full_name, sha) DO UPDATE SET summary=excluded.summary, \
+                components=excluded.components, embedding=excluded.embedding, \
+                model=excluded.model",
+            params![
+                full_name,
+                sha,
+                summary,
+                json(&components)?,
+                embedding,
+                model,
+                Utc::now().to_rfc3339()
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Shas in `full_name` that have no summary yet, oldest first.
+    ///
+    /// Oldest first on purpose: indexing runs in bounded batches, and a cause precedes
+    /// its symptom — so the commits most likely to explain something are the ones
+    /// already in the window, not the ones arriving now.
+    pub fn commits_needing_summary(
+        &self,
+        full_name: &str,
+        limit: usize,
+    ) -> Result<Vec<CommitEntry>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT c.full_name, c.sha, c.author, c.committed_at, c.message, c.url, c.files \
+             FROM repo_commits c \
+             LEFT JOIN commit_summaries s ON s.full_name = c.full_name AND s.sha = c.sha \
+             WHERE c.full_name = ?1 AND s.sha IS NULL \
+             ORDER BY c.committed_at ASC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![full_name, limit as i64], row_to_commit)?;
+        collect(rows)
+    }
+
+    /// How much of a repo's commit window is summarized — the progress the board shows
+    /// while a one-time index is still running.
+    pub fn commit_index_progress(&self, full_name: &str) -> Result<(i64, i64)> {
+        let conn = self.lock();
+        let total: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM repo_commits WHERE full_name = ?1",
+            params![full_name],
+            |r| r.get(0),
+        )?;
+        let done: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM commit_summaries WHERE full_name = ?1",
+            params![full_name],
+            |r| r.get(0),
+        )?;
+        Ok((done, total))
+    }
+
+    /// Every commit summary with an embedding, for the semantic pass. `repos` empty
+    /// means the whole index.
+    pub fn commit_summary_embeddings(
+        &self,
+        repos: &[String],
+    ) -> Result<Vec<(CommitSummary, Vec<u8>)>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT full_name, sha, summary, components, embedding FROM commit_summaries \
+             WHERE embedding IS NOT NULL",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                CommitSummary {
+                    full_name: r.get(0)?,
+                    sha: r.get(1)?,
+                    summary: r.get(2)?,
+                    components: from_json::<Vec<String>>(r, 3)?,
+                },
+                r.get::<_, Vec<u8>>(4)?,
+            ))
+        })?;
+        let all: Vec<(CommitSummary, Vec<u8>)> = collect(rows)?;
+        Ok(if repos.is_empty() {
+            all
+        } else {
+            all.into_iter()
+                .filter(|(c, _)| repos.contains(&c.full_name))
+                .collect()
+        })
+    }
+
+    /// Commit summaries whose text or changed paths match `term`, for the lexical pass.
+    pub fn search_commit_summaries(&self, term: &str, limit: usize) -> Result<Vec<CommitSummary>> {
+        let conn = self.lock();
+        let like = format!("%{term}%");
+        let mut stmt = conn.prepare(
+            "SELECT s.full_name, s.sha, s.summary, s.components FROM commit_summaries s \
+             JOIN repo_commits c ON c.full_name = s.full_name AND c.sha = s.sha \
+             WHERE s.summary LIKE ?1 OR c.message LIKE ?1 OR c.files LIKE ?1 \
+             ORDER BY c.committed_at DESC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![like, limit as i64], |r| {
+            Ok(CommitSummary {
+                full_name: r.get(0)?,
+                sha: r.get(1)?,
+                summary: r.get(2)?,
+                components: from_json::<Vec<String>>(r, 3)?,
+            })
+        })?;
+        collect(rows)
+    }
+
+    pub fn put_component_summary(
+        &self,
+        c: &ComponentSummary,
+        embedding: Option<&[u8]>,
+    ) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "INSERT INTO component_summaries (full_name, path, purpose, symptoms, digest, \
+                embedding, indexed_sha, created_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8) \
+             ON CONFLICT(full_name, path) DO UPDATE SET purpose=excluded.purpose, \
+                symptoms=excluded.symptoms, digest=excluded.digest, \
+                embedding=excluded.embedding, indexed_sha=excluded.indexed_sha",
+            params![
+                c.full_name,
+                c.path,
+                c.purpose,
+                c.symptoms,
+                c.digest,
+                embedding,
+                c.indexed_sha,
+                Utc::now().to_rfc3339()
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn components_for_repo(&self, full_name: &str) -> Result<Vec<ComponentSummary>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT full_name, path, purpose, symptoms, digest, indexed_sha \
+             FROM component_summaries WHERE full_name = ?1 ORDER BY path",
+        )?;
+        let rows = stmt.query_map(params![full_name], row_to_component)?;
+        collect(rows)
+    }
+
+    /// Per-repo index progress for the whole watched org, in one query.
+    ///
+    /// One query rather than a loop of `commit_index_progress` + `components_for_repo` +
+    /// `repo_deps` per repo: at 147 repos that is 600 round trips behind a single mutex, on a
+    /// panel that repaints whenever anything changes.
+    pub fn index_progress_all(&self) -> Result<Vec<RepoIndexProgress>> {
+        let conn = self.lock();
+        // Column order is load-bearing — the mapper below reads by index — so the two are kept
+        // adjacent and numbered in the comment. Inserting a column in the middle silently
+        // shifts every field after it, which is a class of bug the compiler cannot catch.
+        let mut stmt = conn.prepare(
+            "SELECT r.full_name,                                              -- 0
+                    r.summary,                                                -- 1
+                    r.language,                                               -- 2
+                    r.archived,                                               -- 3
+                    r.indexed_sha,                                            -- 4
+                    r.kind,                                                   -- 5
+                    r.kind_pinned,                                            -- 6
+                    (SELECT COUNT(*) FROM component_summaries c
+                      WHERE c.full_name = r.full_name),                       -- 7
+                    (SELECT COUNT(*) FROM repo_commits k
+                      WHERE k.full_name = r.full_name),                       -- 8
+                    (SELECT COUNT(*) FROM commit_summaries s
+                      WHERE s.full_name = r.full_name),                       -- 9
+                    (SELECT COUNT(*) FROM repo_deps d
+                      WHERE d.from_repo = r.full_name),                       -- 10
+                    (SELECT COUNT(*) FROM repo_deps d
+                      WHERE d.to_repo = r.full_name),                         -- 11
+                    -- The actual oldest cached commit, not the walk cursor: once the walk
+                    -- reaches the root, the cursor is parked at an epoch completion sentinel
+                    -- which must never be presented as repository history.
+                    (SELECT MIN(k.committed_at) FROM repo_commits k
+                      WHERE k.full_name = r.full_name),                       -- 12
+                    (SELECT MAX(k.committed_at) FROM repo_commits k
+                      WHERE k.full_name = r.full_name)                        -- 13
+             FROM repo_index r ORDER BY r.full_name",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(RepoIndexProgress {
+                full_name: r.get(0)?,
+                summary: r.get(1)?,
+                language: r.get(2)?,
+                archived: r.get::<_, i64>(3)? != 0,
+                indexed_sha: r.get(4)?,
+                kind: r
+                    .get::<_, Option<String>>(5)?
+                    .and_then(|k| RepoKind::parse(&k)),
+                kind_pinned: r.get::<_, i64>(6)? != 0,
+                components: r.get(7)?,
+                commits_cached: r.get(8)?,
+                commits_summarized: r.get(9)?,
+                depends_on: r.get(10)?,
+                depended_on_by: r.get(11)?,
+                history_back_to: r.get(12)?,
+                last_commit: r.get(13)?,
+            })
+        })?;
+        collect(rows)
+    }
+
+    /// Fill in the kind for repos that have none, from the name-and-topics guess.
+    ///
+    /// Needed because the guess is applied when the crawl *writes* a row, so repos already in the
+    /// index keep a NULL kind until their next crawl — which for a daily cadence means the
+    /// grouping looks broken for a day after the feature ships.
+    ///
+    /// Only ever fills a NULL on an unpinned row: it cannot overwrite a human's tag, and it
+    /// cannot change its mind about one it already guessed. That makes it safe to run at every
+    /// boot, which is also what makes it self-healing rather than a one-shot to remember.
+    ///
+    /// Returns how many rows it filled.
+    pub fn backfill_repo_kinds(&self) -> Result<usize> {
+        let repos = self.list_repos()?;
+        let mut filled = 0usize;
+        for repo in repos {
+            if repo.kind.is_some() || repo.kind_pinned {
+                continue;
+            }
+            let Some(kind) = RepoKind::guess(&repo.full_name, &repo.topics) else {
+                continue;
+            };
+            self.put_repo_kind_guess(&repo.full_name, kind)?;
+            filled += 1;
+        }
+        Ok(filled)
+    }
+
+    /// Record a *guessed* kind — from the keyword heuristic or the local model.
+    ///
+    /// Deliberately not `set_repo_kind`, which pins. A guess must stay revisable: the next crawl
+    /// may know better, and the operator's answer has to be able to win without a fight.
+    pub fn put_repo_kind_guess(&self, full_name: &str, kind: RepoKind) -> Result<()> {
+        self.lock().execute(
+            "UPDATE repo_index SET kind = ?2 WHERE full_name = ?1 AND kind_pinned = 0",
+            params![full_name, kind.as_str()],
+        )?;
+        Ok(())
+    }
+
+    /// Set a repo's kind as a human decision, pinning it against the crawl's guess.
+    ///
+    /// Pinned because the alternative is worse than useless: an operator corrects a demo repo
+    /// that was mis-guessed as code, and the next crawl silently reverts it.
+    pub fn set_repo_kind(&self, full_name: &str, kind: RepoKind) -> Result<()> {
+        let n = self.lock().execute(
+            "UPDATE repo_index SET kind = ?2, kind_pinned = 1 WHERE full_name = ?1",
+            params![full_name, kind.as_str()],
+        )?;
+        if n == 0 {
+            anyhow::bail!("{full_name} is not in the repo index");
+        }
+        Ok(())
+    }
+
+    /// Drop a human's kind, handing the repo back to the name-matching guess.
+    pub fn clear_repo_kind(&self, full_name: &str) -> Result<()> {
+        self.lock().execute(
+            "UPDATE repo_index SET kind = NULL, kind_pinned = 0 WHERE full_name = ?1",
+            params![full_name],
+        )?;
+        Ok(())
+    }
+
+    /// The newest cached commit for one repo.
+    ///
+    /// Its own query rather than a filter over [`Self::index_progress_all`]: that reads every
+    /// repo in the org, and this is called once per indexer tick.
+    pub fn last_commit_at(&self, full_name: &str) -> Result<Option<String>> {
         let conn = self.lock();
         conn.query_row(
-            "SELECT secret FROM credentials WHERE account = ?1",
-            params![account],
-            |r| r.get::<_, String>(0),
+            "SELECT MAX(committed_at) FROM repo_commits WHERE full_name = ?1",
+            params![full_name],
+            |r| r.get(0),
+        )
+        .optional()
+        .map(Option::flatten)
+        .map_err(Into::into)
+    }
+
+    /// A repo's commit summaries, newest first. The drill-down for "what has it actually
+    /// read?", which is the only way to tell a thin index from a wrong one.
+    pub fn commit_summaries_for_repo(
+        &self,
+        full_name: &str,
+        limit: usize,
+    ) -> Result<Vec<CommitSummaryRow>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT s.sha, s.summary, s.components, s.model, s.created_at, \
+                    c.message, c.author, c.committed_at, c.url \
+             FROM commit_summaries s \
+             LEFT JOIN repo_commits c ON c.full_name = s.full_name AND c.sha = s.sha \
+             WHERE s.full_name = ?1 \
+             ORDER BY COALESCE(c.committed_at, s.created_at) DESC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![full_name, limit as i64], |r| {
+            let message: Option<String> = r.get(5)?;
+            Ok(CommitSummaryRow {
+                sha: r.get(0)?,
+                summary: r.get(1)?,
+                components: from_json::<Vec<String>>(r, 2)?,
+                model: r.get(3)?,
+                subject: message
+                    .as_deref()
+                    .and_then(|m| m.lines().next())
+                    .map(|l| l.trim().to_string()),
+                author: r.get(6)?,
+                committed_at: r.get(7)?,
+                url: r.get(8)?,
+            })
+        })?;
+        collect(rows)
+    }
+
+    pub fn component_embeddings(&self) -> Result<Vec<(ComponentSummary, Vec<u8>)>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT full_name, path, purpose, symptoms, digest, indexed_sha, embedding \
+             FROM component_summaries WHERE embedding IS NOT NULL",
+        )?;
+        let rows = stmt.query_map([], |r| Ok((row_to_component(r)?, r.get::<_, Vec<u8>>(6)?)))?;
+        collect(rows)
+    }
+
+    /// Replace a repo's outgoing dependency edges. Whole-set replacement because a
+    /// manifest that drops a dependency must drop the edge with it.
+    pub fn put_repo_deps(&self, from_repo: &str, edges: &[(String, String, String)]) -> Result<()> {
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        tx.execute(
+            "DELETE FROM repo_deps WHERE from_repo = ?1",
+            params![from_repo],
+        )?;
+        let now = Utc::now().to_rfc3339();
+        for (to_repo, dep_name, source) in edges {
+            tx.execute(
+                "INSERT OR REPLACE INTO repo_deps (from_repo, to_repo, dep_name, source, \
+                    created_at) VALUES (?1,?2,?3,?4,?5)",
+                params![from_repo, to_repo, dep_name, source, now],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Edges out of `repo` (what it depends on) and into it (what depends on it).
+    ///
+    /// Both directions matter: a symptom in a consumer can be caused by a change in a
+    /// dependency, and a symptom in a library shows up in whatever uses it.
+    pub fn repo_deps(&self, repo: &str) -> Result<(Vec<RepoDep>, Vec<RepoDep>)> {
+        let conn = self.lock();
+        let read = |sql: &str| -> Result<Vec<RepoDep>> {
+            let mut stmt = conn.prepare(sql)?;
+            let rows = stmt.query_map(params![repo], |r| {
+                Ok(RepoDep {
+                    from_repo: r.get(0)?,
+                    to_repo: r.get(1)?,
+                    dep_name: r.get(2)?,
+                    source: r.get(3)?,
+                })
+            })?;
+            collect(rows)
+        };
+        let out = read(
+            "SELECT from_repo, to_repo, dep_name, source FROM repo_deps WHERE from_repo = ?1",
+        )?;
+        let inbound =
+            read("SELECT from_repo, to_repo, dep_name, source FROM repo_deps WHERE to_repo = ?1")?;
+        Ok((out, inbound))
+    }
+
+    // ---- explanations -------------------------------------------------------
+
+    /// Store a distilled explanation, replacing any previous one for this subject.
+    pub fn put_explanation(
+        &self,
+        subject_key: &str,
+        watermark: &str,
+        markdown: &str,
+        produced_by: &str,
+        sources: &[String],
+        removed: &[String],
+    ) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "INSERT INTO subject_explanations (subject_key, produced_by, watermark, markdown, \
+                sources, removed, created_at) VALUES (?1,?2,?3,?4,?5,?6,?7) \
+             ON CONFLICT(subject_key, produced_by) DO UPDATE SET watermark=excluded.watermark, \
+                markdown=excluded.markdown, sources=excluded.sources, \
+                removed=excluded.removed, created_at=excluded.created_at",
+            params![
+                subject_key,
+                produced_by,
+                watermark,
+                markdown,
+                json(&sources)?,
+                json(&removed)?,
+                Utc::now().to_rfc3339()
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// One subject's explanation by a specific author ([`EXPLAIN_LOCAL`] / [`EXPLAIN_CLOUD`]).
+    pub fn get_explanation(
+        &self,
+        subject_key: &str,
+        produced_by: &str,
+    ) -> Result<Option<Explanation>> {
+        let conn = self.lock();
+        conn.query_row(
+            "SELECT subject_key, produced_by, watermark, markdown, sources, removed, created_at \
+             FROM subject_explanations WHERE subject_key = ?1 AND produced_by = ?2",
+            params![subject_key, produced_by],
+            row_to_explanation,
         )
         .optional()
         .map_err(Into::into)
     }
 
-    /// Store (or overwrite) a secret by account name.
-    pub fn credential_set(&self, account: &str, secret: &str) -> Result<()> {
+    /// The oldest commit actually cached for one repo.
+    ///
+    /// This is deliberately distinct from [`Self::commit_window`]: once a full-history walk
+    /// reaches the root, that cursor is parked at an epoch sentinel to record completion.
+    /// Operator-facing progress must keep showing the real root commit's date.
+    pub fn oldest_commit_at(&self, full_name: &str) -> Result<Option<String>> {
+        let conn = self.lock();
+        conn.query_row(
+            "SELECT MIN(committed_at) FROM repo_commits WHERE full_name = ?1",
+            [full_name],
+            |r| r.get(0),
+        )
+        .optional()
+        .map(Option::flatten)
+        .map_err(Into::into)
+    }
+
+    /// Every explanation of a subject, local first so the board's default is the one that
+    /// didn't cost anything.
+    pub fn explanations(&self, subject_key: &str) -> Result<Vec<Explanation>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT subject_key, produced_by, watermark, markdown, sources, removed, created_at \
+             FROM subject_explanations WHERE subject_key = ?1 \
+             ORDER BY CASE produced_by WHEN 'local' THEN 0 ELSE 1 END, created_at DESC",
+        )?;
+        let rows = stmt.query_map(params![subject_key], row_to_explanation)?;
+        collect(rows)
+    }
+
+    // ---- secrets ------------------------------------------------------------
+    //
+    // Raw byte access only. Sealing, unsealing, and the write-only API shape live
+    // in `secrets::Secrets` — the store deliberately doesn't know whether a value
+    // is plaintext, so there is exactly one place that can decrypt.
+
+    /// Fetch a stored secret's raw bytes. Returns `Ok(None)` when absent.
+    pub fn secret_raw(&self, name: &str) -> Result<Option<Vec<u8>>> {
+        let conn = self.lock();
+        conn.query_row(
+            "SELECT value FROM secrets WHERE name = ?1",
+            params![name],
+            |r| r.get::<_, Vec<u8>>(0),
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    /// Store (or overwrite) a secret's raw bytes, stamping `updated_at`.
+    pub fn secret_put_raw(&self, name: &str, value: &[u8]) -> Result<()> {
         let conn = self.lock();
         conn.execute(
-            "INSERT INTO credentials (account, secret) VALUES (?1, ?2) \
-             ON CONFLICT(account) DO UPDATE SET secret = excluded.secret",
-            params![account, secret],
+            "INSERT INTO secrets (name, value, updated_at) VALUES (?1, ?2, ?3) \
+             ON CONFLICT(name) DO UPDATE SET value = excluded.value, \
+             updated_at = excluded.updated_at",
+            params![name, value, Utc::now().to_rfc3339()],
         )?;
         Ok(())
     }
 
     /// Delete a secret. Missing entries are treated as success.
-    pub fn credential_delete(&self, account: &str) -> Result<()> {
+    pub fn secret_delete(&self, name: &str) -> Result<()> {
+        let conn = self.lock();
+        conn.execute("DELETE FROM secrets WHERE name = ?1", params![name])?;
+        Ok(())
+    }
+
+    /// Names of every stored secret, with when each was last written. Never
+    /// values — this is what the config page and MCP are allowed to see.
+    pub fn secret_names(&self) -> Result<Vec<(String, DateTime<Utc>)>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare("SELECT name, updated_at FROM secrets ORDER BY name")?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, parse_ts(r, 1)?)))?;
+        collect(rows)
+    }
+
+    /// Every stored secret's raw bytes, for the one caller that needs them all at
+    /// once: re-sealing on a key change, and registering values with the log
+    /// scrubber.
+    pub fn secrets_raw(&self) -> Result<Vec<(String, Vec<u8>)>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare("SELECT name, value FROM secrets")?;
+        let rows = stmt.query_map([], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?))
+        })?;
+        collect(rows)
+    }
+
+    // ---- meta ---------------------------------------------------------------
+
+    pub fn meta_get(&self, key: &str) -> Result<Option<Vec<u8>>> {
+        let conn = self.lock();
+        conn.query_row("SELECT value FROM meta WHERE key = ?1", params![key], |r| {
+            r.get::<_, Vec<u8>>(0)
+        })
+        .optional()
+        .map_err(Into::into)
+    }
+
+    pub fn meta_put(&self, key: &str, value: &[u8]) -> Result<()> {
         let conn = self.lock();
         conn.execute(
-            "DELETE FROM credentials WHERE account = ?1",
-            params![account],
+            "INSERT INTO meta (key, value) VALUES (?1, ?2) \
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![key, value],
         )?;
         Ok(())
     }
@@ -2363,10 +3310,10 @@ fn order<'a>(a: &'a str, b: &'a str) -> (&'a str, &'a str) {
 }
 
 fn normalize_edge(e: &Edge) -> (String, String, Edge) {
-    let (a, b) = order(&e.thread_a, &e.thread_b);
+    let (a, b) = order(&e.subject_a, &e.subject_b);
     let mut norm = e.clone();
-    norm.thread_a = a.to_string();
-    norm.thread_b = b.to_string();
+    norm.subject_a = a.to_string();
+    norm.subject_b = b.to_string();
     (a.to_string(), b.to_string(), norm)
 }
 
@@ -2378,36 +3325,66 @@ fn row_to_signal(row: &Row) -> rusqlite::Result<Signal> {
         id: row.get(0)?,
         source,
         external_id: row.get(2)?,
-        kind: from_json::<SignalKind>(row, 3)?,
-        title: row.get(4)?,
-        body: row.get(5)?,
-        url: row.get(6)?,
-        actor: row.get(7)?,
-        entities: from_json::<Vec<Entity>>(row, 8)?,
-        severity: from_json::<Severity>(row, 9)?,
-        state: from_json::<State>(row, 10)?,
-        occurred_at: parse_ts(row, 11)?,
-        ingested_at: parse_ts(row, 12)?,
-        thread: row.get(13)?,
+        version: row.get(3)?,
+        kind: from_json::<SignalKind>(row, 4)?,
+        title: row.get(5)?,
+        body: row.get(6)?,
+        url: row.get(7)?,
+        actor: row.get(8)?,
+        keys: from_json::<Vec<ResolutionKey>>(row, 9)?,
+        severity: from_json::<Severity>(row, 10)?,
+        upstream_gone: row.get::<_, i64>(11)? != 0,
+        occurred_at: parse_ts(row, 12)?,
+        ingested_at: parse_ts(row, 13)?,
+        subject: row.get(14)?,
         raw: {
-            let s: String = row.get(14)?;
-            serde_json::from_str(&s).map_err(|e| conv_err(14, e.to_string()))?
+            let s: String = row.get(15)?;
+            serde_json::from_str(&s).map_err(|e| conv_err(15, e.to_string()))?
         },
-        tags: from_json::<Vec<String>>(row, 15)?,
+        tags: from_json::<Vec<String>>(row, 16)?,
     })
 }
 
-fn row_to_thread(row: &Row) -> rusqlite::Result<Thread> {
-    Ok(Thread {
-        id: row.get(0)?,
-        title: row.get(1)?,
-        summary: row.get(2)?,
-        created_at: parse_ts(row, 3)?,
-        updated_at: parse_ts(row, 4)?,
-        last_reasoned_at: parse_ts_opt(row, 5)?,
-        live: row.get::<_, i64>(6)? != 0,
-        tags: from_json::<Vec<String>>(row, 7)?,
-        tags_pinned: row.get::<_, i64>(8)? != 0,
+/// Column list for [`row_to_signal`], shared so the two never drift. It was inlined at
+/// six call sites; adding `version` to five of them and missing the sixth is the kind of
+/// mistake that shows up as a decode error at runtime rather than a compile error.
+const SIGNAL_SELECT: &str = "SELECT id, source, external_id, version, kind, title, body, \
+     url, actor, keys, severity, upstream_gone, occurred_at, ingested_at, subject, raw, tags \
+     FROM signals";
+
+/// Column list for [`row_to_subject`], shared so the two never drift.
+const SUBJECT_SELECT: &str = "SELECT s.key, s.rank, s.title, s.summary, s.created_at, \
+     s.updated_at, s.last_reasoned_at, s.live, s.tags, s.tags_pinned, s.handled, \
+     s.snoozed_until, s.same_as, l.parent \
+     FROM subjects s LEFT JOIN subject_links l ON l.child = s.key";
+
+fn row_to_subject(row: &Row) -> rusqlite::Result<Subject> {
+    let raw_key: String = row.get(0)?;
+    let key = SubjectKey::parse(&raw_key)
+        .map_err(|e| conv_err(0, format!("bad subject key '{raw_key}': {e}")))?;
+    let rank_s: String = row.get(1)?;
+    let handled_s: String = row.get(10)?;
+    Ok(Subject {
+        rank: SubjectRank::parse(&rank_s).unwrap_or_else(|| key.rank()),
+        key,
+        title: row.get(2)?,
+        summary: row.get(3)?,
+        created_at: parse_ts(row, 4)?,
+        updated_at: parse_ts(row, 5)?,
+        last_reasoned_at: parse_ts_opt(row, 6)?,
+        live: row.get::<_, i64>(7)? != 0,
+        tags: from_json::<Vec<String>>(row, 8)?,
+        tags_pinned: row.get::<_, i64>(9)? != 0,
+        handled: Handled::parse(&handled_s)
+            .ok_or_else(|| conv_err(10, format!("bad handled state '{handled_s}'")))?,
+        snoozed_until: parse_ts_opt(row, 11)?,
+        same_as: row
+            .get::<_, Option<String>>(12)?
+            .and_then(|k| SubjectKey::parse(&k).ok()),
+        parent: row
+            .get::<_, Option<String>>(13)?
+            .and_then(|k| SubjectKey::parse(&k).ok()),
+        merge_key: row.get(14).ok().flatten(),
     })
 }
 
@@ -2415,8 +3392,8 @@ fn row_to_edge(row: &Row) -> rusqlite::Result<Edge> {
     let kind_s: String = row.get(2)?;
     let prov_s: String = row.get(3)?;
     Ok(Edge {
-        thread_a: row.get(0)?,
-        thread_b: row.get(1)?,
+        subject_a: row.get(0)?,
+        subject_b: row.get(1)?,
         kind: RelationKind::parse(&kind_s)
             .ok_or_else(|| conv_err(2, format!("bad relation kind '{kind_s}'")))?,
         provenance: match prov_s.as_str() {
@@ -2430,11 +3407,11 @@ fn row_to_edge(row: &Row) -> rusqlite::Result<Edge> {
     })
 }
 
-fn row_to_thread_context(row: &Row) -> rusqlite::Result<ThreadContext> {
+fn row_to_subject_context(row: &Row) -> rusqlite::Result<SubjectContext> {
     let kind_s: String = row.get(2)?;
-    Ok(ThreadContext {
+    Ok(SubjectContext {
         id: row.get(0)?,
-        thread_id: row.get(1)?,
+        subject_key: row.get(1)?,
         kind: ContextKind::parse(&kind_s)
             .ok_or_else(|| conv_err(2, format!("bad context kind '{kind_s}'")))?,
         content: row.get(3)?,
@@ -2447,7 +3424,7 @@ fn row_to_browser_investigation(row: &Row) -> rusqlite::Result<BrowserInvestigat
     Ok(BrowserInvestigation {
         id: row.get(0)?,
         signal_id: row.get(1)?,
-        thread_id: row.get(2)?,
+        subject_key: row.get(2)?,
         url: row.get(3)?,
         prompt: row.get(4)?,
         status: row.get(5)?,
@@ -2473,6 +3450,10 @@ fn row_to_repo(row: &Row) -> rusqlite::Result<RepoEntry> {
         indexed_sha: row.get(9)?,
         digest: row.get(10)?,
         fetched_at: row.get(11)?,
+        kind: row
+            .get::<_, Option<String>>(12)?
+            .and_then(|k| RepoKind::parse(&k)),
+        kind_pinned: row.get::<_, i64>(13).unwrap_or(0) != 0,
     })
 }
 
@@ -2490,10 +3471,158 @@ fn row_to_pr_fix(row: &Row) -> rusqlite::Result<PrFix> {
         confidence: row.get(9)?,
         implementation: row.get(10)?,
         critique: row.get(11)?,
-        also_fixes: from_json::<Vec<String>>(row, 12)?,
-        analyzed_by: row.get(13)?,
-        created_at: row.get(14)?,
-        updated_at: row.get(15)?,
+        conversation: row.get(12)?,
+        also_fixes: from_json::<Vec<String>>(row, 13)?,
+        analyzed_by: row.get(14)?,
+        created_at: row.get(15)?,
+        updated_at: row.get(16)?,
+    })
+}
+
+fn row_to_component(row: &Row) -> rusqlite::Result<ComponentSummary> {
+    Ok(ComponentSummary {
+        full_name: row.get(0)?,
+        path: row.get(1)?,
+        purpose: row.get(2)?,
+        symptoms: row.get(3)?,
+        digest: row.get(4)?,
+        indexed_sha: row.get(5)?,
+    })
+}
+
+/// Columns added to tables that already exist, applied idempotently.
+///
+/// `CREATE TABLE IF NOT EXISTS` **silently skips a table that is already there**, so a column
+/// added to a table in [`SCHEMA`] never reaches an existing database — and then every query
+/// naming it fails with `no such column`. That is not a hypothetical: adding `kind` to
+/// `repo_index` broke every indexer tick on a database holding 147 repos, 462 component cards
+/// and 718 commit summaries.
+///
+/// This is not a migration framework and must not become one. It handles exactly the case that
+/// needs no data transformation — **a new nullable column, or one with a default** — because
+/// that case is otherwise unserviceable without discarding the database. Anything that needs
+/// data moved, a type changed, or a constraint added is not this: bump [`SCHEMA_VERSION`] and
+/// let [`check_compatible`] refuse the database with an explanation.
+///
+/// Guarded on `PRAGMA table_info` rather than relying on the error, so a real failure is not
+/// swallowed as "already applied".
+fn add_columns(conn: &Connection) -> Result<()> {
+    // (table, column, definition)
+    const ADDED: &[(&str, &str, &str)] = &[
+        ("repo_index", "kind", "TEXT"),
+        ("repo_index", "kind_pinned", "INTEGER NOT NULL DEFAULT 0"),
+    ];
+    for (table, column, def) in ADDED {
+        if has_column(conn, table, column)? {
+            continue;
+        }
+        conn.execute(
+            &format!("ALTER TABLE {table} ADD COLUMN {column} {def}"),
+            [],
+        )
+        .with_context(|| format!("adding {table}.{column}"))?;
+        tracing::info!("store: added {table}.{column}");
+    }
+    Ok(())
+}
+
+/// Whether a table already has a column. `false` when the table itself is absent, which is the
+/// right answer: [`SCHEMA`] will have created it with the column already in place.
+fn has_column(conn: &Connection, table: &str, column: &str) -> Result<bool> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        if row.get::<_, String>(1)? == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Bumped whenever [`SCHEMA`] changes in a way an existing database can't satisfy.
+///
+/// **Which of the two mechanisms applies:** a new nullable column (or one with a default) goes
+/// in [`add_columns`] and the version stays put, because such a database *can* satisfy the new
+/// schema once the column is there. Anything else — a column that needs data moved into it, a
+/// changed type, a new constraint, a renamed table — bumps this, and the database is refused
+/// with an explanation.
+///
+/// Getting that choice wrong is silent in the worst way. Adding `kind` to `repo_index` without
+/// either mechanism left the column existing only for fresh databases, and every indexer tick on
+/// an existing one failed with `no such column` — while the version check happily reported the
+/// database as current.
+///
+/// There is deliberately **no migration path** — this is a local, rebuildable cache of
+/// upstream state, and carrying migrations for it would cost more than re-fetching. So the
+/// only thing a version buys is a clear refusal, which is the entire point: without it, an
+/// out-of-date database fails somewhere arbitrary in the middle of `execute_batch` and
+/// reports whichever statement happened to trip first.
+const SCHEMA_VERSION: i64 = 2;
+
+/// Refuse an incompatible database with a sentence instead of a stack of SQL.
+///
+/// The failure this exists to replace: `CREATE TABLE IF NOT EXISTS signals` silently skips a
+/// pre-existing `signals` of an older shape, and then `CREATE INDEX … ON signals(subject)`
+/// fails with `no such column`. rusqlite reports that as the message plus *the whole
+/// remainder of the batch* and a byte offset into it — a thousand characters of unrelated
+/// DDL, with the offset landing in whichever table the reader's terminal stopped scrolling
+/// at. It reads as "this CREATE TABLE is malformed", which is both wrong and unfixable.
+fn check_compatible(conn: &Connection, path: &Path) -> Result<()> {
+    // An empty file is a fresh database, which is always compatible.
+    let tables: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
+        [],
+        |r| r.get(0),
+    )?;
+    if tables == 0 {
+        return Ok(());
+    }
+
+    // `meta` may itself not exist on a database old enough to predate it; absent is a
+    // version of 0, which is never current.
+    let found: i64 = conn
+        .query_row(
+            "SELECT CAST(value AS INTEGER) FROM meta WHERE key = 'schema_version'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    if found == SCHEMA_VERSION {
+        return Ok(());
+    }
+
+    let what = if found == 0 {
+        "an older MuggleBot".to_string()
+    } else {
+        format!("MuggleBot schema v{found}")
+    };
+    let verb = if found > SCHEMA_VERSION {
+        "newer than"
+    } else {
+        "older than"
+    };
+    anyhow::bail!(
+        "{} was created by {what} and its schema is {verb} this build's (v{SCHEMA_VERSION}). \
+         There is no migration path: the database is a local cache of GitHub, Slack and \
+         Granola state, and it is rebuilt by re-polling. Move it aside and restart:\n\
+         \n    mv {} {}.bak\n\
+         \nStored credentials go with it, so re-enter them on the config page \
+         (or copy the `secrets` table across with sqlite3 first).",
+        path.display(),
+        path.display(),
+        path.display(),
+    )
+}
+
+fn row_to_explanation(r: &Row) -> rusqlite::Result<Explanation> {
+    Ok(Explanation {
+        subject_key: r.get(0)?,
+        produced_by: r.get(1)?,
+        watermark: r.get(2)?,
+        markdown: r.get(3)?,
+        sources: from_json::<Vec<String>>(r, 4)?,
+        removed: from_json::<Vec<String>>(r, 5)?,
+        created_at: parse_ts(r, 6)?,
     })
 }
 
@@ -2535,7 +3664,7 @@ fn row_to_issue_triage(row: &Row) -> rusqlite::Result<IssueTriage> {
 
 fn row_to_root_cause(row: &Row) -> rusqlite::Result<RootCauseReport> {
     Ok(RootCauseReport {
-        thread_id: row.get(0)?,
+        subject_key: row.get(0)?,
         status: row.get(1)?,
         symptoms: from_json::<Vec<String>>(row, 2)?,
         repos: from_json::<Vec<String>>(row, 3)?,
@@ -2618,7 +3747,7 @@ fn row_to_hint(row: &Row) -> rusqlite::Result<Hint> {
     let state_s: String = row.get(8)?;
     Ok(Hint {
         id: row.get(0)?,
-        thread_id: row.get(1)?,
+        subject_key: row.get(1)?,
         kind: HintKind::parse(&kind_s)
             .ok_or_else(|| conv_err(2, format!("bad hint kind '{kind_s}'")))?,
         flag_type: flag_s.and_then(|s| FlagType::parse(&s)),
@@ -2675,57 +3804,51 @@ impl Store {
     pub fn open_in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory()?;
         conn.execute_batch(SCHEMA)?;
-        migrate(&conn)?;
+        add_columns(&conn)?;
+        conn.execute(
+            "INSERT INTO meta (key, value) VALUES ('schema_version', ?1) \
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![SCHEMA_VERSION.to_string()],
+        )?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
     }
 }
 
-/// Idempotent column additions for databases created before a column existed.
-/// New tables come from [`SCHEMA`] (all `IF NOT EXISTS`); only added columns on
-/// pre-existing tables need this. `ALTER TABLE ADD COLUMN` is a no-op-safe here
-/// because we guard on `PRAGMA table_info`.
-fn migrate(conn: &Connection) -> Result<()> {
-    add_column_if_missing(conn, "threads", "tags", "TEXT NOT NULL DEFAULT '[]'")?;
-    add_column_if_missing(conn, "threads", "tags_pinned", "INTEGER NOT NULL DEFAULT 0")?;
-    add_column_if_missing(conn, "context", "tags", "TEXT NOT NULL DEFAULT '[]'")?;
-    add_column_if_missing(conn, "context", "tags_pinned", "INTEGER NOT NULL DEFAULT 0")?;
-    add_column_if_missing(conn, "memory", "tags", "TEXT NOT NULL DEFAULT '[]'")?;
-    add_column_if_missing(conn, "memory", "tags_pinned", "INTEGER NOT NULL DEFAULT 0")?;
-    add_column_if_missing(conn, "signals", "tags", "TEXT NOT NULL DEFAULT '[]'")?;
-    add_column_if_missing(conn, "repo_index", "indexed_sha", "TEXT")?;
-    add_column_if_missing(conn, "repo_index", "digest", "TEXT")?;
-    add_column_if_missing(conn, "browser_investigations", "error", "TEXT")?;
-    add_column_if_missing(
-        conn,
-        "browser_investigations",
-        "attempts",
-        "INTEGER NOT NULL DEFAULT 0",
-    )?;
-    Ok(())
-}
-
-fn add_column_if_missing(conn: &Connection, table: &str, column: &str, decl: &str) -> Result<()> {
-    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
-    let existing: Vec<String> = stmt
-        .query_map([], |r| r.get::<_, String>(1))?
-        .collect::<rusqlite::Result<_>>()?;
-    if !existing.iter().any(|c| c == column) {
-        conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {decl}"))?;
+/// Tighten the DB (and its WAL sidecars) to owner-only. Best-effort: a failure
+/// here means the filesystem doesn't support it, which is not a reason to refuse
+/// to start — but it is worth a warning, which the caller emits.
+fn restrict_permissions(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for suffix in ["", "-wal", "-shm"] {
+            let p = if suffix.is_empty() {
+                path.to_path_buf()
+            } else {
+                let mut s = path.as_os_str().to_owned();
+                s.push(suffix);
+                std::path::PathBuf::from(s)
+            };
+            if p.exists() {
+                let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600));
+            }
+        }
     }
-    Ok(())
+    #[cfg(not(unix))]
+    let _ = path;
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::signal::{Entity, Severity, SignalKind, Source, State};
+    use crate::signal::{ResolutionKey, Severity, SignalKind, Source};
     use chrono::Utc;
 
     fn sample(ext: &str) -> Signal {
         Signal {
-            id: Signal::make_id(Source::GitHub, ext),
+            id: Signal::make_id(Source::GitHub, ext, None),
             source: Source::GitHub,
             external_id: ext.into(),
             kind: SignalKind::Mention,
@@ -2733,12 +3856,13 @@ mod tests {
             body: Some("body".into()),
             url: Some("https://example.com".into()),
             actor: None,
-            entities: vec![Entity::new("repo", "o/r")],
+            keys: vec![ResolutionKey::new("repo", "o/r")],
             severity: Severity::Warning,
-            state: State::Unseen,
+            version: None,
+            upstream_gone: false,
             occurred_at: Utc::now(),
             ingested_at: Utc::now(),
-            thread: None,
+            subject: None,
             raw: serde_json::json!({ "k": "v" }),
             tags: Vec::new(),
         }
@@ -2796,9 +3920,11 @@ mod tests {
             .is_empty());
         assert!(store.context_by_tags(&[]).unwrap().is_empty());
 
-        // thread tags round-trip
-        let t = Thread {
-            id: "thr/1".into(),
+        // subject tags round-trip
+        let key = SubjectKey::issue("o/r", 1);
+        let t = Subject {
+            rank: key.rank(),
+            key: key.clone(),
             title: "t".into(),
             summary: None,
             created_at: now,
@@ -2807,12 +3933,17 @@ mod tests {
             live: false,
             tags: vec![],
             tags_pinned: false,
+            handled: Handled::Open,
+            snoozed_until: None,
+            same_as: None,
+            parent: None,
+            merge_key: None,
         };
-        store.upsert_thread(&t).unwrap();
+        store.upsert_subject(&t).unwrap();
         store
-            .set_thread_tags("thr/1", &["database".to_string()], true)
+            .set_subject_tags(key.as_str(), &["database".to_string()], true)
             .unwrap();
-        let gt = store.get_thread("thr/1").unwrap().unwrap();
+        let gt = store.get_subject(key.as_str()).unwrap().unwrap();
         assert_eq!(gt.tags, vec!["database".to_string()]);
         assert!(gt.tags_pinned);
 
@@ -2845,7 +3976,7 @@ mod tests {
 
         // signal tags round-trip
         store.insert_signal(&sample("sig-tagged")).unwrap();
-        let sid = Signal::make_id(Source::GitHub, "sig-tagged");
+        let sid = Signal::make_id(Source::GitHub, "sig-tagged", None);
         store
             .set_signal_tags(&sid, &["database".to_string()])
             .unwrap();
@@ -2863,7 +3994,7 @@ mod tests {
             vec!["postgres".to_string()]
         );
         assert_eq!(
-            store.get_thread("thr/1").unwrap().unwrap().tags,
+            store.get_subject(key.as_str()).unwrap().unwrap().tags,
             vec!["postgres".to_string()]
         );
         assert_eq!(
@@ -2902,53 +4033,67 @@ mod tests {
         let s = &recent[0];
         assert_eq!(s.source, Source::GitHub);
         assert_eq!(s.severity, Severity::Warning);
-        assert_eq!(s.entities, vec![Entity::new("repo", "o/r")]);
+        assert_eq!(s.keys, vec![ResolutionKey::new("repo", "o/r")]);
         assert_eq!(s.raw, serde_json::json!({ "k": "v" }));
     }
 
+    /// Triage is per subject; "gone upstream" is per signal. Conflating the two was
+    /// what made the old `state` column mean two unrelated things.
     #[test]
-    fn set_state_updates() {
+    fn triage_is_per_subject_and_upstream_absence_is_per_signal() {
         let store = Store::open_in_memory().unwrap();
-        store.insert_signal(&sample("1")).unwrap();
+        let s = sample("1");
+        store.insert_signal(&s).unwrap();
+        let key = SubjectKey::issue("o/r", 1);
         store
-            .set_state(&Signal::make_id(Source::GitHub, "1"), State::Acknowledged)
+            .upsert_subject(&Subject::new(key.clone(), &s, Utc::now()))
             .unwrap();
-        let recent = store.recent(10).unwrap();
-        assert!(matches!(recent[0].state, State::Acknowledged));
+
+        store
+            .set_handled(key.as_str(), Handled::Acknowledged, None)
+            .unwrap();
+        assert_eq!(
+            store.get_subject(key.as_str()).unwrap().unwrap().handled,
+            Handled::Acknowledged
+        );
+        assert!(
+            !store.recent(10).unwrap()[0].upstream_gone,
+            "acknowledging work does not make the notification disappear upstream"
+        );
+
+        store.set_upstream_gone(&s.id, true).unwrap();
+        assert!(store.recent(10).unwrap()[0].upstream_gone);
     }
 
     #[test]
-    fn clear_board_events_deletes_signals_and_threads() {
+    fn clear_board_events_deletes_signals_and_subjects() {
         let store = Store::open_in_memory().unwrap();
 
-        // Signals from three sources, on two threads. All should be resolved —
+        // Signals from three sources, on two subjects. All should be resolved —
         // the reset clears the whole board, not just some sources.
         let mut gh = sample("gh1");
-        gh.thread = Some("thread-x".into());
+        gh.subject = Some("o/r#1".into());
         let mut slack = sample("sl1");
         slack.source = Source::Slack;
-        slack.id = Signal::make_id(Source::Slack, "sl1");
-        slack.thread = Some("thread-x".into());
+        slack.id = Signal::make_id(Source::Slack, "sl1", None);
+        slack.subject = Some("o/r#1".into());
         let mut granola = sample("gr1");
         granola.source = Source::Granola;
-        granola.id = Signal::make_id(Source::Granola, "gr1");
-        granola.thread = Some("thread-y".into());
+        granola.id = Signal::make_id(Source::Granola, "gr1", None);
+        granola.subject = Some("o/r#2".into());
         for s in [&gh, &slack, &granola] {
             store.insert_signal(s).unwrap();
         }
 
-        let (cleared, mut threads) = store.clear_board_events().unwrap();
+        let (cleared, mut subjects) = store.clear_board_events().unwrap();
         assert_eq!(cleared, 3, "every signal is deleted regardless of source");
-        threads.sort();
-        assert_eq!(
-            threads,
-            vec!["thread-x".to_string(), "thread-y".to_string()]
-        );
+        subjects.sort();
+        assert_eq!(subjects, vec!["o/r#1".to_string(), "o/r#2".to_string()]);
 
-        // The event rows and their board-level thread records are gone. A source
+        // The event rows and their board-level subject records are gone. A source
         // can subsequently re-ingest a still-active upstream notification.
         assert!(store.recent(10).unwrap().is_empty());
-        assert!(store.list_threads().unwrap().is_empty());
+        assert!(store.list_subjects().unwrap().is_empty());
         assert!(
             store.insert_signal(&gh).unwrap(),
             "re-ingest is a new event"
@@ -2961,10 +4106,318 @@ mod tests {
         assert_eq!(empty, 0);
     }
 
+    /// The backfill fills gaps and nothing else.
+    ///
+    /// It runs at every boot, so "only ever fills a NULL on an unpinned row" is what stops it
+    /// from being a process that slowly overwrites the operator's answers.
+    #[test]
+    fn the_kind_backfill_fills_gaps_without_overwriting_anything() {
+        let store = Store::open_in_memory().unwrap();
+        let put = |name: &str, topics: Vec<String>| {
+            store
+                .put_repo(
+                    &RepoEntry {
+                        full_name: name.into(),
+                        description: None,
+                        topics,
+                        language: None,
+                        archived: false,
+                        pushed_at: None,
+                        readme_etag: None,
+                        readme: None,
+                        summary: None,
+                        indexed_sha: None,
+                        digest: None,
+                        kind: None,
+                        kind_pinned: false,
+                        fetched_at: Utc::now().to_rfc3339(),
+                    },
+                    false,
+                )
+                .unwrap();
+        };
+        put("o/ai-examples", vec![]);
+        put("o/docs-restate", vec![]);
+        put("o/restate", vec![]);
+        // A human called this one code, against what the name suggests.
+        put("o/loan-demo", vec![]);
+        store.set_repo_kind("o/loan-demo", RepoKind::Code).unwrap();
+
+        assert_eq!(store.backfill_repo_kinds().unwrap(), 2);
+        assert_eq!(
+            store.get_repo("o/ai-examples").unwrap().unwrap().kind,
+            Some(RepoKind::Example)
+        );
+        assert_eq!(
+            store.get_repo("o/docs-restate").unwrap().unwrap().kind,
+            Some(RepoKind::Docs)
+        );
+        // Nothing in the name says, so it stays unset and is treated as code.
+        assert_eq!(store.get_repo("o/restate").unwrap().unwrap().kind, None);
+        // The human's answer stands, even though the name says otherwise.
+        let pinned = store.get_repo("o/loan-demo").unwrap().unwrap();
+        assert_eq!(pinned.kind, Some(RepoKind::Code));
+        assert!(pinned.kind_pinned);
+
+        // Idempotent: a second run has nothing left to fill.
+        assert_eq!(store.backfill_repo_kinds().unwrap(), 0);
+    }
+
+    /// A column added to an existing table has to reach an existing database.
+    ///
+    /// `CREATE TABLE IF NOT EXISTS` skips a table that is already there, so without
+    /// [`add_columns`] a new column exists only for fresh databases — and every query naming it
+    /// fails with `no such column`. Adding `kind` to `repo_index` did exactly that to a database
+    /// holding 147 repos and 718 commit summaries.
+    #[test]
+    fn a_new_column_reaches_a_database_that_predates_it() {
+        let dir = std::env::temp_dir().join("mugglebot-add-column-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("older.sqlite");
+
+        // A `repo_index` from before `kind` existed, with a row in it.
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE repo_index (
+                     full_name TEXT PRIMARY KEY, description TEXT, topics TEXT NOT NULL DEFAULT '[]',
+                     language TEXT, archived INTEGER NOT NULL DEFAULT 0, pushed_at TEXT,
+                     readme_etag TEXT, readme TEXT, summary TEXT, indexed_sha TEXT, digest TEXT,
+                     fetched_at TEXT NOT NULL);
+                 INSERT INTO repo_index (full_name, fetched_at) VALUES ('o/r', '2026-01-01');
+                 CREATE TABLE meta (key TEXT PRIMARY KEY, value BLOB NOT NULL);
+                 INSERT INTO meta (key, value) VALUES ('schema_version', '2');",
+            )
+            .unwrap();
+        }
+
+        // Opening it adds the columns rather than failing, and the row survives — the whole
+        // point is not having to discard the database over an additive change.
+        let store = Store::open(&path).expect("an additive change must not refuse the database");
+        let got = store
+            .get_repo("o/r")
+            .expect("the query naming the new column must work")
+            .expect("the existing row survives");
+        assert_eq!(got.kind, None, "the added column defaults to unset");
+        assert!(!got.kind_pinned);
+
+        // And it is usable, not merely present.
+        store.set_repo_kind("o/r", RepoKind::Example).unwrap();
+        assert_eq!(
+            store.get_repo("o/r").unwrap().unwrap().kind,
+            Some(RepoKind::Example)
+        );
+
+        // Idempotent: opening again must not try to add them twice.
+        drop(store);
+        let reopened = Store::open(&path).expect("reopen");
+        assert_eq!(
+            reopened.get_repo("o/r").unwrap().unwrap().kind,
+            Some(RepoKind::Example),
+            "a second open must not disturb the data"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn column_detection_handles_an_absent_table() {
+        let conn = Connection::open_in_memory().unwrap();
+        // No table: `false` is right, because SCHEMA will create it with the column in place.
+        assert!(!has_column(&conn, "repo_index", "kind").unwrap());
+        conn.execute_batch("CREATE TABLE repo_index (full_name TEXT, kind TEXT)")
+            .unwrap();
+        assert!(has_column(&conn, "repo_index", "kind").unwrap());
+        assert!(!has_column(&conn, "repo_index", "kind_pinned").unwrap());
+    }
+
+    /// The name-matching guess covers the unambiguous cases and declines the rest.    /// The name-matching guess covers the unambiguous cases and declines the rest.
+    ///
+    /// Declining matters more than reaching: a guess that mis-files production code as a demo
+    /// makes the operator notice and correct something they never asked for, while `None` simply
+    /// means "you tell me" and is treated as code until they do.
+    #[test]
+    fn a_repo_kind_is_guessed_only_when_the_name_is_unambiguous() {
+        let g = |n: &str| RepoKind::guess(n, &[]);
+        assert_eq!(g("o/sdk-examples"), Some(RepoKind::Example));
+        assert_eq!(g("o/ai-examples"), Some(RepoKind::Example));
+        assert_eq!(g("o/demo"), Some(RepoKind::Example));
+        assert_eq!(g("o/demos-private"), Some(RepoKind::Example));
+        assert_eq!(g("o/rust-template"), Some(RepoKind::Example));
+        assert_eq!(g("o/docs-restate"), Some(RepoKind::Docs));
+        assert_eq!(g("o/website"), Some(RepoKind::Docs));
+
+        // Real code, and nothing in the name says otherwise.
+        assert_eq!(g("o/restate"), None);
+        assert_eq!(g("o/restate-cloud"), None);
+        assert_eq!(g("o/sdk-python"), None);
+        // A substring is not a word: these must not be mistaken for demos or docs.
+        assert_eq!(g("o/redemption"), None);
+        assert_eq!(g("o/docker-images"), None);
+        assert_eq!(g("o/exampled-things"), None);
+
+        // Author-declared topics are honoured when the name is silent.
+        assert_eq!(
+            RepoKind::guess("o/playground-svc", &["example".into()]),
+            Some(RepoKind::Example)
+        );
+        assert_eq!(
+            RepoKind::guess("o/handbook-src", &["documentation".into()]),
+            Some(RepoKind::Docs)
+        );
+    }
+
+    /// A human's tag survives the crawl. Without the pin, an operator's correction is silently
+    /// reverted the next time the org is listed — which is worse than never offering the tag.
+    #[test]
+    fn a_pinned_kind_is_not_overwritten_by_the_crawl() {
+        let store = Store::open_in_memory().unwrap();
+        let entry = |kind| RepoEntry {
+            full_name: "o/tools".into(),
+            description: None,
+            topics: vec![],
+            language: None,
+            archived: false,
+            pushed_at: None,
+            readme_etag: None,
+            readme: None,
+            summary: None,
+            indexed_sha: None,
+            digest: None,
+            kind,
+            kind_pinned: false,
+            fetched_at: Utc::now().to_rfc3339(),
+        };
+        store.put_repo(&entry(None), false).unwrap();
+
+        // The operator says it is a demo.
+        store.set_repo_kind("o/tools", RepoKind::Example).unwrap();
+        let got = store.get_repo("o/tools").unwrap().unwrap();
+        assert_eq!(got.kind, Some(RepoKind::Example));
+        assert!(got.kind_pinned);
+
+        // A later crawl guesses nothing and must not clear it.
+        store.put_repo(&entry(None), false).unwrap();
+        let after = store.get_repo("o/tools").unwrap().unwrap();
+        assert_eq!(
+            after.kind,
+            Some(RepoKind::Example),
+            "the crawl overwrote a human's answer"
+        );
+
+        // Clearing hands it back to the guess.
+        store.clear_repo_kind("o/tools").unwrap();
+        let cleared = store.get_repo("o/tools").unwrap().unwrap();
+        assert_eq!(cleared.kind, None);
+        assert!(!cleared.kind_pinned);
+
+        // Tagging something that isn't indexed is an error rather than a silent no-op.
+        assert!(store.set_repo_kind("o/absent", RepoKind::Docs).is_err());
+    }
+
+    /// A board reset must leave nothing keyed by a subject behind    /// A board reset must leave nothing keyed by a subject behind, and must leave the code
+    /// index alone.
+    ///
+    /// Both halves matter and they pull in opposite directions. Subject keys are stable upstream
+    /// identities, so the next poll re-mints the *same* key — anything left under it reappears on
+    /// a card the operator believes is fresh, which is exactly what the reset is for. But the
+    /// code index is keyed by *repo*, cost hours of GPU, and has nothing to do with the board;
+    /// clearing it would make a reset unaffordable.
+    #[test]
+    fn a_reset_clears_everything_subject_keyed_and_nothing_repo_keyed() {
+        let store = Store::open_in_memory().unwrap();
+        let key = "o/r#412";
+
+        let mut sig = sample("gh1");
+        sig.subject = Some(key.into());
+        store.insert_signal(&sig).unwrap();
+
+        // Derived analysis hanging off the subject.
+        store
+            .put_explanation(key, &sig.id, "the pool saturates", EXPLAIN_LOCAL, &[], &[])
+            .unwrap();
+        store
+            .put_root_cause(&RootCauseReport {
+                subject_key: key.into(),
+                status: "complete".into(),
+                symptoms: vec!["pool".into()],
+                repos: vec!["o/r".into()],
+                candidates: serde_json::json!([]),
+                verdict: Some("likely the retry change".into()),
+                error: None,
+                created_at: Utc::now().to_rfc3339(),
+                updated_at: Utc::now().to_rfc3339(),
+            })
+            .unwrap();
+        store.set_subject_parent("o/r!987", Some(key)).unwrap();
+
+        // Code index: keyed by repo, and expensive.
+        store
+            .put_repo(
+                &RepoEntry {
+                    full_name: "o/r".into(),
+                    description: None,
+                    topics: vec![],
+                    language: None,
+                    archived: false,
+                    pushed_at: None,
+                    readme_etag: None,
+                    readme: None,
+                    summary: Some("a card".into()),
+                    indexed_sha: Some("abc".into()),
+                    digest: None,
+                    kind: None,
+                    kind_pinned: false,
+                    fetched_at: Utc::now().to_rfc3339(),
+                },
+                false,
+            )
+            .unwrap();
+        store
+            .put_component_summary(
+                &ComponentSummary {
+                    full_name: "o/r".into(),
+                    path: "crates/pool".into(),
+                    purpose: Some("the pool".into()),
+                    symptoms: None,
+                    digest: None,
+                    indexed_sha: None,
+                },
+                None,
+            )
+            .unwrap();
+        store
+            .put_commit_summary("o/r", "aaa", "stops leaking", &[], None, None)
+            .unwrap();
+        store
+            .put_repo_deps(
+                "o/r",
+                &[("o/lib".into(), "lib".into(), "Cargo.toml".into())],
+            )
+            .unwrap();
+
+        store.clear_board_events().unwrap();
+
+        // Nothing subject-keyed may survive — the re-ingested card must start blank.
+        assert!(store.explanations(key).unwrap().is_empty(), "explanation");
+        assert!(store.get_root_cause(key).unwrap().is_none(), "root cause");
+        assert!(store.subject_children(key).unwrap().is_empty(), "hierarchy");
+        assert!(store.get_subject(key).unwrap().is_none(), "subject");
+        assert!(store.recent(10).unwrap().is_empty(), "signals");
+
+        // ...and the code index is untouched. A reset that cost the index would be one nobody
+        // could afford to press.
+        assert!(store.get_repo("o/r").unwrap().is_some(), "repo card");
+        assert_eq!(store.components_for_repo("o/r").unwrap().len(), 1);
+        assert_eq!(store.commit_index_progress("o/r").unwrap().0, 1);
+        assert_eq!(store.repo_deps("o/r").unwrap().0.len(), 1);
+    }
+
     fn assigned_signal(ext: &str) -> Signal {
         let mut s = sample(ext);
         s.external_id = format!("assigned/{ext}");
-        s.id = Signal::make_id(Source::GitHub, &s.external_id);
+        s.id = Signal::make_id(Source::GitHub, &s.external_id, None);
         s
     }
 
@@ -2984,9 +4437,12 @@ mod tests {
         let active: BTreeSet<String> = [notification.external_id.clone()].into();
         let resolved = store.resolve_missing_github_notifications(&active).unwrap();
         assert!(resolved.is_empty(), "nothing should have been resolved");
-        assert_eq!(
-            store.get_signal(&assigned.id).unwrap().unwrap().state,
-            State::Unseen,
+        assert!(
+            !store
+                .get_signal(&assigned.id)
+                .unwrap()
+                .unwrap()
+                .upstream_gone,
             "the assigned card must survive a notifications reconcile"
         );
 
@@ -2996,9 +4452,12 @@ mod tests {
             .resolve_missing_assigned_issues(&active)
             .unwrap()
             .is_empty());
-        assert_eq!(
-            store.get_signal(&notification.id).unwrap().unwrap().state,
-            State::Unseen
+        assert!(
+            !store
+                .get_signal(&notification.id)
+                .unwrap()
+                .unwrap()
+                .upstream_gone
         );
 
         // An emptied assigned listing means the issue was closed or reassigned.
@@ -3007,9 +4466,12 @@ mod tests {
             .unwrap();
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved[0].id, assigned.id);
-        assert_eq!(
-            store.get_signal(&notification.id).unwrap().unwrap().state,
-            State::Unseen,
+        assert!(
+            !store
+                .get_signal(&notification.id)
+                .unwrap()
+                .unwrap()
+                .upstream_gone,
             "the notification card is still untouched"
         );
     }
@@ -3030,12 +4492,15 @@ mod tests {
         // The watcher re-emits every poll; that must not re-queue work.
         assert!(!queue(), "already pending");
 
-        let claimed = store.claim_issue_triage().unwrap().unwrap();
-        assert_eq!(claimed.issue_key, key);
-        assert!(store.claim_issue_triage().unwrap().is_none(), "exclusive");
+        // The scheduler submits an `IssueTriage` workflow and the workflow marks the row
+        // `running`; there is no claim step any more — the workflow id is the claim.
+        let mut running = store.get_issue_triage(key).unwrap().unwrap();
+        assert_eq!(running.issue_key, key);
+        running.status = "running".into();
+        store.put_issue_triage(&running).unwrap();
         assert!(!queue(), "running work is not re-queued");
 
-        let mut done = claimed;
+        let mut done = running;
         done.status = "complete".into();
         done.characterization = Some("The pool never shrinks.".into());
         done.patches = serde_json::json!([{ "id": "patch-0", "title": "Bound the pool" }]);
@@ -3045,8 +4510,11 @@ mod tests {
 
         // Explicitly asking is what re-runs it.
         store.retriage_issue(key).unwrap();
-        let requeued = store.claim_issue_triage().unwrap().unwrap();
-        assert_eq!(requeued.status, "running");
+        let requeued = store.get_issue_triage(key).unwrap().unwrap();
+        assert_eq!(
+            requeued.status, "pending",
+            "back in the queue the scheduler reads"
+        );
         // Prior analysis is preserved until the new run overwrites it.
         assert_eq!(requeued.head_sha.as_deref(), Some("abc1234"));
     }
@@ -3060,8 +4528,7 @@ mod tests {
         store
             .queue_issue_triage(key, "restatedev/restate", 9, "t", None, &sig.id)
             .unwrap();
-        let claimed = store.claim_issue_triage().unwrap().unwrap();
-        let mut failed = claimed;
+        let mut failed = store.get_issue_triage(key).unwrap().unwrap();
         failed.status = "failed".into();
         failed.error = Some("git timed out".into());
         store.put_issue_triage(&failed).unwrap();
@@ -3075,10 +4542,10 @@ mod tests {
     }
 
     #[test]
-    fn triage_is_reachable_from_its_thread() {
+    fn triage_is_reachable_from_its_subject() {
         let store = Store::open_in_memory().unwrap();
         let mut sig = assigned_signal("restatedev/restate#77");
-        sig.thread = Some("thr/assigned".into());
+        sig.subject = Some("restatedev/restate#412".into());
         store.insert_signal(&sig).unwrap();
         store
             .queue_issue_triage(
@@ -3091,69 +4558,15 @@ mod tests {
             )
             .unwrap();
 
-        let found = store.issue_triage_for_thread("thr/assigned").unwrap();
+        let found = store
+            .issue_triage_for_subject("restatedev/restate#412")
+            .unwrap();
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].number, 77);
         assert!(store
-            .issue_triage_for_thread("thr/other")
+            .issue_triage_for_subject("thr/other")
             .unwrap()
             .is_empty());
-    }
-
-    #[test]
-    fn interrupted_triage_is_requeued_at_startup() {
-        let store = Store::open_in_memory().unwrap();
-        let sig = assigned_signal("restatedev/restate#5");
-        store.insert_signal(&sig).unwrap();
-        store
-            .queue_issue_triage(
-                "restatedev/restate#5",
-                "restatedev/restate",
-                5,
-                "t",
-                None,
-                &sig.id,
-            )
-            .unwrap();
-        store.claim_issue_triage().unwrap().unwrap();
-        assert!(store.claim_issue_triage().unwrap().is_none());
-
-        assert_eq!(store.requeue_running_issue_triage().unwrap(), 1);
-        assert!(
-            store.claim_issue_triage().unwrap().is_some(),
-            "a triage the daemon died inside must be picked up again"
-        );
-    }
-
-    #[test]
-    fn claiming_is_exclusive_and_survives_a_restart() {
-        let store = Store::open_in_memory().unwrap();
-        let mut signal = sample("grafana");
-        signal.thread = Some("thread-grafana".into());
-        store.insert_signal(&signal).unwrap();
-        store
-            .queue_browser_investigation(&signal.id, "https://g/1", "brief")
-            .unwrap();
-
-        // One worker claims it; a second finds nothing rather than double-driving
-        // the same Chrome.
-        let first = store.claim_browser_investigation(3).unwrap().unwrap();
-        assert_eq!(first.status, "running");
-        assert_eq!(first.attempts, 1);
-        assert!(store.claim_browser_investigation(3).unwrap().is_none());
-
-        // A `running` job at startup is one the daemon died inside.
-        assert_eq!(store.requeue_running_browser_investigations().unwrap(), 1);
-        let reclaimed = store.claim_browser_investigation(3).unwrap().unwrap();
-        assert_eq!(reclaimed.attempts, 2, "attempts accumulate across restarts");
-
-        // Past the cap it stops being handed out, so a permanently broken link
-        // can't spin the worker forever.
-        store
-            .fail_browser_investigation(&reclaimed.id, "boom")
-            .unwrap();
-        store.requeue_browser_investigation(&reclaimed.id).unwrap();
-        assert!(store.claim_browser_investigation(2).unwrap().is_none());
     }
 
     #[test]
@@ -3171,6 +4584,8 @@ mod tests {
             summary: summary.map(str::to_string),
             indexed_sha: None,
             digest: None,
+            kind: None,
+            kind_pinned: false,
             fetched_at: Utc::now().to_rfc3339(),
         };
         store
@@ -3270,7 +4685,7 @@ mod tests {
     fn root_cause_report_round_trips_and_moves_on_merge() {
         let store = Store::open_in_memory().unwrap();
         let report = RootCauseReport {
-            thread_id: "thr/a".into(),
+            subject_key: "thr/a".into(),
             status: "complete".into(),
             symptoms: vec!["pool exhausted".into()],
             repos: vec!["restatedev/restate".into()],
@@ -3285,7 +4700,7 @@ mod tests {
         assert_eq!(stored.symptoms, vec!["pool exhausted"]);
         assert_eq!(stored.candidates[0]["reference"], "restatedev/restate#12");
 
-        // A merge must not lose the investigation with the collapsed thread.
+        // A merge must not lose the investigation with the collapsed subject.
         store.move_root_cause("thr/a", "thr/b").unwrap();
         assert!(store.get_root_cause("thr/a").unwrap().is_none());
         assert_eq!(
@@ -3298,7 +4713,7 @@ mod tests {
     fn browser_investigation_round_trips_findings() {
         let store = Store::open_in_memory().unwrap();
         let mut signal = sample("grafana");
-        signal.thread = Some("thread-grafana".into());
+        signal.subject = Some("o/r#7".into());
         store.insert_signal(&signal).unwrap();
 
         let queued = store
@@ -3319,20 +4734,26 @@ mod tests {
             .complete_browser_investigation(&queued.id, "CPU saturated on restate-0.")
             .unwrap();
         assert_eq!(complete.status, "completed");
-        assert_eq!(complete.thread_id.as_deref(), Some("thread-grafana"));
+        assert_eq!(complete.subject_key.as_deref(), Some("o/r#7"));
         assert_eq!(
             complete.findings.as_deref(),
             Some("CPU saturated on restate-0.")
         );
     }
 
+    /// The snapshot lists bare upstream notification ids, so reconciliation compares
+    /// against `external_id` — which is the bare id now that the version has its own
+    /// column. This test previously encoded the old composite `id@version` form and
+    /// passed only because the reconciler carried a fallback that split it back apart.
     #[test]
     fn github_unread_snapshot_resolves_missing_notifications() {
         let store = Store::open_in_memory().unwrap();
-        let mut active = sample("1@2026-07-24T10:00:00Z");
-        active.raw = serde_json::json!({ "thread_id": "1" });
-        let mut read = sample("2@2026-07-24T10:00:00Z");
-        read.raw = serde_json::json!({ "thread_id": "2" });
+        let mut active = sample("1");
+        active.version = Some("2026-07-24T10:00:00Z".into());
+        active.id = Signal::make_id(Source::GitHub, "1", active.version.as_deref());
+        let mut read = sample("2");
+        read.version = Some("2026-07-24T10:00:00Z".into());
+        read.id = Signal::make_id(Source::GitHub, "2", read.version.as_deref());
         store.insert_signal(&active).unwrap();
         store.insert_signal(&read).unwrap();
 
@@ -3343,13 +4764,47 @@ mod tests {
 
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved[0].external_id, read.external_id);
+        assert!(store.get_signal(&read.id).unwrap().unwrap().upstream_gone);
+        assert!(!store.get_signal(&active.id).unwrap().unwrap().upstream_gone);
+    }
+
+    /// A notification thread has one row per version, so refreshing the newest must not
+    /// rewrite the older ones. Before the version moved into its own column the refresh
+    /// matched on `(source, external_id)`, which quietly overwrote the whole history of
+    /// a thread with its latest state.
+    #[test]
+    fn refreshing_one_version_leaves_the_others_alone() {
+        let store = Store::open_in_memory().unwrap();
+        let mut v1 = sample("n1");
+        v1.version = Some("v1".into());
+        v1.id = Signal::make_id(Source::GitHub, "n1", Some("v1"));
+        v1.title = "first state".into();
+        let mut v2 = sample("n1");
+        v2.version = Some("v2".into());
+        v2.id = Signal::make_id(Source::GitHub, "n1", Some("v2"));
+        v2.title = "second state".into();
+        assert!(store.insert_signal(&v1).unwrap());
+        assert!(
+            store.insert_signal(&v2).unwrap(),
+            "a new version is a new event"
+        );
+
+        // Re-ingest v2 with enriched content, as a later poll would.
+        let mut v2_enriched = v2.clone();
+        v2_enriched.body = Some("now with a CI log excerpt".into());
+        assert!(
+            !store.insert_signal(&v2_enriched).unwrap(),
+            "same version, refreshed"
+        );
+
         assert_eq!(
-            store.get_signal(&read.id).unwrap().unwrap().state,
-            State::Resolved
+            store.get_signal(&v1.id).unwrap().unwrap().title,
+            "first state",
+            "the earlier version keeps its own content"
         );
         assert_eq!(
-            store.get_signal(&active.id).unwrap().unwrap().state,
-            State::Unseen
+            store.get_signal(&v2.id).unwrap().unwrap().body.as_deref(),
+            Some("now with a CI log excerpt")
         );
     }
 
@@ -3371,7 +4826,7 @@ mod tests {
         assert_eq!(warns[0].external_id, "1");
 
         let got = store
-            .get_signal(&Signal::make_id(Source::GitHub, "1"))
+            .get_signal(&Signal::make_id(Source::GitHub, "1", None))
             .unwrap();
         assert!(got.is_some());
     }
@@ -3381,8 +4836,8 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         let now = Utc::now();
         let user_edge = Edge {
-            thread_a: "t/b".into(),
-            thread_b: "t/a".into(), // deliberately reversed to test normalization
+            subject_a: "t/b".into(),
+            subject_b: "t/a".into(), // deliberately reversed to test normalization
             kind: RelationKind::Distinct,
             provenance: Provenance::User,
             confidence: 1.0,
@@ -3393,8 +4848,8 @@ mod tests {
         store.put_edge(&user_edge).unwrap();
         // An LLM verdict must not overwrite the user pin.
         let llm_edge = Edge {
-            thread_a: "t/a".into(),
-            thread_b: "t/b".into(),
+            subject_a: "t/a".into(),
+            subject_b: "t/b".into(),
             kind: RelationKind::Same,
             provenance: Provenance::Llm,
             confidence: 0.9,
@@ -3485,5 +4940,303 @@ mod tests {
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].0.summary, "pool exhaustion → restart");
         assert!(!all[0].1.is_empty());
+    }
+    /// The progress panel's whole dataset in one query. Asserted because the counts are
+    /// correlated subqueries against four tables, and a wrong join reads as a plausible
+    /// number rather than an error.
+    #[test]
+    fn index_progress_counts_each_facet_against_the_right_repo() {
+        let store = Store::open_in_memory().unwrap();
+        for name in ["o/app", "o/lib", "o/untouched"] {
+            store
+                .put_repo(
+                    &RepoEntry {
+                        full_name: name.into(),
+                        description: None,
+                        topics: vec![],
+                        language: Some("rust".into()),
+                        archived: false,
+                        pushed_at: None,
+                        readme_etag: None,
+                        readme: None,
+                        summary: None,
+                        indexed_sha: None,
+                        digest: None,
+                        kind: None,
+                        kind_pinned: false,
+                        fetched_at: Utc::now().to_rfc3339(),
+                    },
+                    false,
+                )
+                .unwrap();
+        }
+        store
+            .put_component_summary(
+                &ComponentSummary {
+                    full_name: "o/app".into(),
+                    path: "crates/a".into(),
+                    purpose: Some("does a".into()),
+                    symptoms: None,
+                    digest: None,
+                    indexed_sha: None,
+                },
+                None,
+            )
+            .unwrap();
+        store
+            .put_commits(&[CommitEntry {
+                full_name: "o/app".into(),
+                sha: "aaa".into(),
+                author: Some("alice".into()),
+                committed_at: Utc::now(),
+                message: "fix the leak\n\nmore detail".into(),
+                url: Some("https://example/aaa".into()),
+                files: vec!["src/pool.rs".into()],
+            }])
+            .unwrap();
+        store
+            .put_commit_summary(
+                "o/app",
+                "aaa",
+                "stops leaking on the error path",
+                &[],
+                None,
+                None,
+            )
+            .unwrap();
+        // A second cached commit with no summary, so done < total is visible.
+        store
+            .put_commits(&[CommitEntry {
+                full_name: "o/app".into(),
+                sha: "bbb".into(),
+                author: None,
+                committed_at: Utc::now(),
+                message: "unrelated".into(),
+                url: None,
+                files: vec![],
+            }])
+            .unwrap();
+        store
+            .put_repo_deps(
+                "o/app",
+                &[("o/lib".into(), "lib".into(), "Cargo.toml".into())],
+            )
+            .unwrap();
+        store
+            .set_commit_window("o/app", Utc::now() - chrono::Duration::days(30))
+            .unwrap();
+
+        let all = store.index_progress_all().unwrap();
+        let by = |n: &str| {
+            all.iter()
+                .find(|r| r.full_name == n)
+                .unwrap_or_else(|| panic!("{n} missing"))
+        };
+
+        let app = by("o/app");
+        assert_eq!(app.components, 1);
+        assert_eq!(app.commits_cached, 2);
+        assert_eq!(app.commits_summarized, 1);
+        assert_eq!(app.depends_on, 1);
+        assert_eq!(app.depended_on_by, 0);
+        assert!(app.history_back_to.is_some());
+
+        // The edge belongs to `o/app` outbound and `o/lib` inbound — and to neither in the
+        // other direction. This is the case the panel flags: a repo the graph points at with
+        // nothing indexed inside it.
+        let lib = by("o/lib");
+        assert_eq!(lib.depended_on_by, 1);
+        assert_eq!(lib.depends_on, 0);
+        assert_eq!(lib.components, 0);
+
+        // A repo with no index presence at all reports zeroes, not the other repos' counts.
+        let none = by("o/untouched");
+        assert_eq!(
+            (
+                none.components,
+                none.commits_cached,
+                none.commits_summarized,
+                none.depends_on,
+                none.depended_on_by
+            ),
+            (0, 0, 0, 0, 0)
+        );
+        // Never fetched is distinguishable from nothing-left-to-do.
+        assert!(none.history_back_to.is_none());
+    }
+
+    #[test]
+    fn commit_summaries_carry_enough_of_the_commit_to_be_recognizable() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .put_commits(&[CommitEntry {
+                full_name: "o/app".into(),
+                sha: "aaa1111".into(),
+                author: Some("alice".into()),
+                committed_at: Utc::now(),
+                message: "fix the pool leak\n\nlonger body that must not be shown".into(),
+                url: Some("https://example/aaa1111".into()),
+                files: vec!["src/pool.rs".into()],
+            }])
+            .unwrap();
+        store
+            .put_commit_summary(
+                "o/app",
+                "aaa1111",
+                "stops leaking on the error path",
+                &["crates/pool".into()],
+                None,
+                Some("local"),
+            )
+            .unwrap();
+
+        let rows = store.commit_summaries_for_repo("o/app", 10).unwrap();
+        assert_eq!(rows.len(), 1);
+        let r = &rows[0];
+        assert_eq!(r.summary, "stops leaking on the error path");
+        // First line only: the summary is behavioural and deliberately doesn't restate the
+        // message, so showing the whole body next to it would bury it.
+        assert_eq!(r.subject.as_deref(), Some("fix the pool leak"));
+        assert_eq!(r.author.as_deref(), Some("alice"));
+        assert_eq!(r.components, vec!["crates/pool".to_string()]);
+        assert_eq!(r.model.as_deref(), Some("local"));
+        assert!(r.url.is_some());
+
+        // A summary whose commit is no longer cached still renders — the sha and the summary
+        // are the durable half, and dropping the row would make the count and the list
+        // disagree.
+        store
+            .put_commit_summary(
+                "o/app",
+                "orphan",
+                "summary with no commit row",
+                &[],
+                None,
+                None,
+            )
+            .unwrap();
+        let rows = store.commit_summaries_for_repo("o/app", 10).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(rows
+            .iter()
+            .any(|r| r.sha == "orphan" && r.subject.is_none()));
+    }
+
+    /// An out-of-date database must be refused by name, not by failing somewhere arbitrary
+    /// inside `execute_batch`.
+    ///
+    /// The failure this replaces: `CREATE TABLE IF NOT EXISTS signals` skips a pre-existing
+    /// `signals` of an older shape, so `CREATE INDEX … ON signals(upstream_gone)` fails with
+    /// `no such column`, and rusqlite renders that as the message plus the entire remainder
+    /// of the batch and a byte offset into it. What the operator sees is a screenful of DDL
+    /// for whichever table their terminal stopped at — a real report of this landed on
+    /// `subject_root_cause`, which was neither the cause nor even mentioned in the error.
+    #[test]
+    fn an_older_database_is_refused_by_name_rather_than_failing_mid_schema() {
+        let dir = std::env::temp_dir().join("mugglebot-schema-compat-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("old.sqlite");
+
+        // A pre-rewrite database: `signals` without the columns the current schema indexes.
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE signals (id TEXT PRIMARY KEY, source TEXT NOT NULL);
+                 CREATE TABLE threads (id TEXT PRIMARY KEY);",
+            )
+            .unwrap();
+        }
+
+        let msg = match Store::open(&path) {
+            Ok(_) => panic!("an older database must be refused"),
+            Err(e) => format!("{e:#}"),
+        };
+        assert!(
+            msg.contains("older MuggleBot"),
+            "must name the cause, got: {msg}"
+        );
+        assert!(msg.contains("no migration path"), "{msg}");
+        // The path and the way out, because "incompatible" with no next step is a dead end.
+        assert!(msg.contains("old.sqlite"), "{msg}");
+        assert!(msg.contains("mv "), "{msg}");
+        // And emphatically NOT the old failure mode.
+        assert!(
+            !msg.contains("CREATE TABLE"),
+            "must not dump the schema at the operator: {msg}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A database this build created must reopen, and reopen again — the version stamp is
+    /// only useful if the happy path is unaffected by it.
+    #[test]
+    fn a_current_database_reopens_cleanly() {
+        let dir = std::env::temp_dir().join("mugglebot-schema-reopen-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("current.sqlite");
+
+        for attempt in 1..=3 {
+            let store = Store::open(&path).unwrap_or_else(|e| panic!("open {attempt}: {e:#}"));
+            // Usable, not merely openable.
+            store
+                .put_explanation("o/r#1", "sig-1", "text", EXPLAIN_LOCAL, &[], &[])
+                .unwrap();
+            drop(store);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Two explanations of one subject must coexist: the local one MuggleBot wrote on its
+    /// own, and the cloud one somebody asked for. A single-row table would make asking for
+    /// a second opinion destroy the answer being compared against.
+    #[test]
+    fn a_second_opinion_sits_beside_the_local_explanation_rather_than_replacing_it() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .put_explanation("o/r#412", "sig-9", "local read", EXPLAIN_LOCAL, &[], &[])
+            .unwrap();
+        store
+            .put_explanation(
+                "o/r#412",
+                "sig-9",
+                "cloud read",
+                EXPLAIN_CLOUD,
+                &["pr_critiques".into()],
+                &["1 link removed (not in the dossier)".into()],
+            )
+            .unwrap();
+
+        let all = store.explanations("o/r#412").unwrap();
+        assert_eq!(all.len(), 2, "both must survive");
+        // Local first: it is what MuggleBot actually concluded, and it cost nothing.
+        assert_eq!(all[0].produced_by, EXPLAIN_LOCAL);
+        assert_eq!(all[0].markdown, "local read");
+        assert_eq!(all[1].produced_by, EXPLAIN_CLOUD);
+        // The removals ride with the explanation they were removed from, not globally —
+        // the local answer here was clean and must not inherit the cloud one's note.
+        assert!(all[0].removed.is_empty());
+        assert_eq!(all[1].removed.len(), 1);
+
+        // Re-explaining replaces that author's row and leaves the other alone.
+        store
+            .put_explanation("o/r#412", "sig-11", "local, again", EXPLAIN_LOCAL, &[], &[])
+            .unwrap();
+        let all = store.explanations("o/r#412").unwrap();
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].markdown, "local, again");
+        assert_eq!(all[0].watermark, "sig-11");
+        assert_eq!(
+            all[1].markdown, "cloud read",
+            "a fresh local pass must not wipe the second opinion"
+        );
+
+        let one = store
+            .get_explanation("o/r#412", EXPLAIN_CLOUD)
+            .unwrap()
+            .expect("addressable by author");
+        assert_eq!(one.markdown, "cloud read");
     }
 }

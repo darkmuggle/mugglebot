@@ -16,8 +16,11 @@ use chrono::{DateTime, Utc};
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, IF_NONE_MATCH, USER_AGENT};
 use reqwest::StatusCode;
 use serde::Deserialize;
+use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::OnceLock;
 use std::time::Duration;
-use tracing::debug;
+use tokio::sync::Mutex;
+use tracing::{debug, warn};
 
 use crate::store::CommitEntry;
 
@@ -38,6 +41,152 @@ const README_CHARS: usize = 12_000;
 pub struct GithubClient {
     client: reqwest::Client,
     token: String,
+    /// Whether this client's calls may spend the reserve. See [`Priority`].
+    priority: Priority,
+}
+
+/// What a caller's requests are for, which decides how they are rationed.
+///
+/// GitHub's budget is **5000 requests per hour** for a user token, and the `github` vqueue does
+/// not help: it bounds how many calls run *at once*, and the budget is a rate. With 147 repo
+/// indexers ticking every 30 seconds and up to twelve calls each, the burn is ~200k/hour —
+/// forty times the budget, which is how a 403 arrived.
+///
+/// The split exists because the two kinds of caller are not equally important. If background
+/// indexing drains the budget, notification polling stops, and an ops agent that has stopped
+/// noticing incidents is broken in a way that a slow index is not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Priority {
+    /// Watchers and operator actions. Always allowed; never deliberately slowed.
+    Interactive,
+    /// Indexing and crawling. Paced from the remaining budget, and stopped outright once the
+    /// reserve is all that is left.
+    Background,
+}
+
+/// Requests kept back for [`Priority::Interactive`] callers.
+///
+/// Sized so a busy hour of watcher polling and operator actions fits comfortably: the GitHub
+/// watcher at a 60s cadence is ~60 calls an hour plus enrichment, and a triage or an
+/// investigation is tens more.
+const RESERVE: i64 = 1_000;
+
+/// The per-hour budget assumed before any response has told us otherwise.
+const ASSUMED_BUDGET: i64 = 5_000;
+
+/// Process-wide view of the GitHub budget, learned from response headers.
+///
+/// Global because the budget is per *token*, not per client, and several clients exist (the
+/// watchers', the indexer's, the repo crawler's). A per-client limiter would let each of them
+/// independently believe it had the whole budget, which is the arithmetic that produced the
+/// 403.
+struct Budget {
+    remaining: AtomicI64,
+    /// Epoch seconds when the window resets.
+    reset_at: AtomicI64,
+    /// Serializes the pace calculation so two background callers can't both decide the coast
+    /// is clear at the same instant.
+    pace: Mutex<()>,
+}
+
+static BUDGET: OnceLock<Budget> = OnceLock::new();
+
+fn budget() -> &'static Budget {
+    BUDGET.get_or_init(|| Budget {
+        remaining: AtomicI64::new(ASSUMED_BUDGET),
+        reset_at: AtomicI64::new(0),
+        pace: Mutex::new(()),
+    })
+}
+
+fn now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// How long until the budget resets, or zero if that moment has passed.
+fn until_reset() -> Duration {
+    let reset = budget().reset_at.load(Ordering::Relaxed);
+    let delta = reset - now_secs();
+    Duration::from_secs(delta.max(0) as u64)
+}
+
+/// Learn the budget from a response's headers.
+///
+/// Read from every response rather than polled from `/rate_limit`, because asking costs a
+/// request and every answer is already carrying the number.
+fn observe(headers: &HeaderMap) {
+    let get = |name: &str| -> Option<i64> {
+        headers.get(name)?.to_str().ok()?.trim().parse::<i64>().ok()
+    };
+    if let Some(remaining) = get("x-ratelimit-remaining") {
+        budget().remaining.store(remaining, Ordering::Relaxed);
+    }
+    if let Some(reset) = get("x-ratelimit-reset") {
+        budget().reset_at.store(reset, Ordering::Relaxed);
+    }
+}
+
+/// Decide whether this request may proceed, and pace it if so.
+///
+/// Background callers are spaced by *the budget they have left over the time until it resets*,
+/// so the pace corrects itself: plenty of headroom means no delay, and a nearly-spent budget
+/// slows to a crawl instead of hitting a wall. Nothing has to know how many indexers exist.
+async fn admit(priority: Priority) -> Result<()> {
+    if priority == Priority::Interactive {
+        return Ok(());
+    }
+    let _turn = budget().pace.lock().await;
+    let spendable = budget().remaining.load(Ordering::Relaxed) - RESERVE;
+    if spendable <= 0 {
+        let wait = until_reset();
+        bail!(
+            "GitHub budget is down to its {RESERVE}-request reserve, which is held for \
+             notifications and operator actions; background work resumes in {}s",
+            wait.as_secs()
+        );
+    }
+    // Spread what is spendable across the rest of the window.
+    let window = until_reset().as_secs_f64().max(1.0);
+    let spacing = Duration::from_secs_f64((window / spendable as f64).min(30.0));
+    if spacing > Duration::from_millis(50) {
+        tokio::time::sleep(spacing).await;
+    }
+    Ok(())
+}
+
+/// Whether this response is GitHub saying "too many requests".
+///
+/// 403 *and* 429 both carry it, and a 403 is also how a missing scope and a SAML block arrive —
+/// so the exhausted-budget header is what distinguishes them. Treating every 403 as a rate
+/// limit would park all work for an hour over a permissions problem.
+fn is_rate_limited(status: StatusCode, headers: &HeaderMap) -> bool {
+    if status == StatusCode::TOO_MANY_REQUESTS {
+        return true;
+    }
+    if status != StatusCode::FORBIDDEN {
+        return false;
+    }
+    headers
+        .get("x-ratelimit-remaining")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .is_some_and(|r| r <= 0)
+        || headers.contains_key("retry-after")
+}
+
+/// `Retry-After`, when GitHub sends one (secondary rate limits do).
+fn retry_after(headers: &HeaderMap) -> Option<Duration> {
+    let secs = headers
+        .get("retry-after")?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse::<u64>()
+        .ok()?;
+    Some(Duration::from_secs(secs.min(3_600)))
 }
 
 /// One repository as the org listing returns it.
@@ -86,6 +235,13 @@ pub struct PullRequest {
     pub labels: Vec<String>,
     pub head_ref: Option<String>,
     pub updated_at: Option<String>,
+    /// When it was merged, if it was.
+    ///
+    /// GitHub reports a merged pull request as `state: "closed"`, so without this a change
+    /// that shipped and a change that was abandoned are the same string — and they are
+    /// nearly opposite facts. The UI leans on the difference: a merged diff is worth reading
+    /// in full, an abandoned one is worth folding away.
+    pub merged_at: Option<String>,
 }
 
 /// A comment on an issue or pull request.
@@ -162,6 +318,7 @@ pub struct CodeHit {
 }
 
 impl GithubClient {
+    /// An interactive client: watchers and operator actions, never deliberately slowed.
     pub fn new(token: String) -> Result<Self> {
         Ok(Self {
             client: reqwest::Client::builder()
@@ -169,7 +326,18 @@ impl GithubClient {
                 .build()
                 .context("building GitHub HTTP client")?,
             token,
+            priority: Priority::Interactive,
         })
+    }
+
+    /// Mark this client's calls as background work: paced from the remaining budget, and
+    /// refused once only the reserve is left.
+    ///
+    /// Used by the code indexer and the org crawler. They are the callers that can generate
+    /// tens of thousands of requests an hour, and the ones whose lateness costs nothing much.
+    pub fn background(mut self) -> Self {
+        self.priority = Priority::Background;
+        self
     }
 
     fn headers(&self, accept: &str) -> Result<HeaderMap> {
@@ -185,6 +353,7 @@ impl GithubClient {
     }
 
     async fn get_json<T: serde::de::DeserializeOwned>(&self, url: &str) -> Result<T> {
+        admit(self.priority).await?;
         let resp = self
             .client
             .get(url)
@@ -193,7 +362,23 @@ impl GithubClient {
             .await
             .with_context(|| format!("GET {url}"))?;
         let status = resp.status();
+        observe(resp.headers());
         if !status.is_success() {
+            // A rate-limit refusal is transient and self-describing: record that the budget is
+            // gone so every other caller paces off it immediately, rather than each of them
+            // discovering it with its own 403.
+            if is_rate_limited(status, resp.headers()) {
+                budget().remaining.store(0, Ordering::Relaxed);
+                if let Some(retry) = retry_after(resp.headers()) {
+                    budget()
+                        .reset_at
+                        .store(now_secs() + retry.as_secs() as i64, Ordering::Relaxed);
+                }
+                warn!(
+                    "github: rate limited; backing off for {}s",
+                    until_reset().as_secs()
+                );
+            }
             // The message body carries the useful part of a 403 (rate limit vs.
             // SAML vs. missing scope), so surface it instead of the bare code.
             let body = resp.text().await.unwrap_or_default();
@@ -269,19 +454,52 @@ impl GithubClient {
     /// an issue assigned weeks ago with no recent activity produces no notification
     /// but still belongs on the board. Pull requests are filtered out — an assigned
     /// PR is review work, which the notification feed already surfaces.
-    pub async fn assigned_issues(&self, limit: usize) -> Result<Vec<IssueHit>> {
+    /// Open issues and pull requests where the user is an **active participant**: assigned,
+    /// mentioned, or asked to review.
+    ///
+    /// Three queries, because no single endpoint answers it. `/issues?filter=` offers `assigned`
+    /// and `mentioned` but has no review-requested value at all, so that one comes from search.
+    /// And `filter=all` is the wrong shape in both directions — it adds `subscribed`, which is
+    /// passive (you get subscribed by commenting once, and never unsubscribe), and it still misses
+    /// review requests.
+    ///
+    /// `state=open` throughout, which is also how closed and merged work leaves the board: the
+    /// caller reconciles against this listing, so anything no longer in it is resolved rather than
+    /// lingering.
+    ///
+    /// Pull requests are **kept**. They were previously filtered out one line before they would
+    /// have been used, which is why a user's own PRs never appeared at all.
+    pub async fn participating_issues(&self, limit: usize) -> Result<Vec<IssueHit>> {
+        let mut out: Vec<IssueHit> = Vec::new();
+        for filter in ["assigned", "mentioned"] {
+            out.extend(self.issues_by_filter(filter, limit).await?);
+        }
+        // Review requests are only expressible as a search qualifier. Failing softly: a search
+        // outage should not empty the board of assigned work.
+        match self
+            .search_issues("is:open is:pr review-requested:@me", limit.min(PAGE_SIZE))
+            .await
+        {
+            Ok(hits) => out.extend(hits),
+            Err(e) => debug!("participating: review-requested search unavailable: {e:#}"),
+        }
+        // One item can arrive from more than one query — assigned *and* mentioned is common — and
+        // a duplicate here would mint two signals for one piece of work.
+        out.sort_by_key(|h| (h.repo.clone(), h.number));
+        out.dedup_by(|a, b| a.repo == b.repo && a.number == b.number);
+        out.truncate(limit);
+        Ok(out)
+    }
+
+    /// One page-walk of `/issues?filter=…`.
+    async fn issues_by_filter(&self, filter: &str, limit: usize) -> Result<Vec<IssueHit>> {
         let mut out = Vec::new();
         for page in 1..=5 {
             let url =
-                format!("{API}/issues?filter=assigned&state=open&per_page={PAGE_SIZE}&page={page}");
+                format!("{API}/issues?filter={filter}&state=open&per_page={PAGE_SIZE}&page={page}");
             let batch: Vec<GhIssue> = self.get_json(&url).await?;
             let n = batch.len();
-            out.extend(
-                batch
-                    .into_iter()
-                    .filter(|i| i.pull_request.is_none())
-                    .map(IssueHit::from),
-            );
+            out.extend(batch.into_iter().map(IssueHit::from));
             if n < PAGE_SIZE || out.len() >= limit {
                 break;
             }
@@ -337,6 +555,29 @@ impl GithubClient {
         }
         out.truncate(limit);
         Ok(out)
+    }
+
+    /// Commits **older** than `until`, newest first — one page.
+    ///
+    /// The backward direction is what makes indexing a repo's history possible at all:
+    /// [`Self::commits`] can only widen a window from a fixed point forward, so walking
+    /// back from HEAD would mean re-fetching everything already seen on each step. Here the
+    /// caller pages by moving `until` to the oldest commit it got.
+    ///
+    /// `files` is empty for the same reason as [`Self::commits`] — one API call per commit.
+    pub async fn commits_before(
+        &self,
+        full_name: &str,
+        until: DateTime<Utc>,
+        limit: usize,
+    ) -> Result<Vec<CommitEntry>> {
+        let url = format!(
+            "{API}/repos/{full_name}/commits?until={}&per_page={}",
+            until.to_rfc3339(),
+            limit.min(PAGE_SIZE)
+        );
+        let batch: Vec<GhCommit> = self.get_json(&url).await?;
+        Ok(batch.into_iter().map(|c| c.into_entry(full_name)).collect())
     }
 
     /// The conversation on an issue or pull request, oldest first.
@@ -623,6 +864,7 @@ struct GhPull {
     user: Option<GhUser>,
     head: Option<GhRef>,
     updated_at: Option<String>,
+    merged_at: Option<String>,
 }
 
 impl PullRequest {
@@ -639,6 +881,7 @@ impl PullRequest {
             labels: p.labels.into_iter().map(|l| l.name).collect(),
             head_ref: p.head.map(|h| h.label),
             updated_at: p.updated_at,
+            merged_at: p.merged_at,
         }
     }
 }
@@ -837,6 +1080,33 @@ mod tests {
         assert_eq!(urlencode("\"quoted phrase\""), "%22quoted+phrase%22");
     }
 
+    /// A merged pull request and an abandoned one must not read the same.
+    ///
+    /// GitHub reports both as `state: "closed"`; only `merged_at` tells them apart, and the
+    /// UI decides whether to unfold a diff on that difference.
+    #[test]
+    fn a_merged_pull_request_is_distinguishable_from_an_abandoned_one() {
+        let wire = |merged: Option<&str>| {
+            let mut raw = serde_json::json!({
+                "number": 7, "title": "bump image", "state": "closed",
+                "html_url": "https://github.com/o/r/pull/7",
+                "body": null, "labels": [], "user": {"login": "octocat"},
+                "head": {"label": "octocat:bump"}, "updated_at": "2026-07-27T22:00:00Z"
+            });
+            if let Some(m) = merged {
+                raw["merged_at"] = serde_json::json!(m);
+            }
+            PullRequest::from_wire(serde_json::from_value::<GhPull>(raw).unwrap(), "o/r")
+        };
+        let merged = wire(Some("2026-07-27T22:10:00Z"));
+        assert_eq!(merged.state, "closed", "upstream says closed either way");
+        assert_eq!(merged.merged_at.as_deref(), Some("2026-07-27T22:10:00Z"));
+
+        // Absent, not empty: a PR closed without merging has no merge time, and the field
+        // has to be missing-tolerant because the field is absent from the payload entirely.
+        assert_eq!(wire(None).merged_at, None);
+    }
+
     #[test]
     fn issue_hit_marks_pull_requests() {
         let raw = serde_json::json!({
@@ -872,5 +1142,112 @@ mod tests {
         assert_eq!(c.author.as_deref(), Some("octocat"));
         assert_eq!(c.subject(), "fix: bound the pool");
         assert_eq!(c.short_sha(), "abc123de");
+    }
+
+    fn hdrs(pairs: &[(&str, &str)]) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        for (k, v) in pairs {
+            h.insert(
+                reqwest::header::HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                HeaderValue::from_str(v).unwrap(),
+            );
+        }
+        h
+    }
+
+    /// A 403 is how GitHub reports an exhausted budget *and* a missing scope *and* a SAML block.
+    /// Treating all of them as a rate limit would park every background call for an hour over a
+    /// permissions problem that no amount of waiting fixes.
+    #[test]
+    fn only_an_exhausted_403_counts_as_a_rate_limit() {
+        assert!(is_rate_limited(
+            StatusCode::FORBIDDEN,
+            &hdrs(&[("x-ratelimit-remaining", "0")])
+        ));
+        assert!(is_rate_limited(StatusCode::TOO_MANY_REQUESTS, &hdrs(&[])));
+        // Secondary limits send Retry-After without zeroing the primary counter.
+        assert!(is_rate_limited(
+            StatusCode::FORBIDDEN,
+            &hdrs(&[("retry-after", "60")])
+        ));
+
+        // A scope or SAML failure: budget intact, so not a rate limit.
+        assert!(!is_rate_limited(
+            StatusCode::FORBIDDEN,
+            &hdrs(&[("x-ratelimit-remaining", "4931")])
+        ));
+        assert!(!is_rate_limited(StatusCode::FORBIDDEN, &hdrs(&[])));
+        assert!(!is_rate_limited(StatusCode::NOT_FOUND, &hdrs(&[])));
+        assert!(!is_rate_limited(
+            StatusCode::UNAUTHORIZED,
+            &hdrs(&[("x-ratelimit-remaining", "0")])
+        ));
+    }
+
+    #[test]
+    fn retry_after_is_read_and_bounded() {
+        assert_eq!(
+            retry_after(&hdrs(&[("retry-after", "45")])),
+            Some(Duration::from_secs(45))
+        );
+        assert_eq!(retry_after(&hdrs(&[])), None);
+        // A hostile or garbled value must not park work for a week.
+        assert_eq!(
+            retry_after(&hdrs(&[("retry-after", "999999")])),
+            Some(Duration::from_secs(3_600))
+        );
+        assert_eq!(retry_after(&hdrs(&[("retry-after", "soon")])), None);
+    }
+    /// Everything that touches the process-wide budget, in one test.
+    ///
+    /// One test on purpose: `BUDGET` is global, and as separate `#[test]` fns the harness runs
+    /// them on parallel threads where each sees the others' writes. Splitting them cost three
+    /// rounds of phantom failures before this comment existed.
+    #[tokio::test]
+    async fn the_budget_is_learned_paced_and_reserved() {
+        // Learned from headers, because every response already carries the number and asking
+        // `/rate_limit` would spend one to find out.
+        observe(&hdrs(&[
+            ("x-ratelimit-remaining", "4321"),
+            ("x-ratelimit-reset", "1785178741"),
+        ]));
+        assert_eq!(budget().remaining.load(Ordering::Relaxed), 4321);
+        assert_eq!(budget().reset_at.load(Ordering::Relaxed), 1785178741);
+
+        // Garbage is ignored rather than read as zero, which would park all background work.
+        observe(&hdrs(&[("x-ratelimit-remaining", "not-a-number")]));
+        assert_eq!(budget().remaining.load(Ordering::Relaxed), 4321);
+
+        // With headroom, background work is admitted without a meaningful delay: the pacing is
+        // meant to bound a 200k/hour burn, not to slow a healthy system.
+        observe(&hdrs(&[
+            ("x-ratelimit-remaining", "5000"),
+            ("x-ratelimit-reset", &(now_secs() + 3_600).to_string()),
+        ]));
+        let started = std::time::Instant::now();
+        admit(Priority::Background).await.expect("admitted");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "healthy pacing took {:?}",
+            started.elapsed()
+        );
+
+        // Down to the reserve: background yields, interactive never does. A watcher that stops
+        // noticing incidents is a worse failure than an index that finishes late.
+        observe(&hdrs(&[
+            ("x-ratelimit-remaining", "10"),
+            ("x-ratelimit-reset", &(now_secs() + 300).to_string()),
+        ]));
+        let err = admit(Priority::Background)
+            .await
+            .expect_err("background must yield the reserve");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("reserve"), "{msg}");
+        // The refusal has to say when it lifts, or it reads as permanent.
+        assert!(msg.contains("resumes in"), "{msg}");
+        assert!(
+            admit(Priority::Interactive).await.is_ok(),
+            "the reserve is held for exactly this caller"
+        );
     }
 }

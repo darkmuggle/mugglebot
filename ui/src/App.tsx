@@ -4,18 +4,19 @@ import Chat from "./components/Chat";
 import ConfigPage from "./components/Config";
 import ContextLibrary from "./components/Context";
 import MemoryEditor from "./components/Memory";
+import RepoIndexView from "./components/RepoIndex";
 import TagEditor from "./components/Tags";
-import ThreadDetail from "./components/ThreadDetail";
-import { connect, connected, disconnect, health, hints, redAlert, signals, threads } from "./state";
+import SubjectDetail from "./components/SubjectDetail";
+import { connect, connected, disconnect, health, hints, redAlert, signals, subjects } from "./state";
 
-type View = "board" | "memory" | "context" | "tags" | "chat" | "config";
+type View = "board" | "memory" | "context" | "tags" | "index" | "chat" | "config";
 
 const SOURCES = ["github", "slack", "granola"] as const;
 
 export default function App() {
   const [view, setView] = createSignal<View>("board");
   const [selected, setSelected] = createSignal<string | null>(null);
-  // Active board filter: show only threads carrying a signal from this source.
+  // Active board filter: show only subjects carrying a signal from this source.
   // null = no filter (show all). Toggled from the SOURCES rail.
   const [sourceFilter, setSourceFilter] = createSignal<string | null>(null);
 
@@ -42,6 +43,7 @@ export default function App() {
     { id: "memory", label: "MEMORY", sep: true },
     { id: "context", label: "CONTEXT" },
     { id: "tags", label: "TAGS" },
+    { id: "index", label: "CODE INDEX" },
     { id: "config", label: "CONFIG" },
   ];
 
@@ -109,7 +111,7 @@ export default function App() {
           </For>
 
           <div class="rail-spacer" />
-          <div class="count">{Object.keys(threads).length}</div>
+          <div class="count">{Object.keys(subjects).length}</div>
           <div class="count-label">THREADS</div>
           <div class="subcount">
             {Object.keys(signals).length} signals · {hints().length} hints
@@ -128,7 +130,7 @@ export default function App() {
                 when={selected()}
                 fallback={<Board onOpen={openThread} sourceFilter={sourceFilter()} />}
               >
-                <ThreadDetail
+                <SubjectDetail
                   id={selected()!}
                   onBack={() => setSelected(null)}
                   onOpen={openThread}
@@ -147,6 +149,11 @@ export default function App() {
             </Match>
             <Match when={view() === "chat"}>
               <Chat />
+            </Match>
+            <Match when={view() === "index"}>
+              {/* The chat hand-off: the seed is set on shared state, and switching views is
+                  what makes the Chat component consume it on mount. */}
+              <RepoIndexView onChat={openChat} />
             </Match>
             <Match when={view() === "config"}>
               <ConfigPage />

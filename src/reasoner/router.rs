@@ -451,12 +451,49 @@ mod tests {
         CompletionRequest::single(prompt).with_system(system)
     }
 
+    /// A router with escalation **on**. The shipped default is off — the local model
+    /// answers everything and a cloud model is asked only by name — so these tests have to
+    /// opt in explicitly, exactly as an operator would.
     fn router(
         local: Arc<dyn Reasoner>,
         mid: Arc<dyn Reasoner>,
         heavy: Arc<dyn Reasoner>,
     ) -> RoutingReasoner {
-        RoutingReasoner::new(local, mid, heavy, RoutingCfg::default())
+        RoutingReasoner::new(local, mid, heavy, escalating())
+    }
+
+    fn escalating() -> RoutingCfg {
+        RoutingCfg {
+            enabled: true,
+            cleanup: true,
+            cloud_fallback: true,
+        }
+    }
+
+    /// The shipped default must keep everything on the local model, ungraded. This is the
+    /// policy test: if it fails, an ordinary install is making cloud calls nobody asked for.
+    #[tokio::test]
+    async fn the_default_config_never_leaves_the_machine() {
+        for grade in ["easy", "medium", "hard", "extra_hard"] {
+            let local = Local::new(grade, "local answer");
+            let mid = Spy::new("mid", "mid answer");
+            let heavy = Spy::new("heavy", "heavy answer");
+            let r = RoutingReasoner::new(
+                local.clone(),
+                mid.clone(),
+                heavy.clone(),
+                RoutingCfg::default(),
+            );
+            let out = r.complete(&task("classify this", "input")).await.unwrap();
+            assert_eq!(out, "local answer", "{grade} must stay local by default");
+            assert_eq!(mid.calls(), 0, "{grade} reached the mid tier");
+            assert_eq!(heavy.calls(), 0, "{grade} reached the cloud tier");
+            assert_eq!(
+                local.grades.load(Ordering::Relaxed),
+                0,
+                "{grade} paid for a difficulty grade with nothing to escalate to"
+            );
+        }
     }
 
     #[tokio::test]
@@ -549,7 +586,7 @@ mod tests {
             Spy::new("heavy", "heavy"),
             RoutingCfg {
                 cloud_fallback: false,
-                ..Default::default()
+                ..escalating()
             },
         );
         let err = r

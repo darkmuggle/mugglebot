@@ -28,7 +28,7 @@ use url::Url;
 
 use super::{PollBatch, Watcher};
 use crate::config::{self, SlackSource};
-use crate::signal::{Entity, Severity, Signal, SignalKind, Source, State};
+use crate::signal::{ResolutionKey, Severity, Signal, SignalKind, Source};
 
 const API: &str = "https://slack.com/api";
 
@@ -91,6 +91,21 @@ pub struct SlackMessage {
     /// every text node rather than modeling the full (recursive) block grammar.
     #[serde(default)]
     pub blocks: Value,
+    /// Present when the message has been edited: `{ user, ts }`. The edit ts is the
+    /// message's version — an edit is new content on the same `ts`, so without it a
+    /// corrected alert would be swallowed as a duplicate.
+    #[serde(default)]
+    pub edited: Value,
+}
+
+impl SlackMessage {
+    /// The edit timestamp, if this message has been edited.
+    pub fn edited_ts(&self) -> Option<String> {
+        self.edited
+            .get("ts")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+    }
 }
 
 /// A legacy Slack message attachment. Only the text-bearing fields matter to us.
@@ -145,7 +160,19 @@ pub struct SearchMatch {
     pub attachments: Vec<Attachment>,
     #[serde(default)]
     pub blocks: Value,
+    /// See [`SlackMessage::edited`] — an edit is a new version of the same `ts`.
+    #[serde(default)]
+    pub edited: Value,
     pub channel: SearchChannel,
+}
+
+impl SearchMatch {
+    pub fn edited_ts(&self) -> Option<String> {
+        self.edited
+            .get("ts")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -385,6 +412,36 @@ impl Watcher for SlackWatcher {
         self.interval
     }
 
+    /// Per-channel cursors plus the search cursor, as JSON. Opaque to the caller:
+    /// the `Watcher` object stores it and hands it back.
+    fn cursor(&self) -> Option<String> {
+        let state = self.state.lock().ok()?;
+        serde_json::to_string(&serde_json::json!({
+            "cursors": state.cursors,
+            "search": state.search_cursor,
+        }))
+        .ok()
+    }
+
+    fn restore_cursor(&self, cursor: &str) {
+        let Ok(v) = serde_json::from_str::<Value>(cursor) else {
+            // A cursor this watcher no longer understands means "start fresh",
+            // which for Slack is a silent seed rather than a history flood.
+            return;
+        };
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        if let Some(map) = v.get("cursors").and_then(|c| c.as_object()) {
+            for (channel, ts) in map {
+                if let Some(ts) = ts.as_str() {
+                    state.cursors.insert(channel.clone(), ts.to_string());
+                }
+            }
+        }
+        state.search_cursor = v.get("search").and_then(|s| s.as_str()).map(str::to_string);
+    }
+
     async fn poll(&self) -> Result<PollBatch> {
         self.resolve_ids().await?;
 
@@ -511,30 +568,34 @@ pub fn normalize_message(
     let external_id = format!("{channel_id}/{}", m.ts);
     let urls = extract_urls(&segments.join("\n"));
     let actor = m.user.clone().or_else(|| m.username.clone());
-    let mut entities = extract_entities(&text, channel_name, actor.as_deref());
-    entities.extend(github_ref_entities(&urls));
-    entities.push(slack_thread_entity(
+    let mut keys = extract_entities(&text, channel_name, actor.as_deref());
+    keys.extend(github_ref_entities(&urls));
+    keys.push(slack_thread_entity(
         channel_id,
         &m.ts,
         m.thread_ts.as_deref(),
     ));
     let title = summarize(&text, channel_name);
 
+    // A Slack message is mutable: an edit is new content on the same ts, so the
+    // edit timestamp is the version.
+    let version = m.edited_ts();
     Some(Signal {
-        id: Signal::make_id(Source::Slack, &external_id),
+        id: Signal::make_id(Source::Slack, &external_id, version.as_deref()),
         source: Source::Slack,
         external_id,
+        version,
         kind,
         title,
         body: Some(text),
         url: None,
         actor,
-        entities,
+        keys,
         severity,
-        state: State::Unseen,
+        upstream_gone: false,
         occurred_at,
         ingested_at: Utc::now(),
-        thread: None,
+        subject: None,
         raw: serde_json::json!({
             "channel": channel_name,
             "channel_id": channel_id,
@@ -588,30 +649,33 @@ pub fn normalize_search_match(m: &SearchMatch, user_id: Option<&str>) -> Option<
     let external_id = format!("{}/{}", m.channel.id, m.ts);
     let urls = extract_urls(&segments.join("\n"));
     let actor = m.user.clone().or_else(|| m.username.clone());
-    let mut entities = extract_entities(&text, &channel_name, actor.as_deref());
-    entities.extend(github_ref_entities(&urls));
-    entities.push(slack_thread_entity(
+    let mut keys = extract_entities(&text, &channel_name, actor.as_deref());
+    keys.extend(github_ref_entities(&urls));
+    keys.push(slack_thread_entity(
         &m.channel.id,
         &m.ts,
         m.thread_ts.as_deref(),
     ));
     let title = summarize(&text, &channel_name);
 
+    // A search hit is a message like any other, so an edit is a new version of it.
+    let version = m.edited_ts();
     Some(Signal {
-        id: Signal::make_id(Source::Slack, &external_id),
+        id: Signal::make_id(Source::Slack, &external_id, version.as_deref()),
         source: Source::Slack,
         external_id,
+        version,
         kind: SignalKind::Mention,
         title,
         body: Some(text),
         url: m.permalink.clone(),
         actor,
-        entities,
+        keys,
         severity: Severity::Notice,
-        state: State::Unseen,
+        upstream_gone: false,
         occurred_at,
         ingested_at: Utc::now(),
-        thread: None,
+        subject: None,
         raw: serde_json::json!({
             "channel": channel_name,
             "channel_id": m.channel.id,
@@ -799,10 +863,10 @@ pub fn extract_urls(text: &str) -> Vec<String> {
     out
 }
 
-fn extract_entities(text: &str, channel: &str, author: Option<&str>) -> Vec<Entity> {
-    let mut ents = vec![Entity::new("channel", format!("#{channel}"))];
+fn extract_entities(text: &str, channel: &str, author: Option<&str>) -> Vec<ResolutionKey> {
+    let mut ents = vec![ResolutionKey::new("channel", format!("#{channel}"))];
     if let Some(a) = author {
-        ents.push(Entity::new("person", a));
+        ents.push(ResolutionKey::new("person", a));
     }
     // `owner/repo`-shaped tokens link Slack chatter to GitHub signals.
     for tok in text.split(|c: char| c.is_whitespace() || matches!(c, ',' | ';' | '(' | ')')) {
@@ -818,7 +882,7 @@ fn extract_entities(text: &str, channel: &str, author: Option<&str>) -> Vec<Enti
                 && b.chars()
                     .all(|c| c.is_alphanumeric() || matches!(c, '-' | '_' | '.'))
             {
-                ents.push(Entity::new("repo", t));
+                ents.push(ResolutionKey::new("repo", t));
             }
         }
         if let Some(env) = environment_entity(t) {
@@ -839,7 +903,7 @@ fn extract_entities(text: &str, channel: &str, author: Option<&str>) -> Vec<Enti
 /// `env-201kbhtqassagmd9t46x1s2sebq`. This is the correlation anchor for tenant
 /// alerts: every alert naming the same id groups onto one thread instead of
 /// spawning one-thread-per-alert, so the fuzzy classifier never has to guess.
-fn environment_entity(tok: &str) -> Option<Entity> {
+fn environment_entity(tok: &str) -> Option<ResolutionKey> {
     const PREFIXES: &[&str] = &["env-2", "acc-1", "org-1"];
     if !PREFIXES.iter().any(|p| tok.starts_with(p)) {
         return None;
@@ -854,15 +918,15 @@ fn environment_entity(tok: &str) -> Option<Entity> {
     {
         return None;
     }
-    Some(Entity::new("environment", tok))
+    Some(ResolutionKey::new("environment", tok))
 }
 
 /// Group replies in one Slack conversation together. A reply carries its root's
 /// `thread_ts`; a top-level message keys on its own `ts`, so it shares the key
 /// with any replies that later reference it.
-fn slack_thread_entity(channel_id: &str, ts: &str, thread_ts: Option<&str>) -> Entity {
+fn slack_thread_entity(channel_id: &str, ts: &str, thread_ts: Option<&str>) -> ResolutionKey {
     let convo = thread_ts.unwrap_or(ts);
-    Entity::new("slack_thread", format!("{channel_id}/{convo}"))
+    ResolutionKey::new("slack_thread", format!("{channel_id}/{convo}"))
 }
 
 /// Parse GitHub PR/issue/discussion references out of a message's URLs, emitting
@@ -870,8 +934,8 @@ fn slack_thread_entity(channel_id: &str, ts: &str, thread_ts: Option<&str>) -> E
 /// `github.rs` `subject_entity`), so a Slack message linking a PR/issue groups
 /// into the same thread as the GitHub signal about it. Handles both web
 /// (`github.com/o/r/pull/7`) and API (`api.github.com/repos/o/r/pulls/7`) forms.
-fn github_ref_entities(urls: &[String]) -> Vec<Entity> {
-    let mut out: Vec<Entity> = Vec::new();
+fn github_ref_entities(urls: &[String]) -> Vec<ResolutionKey> {
+    let mut out: Vec<ResolutionKey> = Vec::new();
     for u in urls {
         if let Some(e) = github_ref_entity(u) {
             if !out.iter().any(|x| x.kind == e.kind && x.value == e.value) {
@@ -882,7 +946,7 @@ fn github_ref_entities(urls: &[String]) -> Vec<Entity> {
     out
 }
 
-fn github_ref_entity(url: &str) -> Option<Entity> {
+fn github_ref_entity(url: &str) -> Option<ResolutionKey> {
     let parsed = Url::parse(url).ok()?;
     let segs: Vec<&str> = parsed.path().split('/').filter(|s| !s.is_empty()).collect();
     // (owner, repo, kind-segment, number) positioned differently on web vs API.
@@ -900,7 +964,7 @@ fn github_ref_entity(url: &str) -> Option<Entity> {
         "discussions" => "discussion",
         _ => return None,
     };
-    Some(Entity::new(kind, format!("{owner}/{repo}#{n}")))
+    Some(ResolutionKey::new(kind, format!("{owner}/{repo}#{n}")))
 }
 
 /// Does this token look like a clickable link (http/https/mailto)?
@@ -983,11 +1047,11 @@ mod tests {
         assert_eq!(s.severity, Severity::Critical);
         // The environment id is surfaced as a strong correlation entity.
         assert!(
-            s.entities
+            s.keys
                 .iter()
                 .any(|e| e.kind == "environment" && e.value == "env-201kbhtqassagmd9t46x1s2sebq"),
             "environment entity: {:?}",
-            s.entities
+            s.keys
         );
         // Bot display name stands in for the missing user as the actor.
         assert_eq!(s.actor.as_deref(), Some("Cloud Alerts"));
@@ -1011,7 +1075,7 @@ mod tests {
             "section block: {body}"
         );
         assert!(s
-            .entities
+            .keys
             .iter()
             .any(|e| e.kind == "environment" && e.value == "env-201kae9veyje5j1fk49829dj2a8"));
     }
@@ -1044,7 +1108,7 @@ mod tests {
         assert!(matches!(s.kind, SignalKind::Alert));
         assert_eq!(s.severity, Severity::Critical);
         assert!(s
-            .entities
+            .keys
             .iter()
             .any(|e| e.kind == "channel" && e.value == "#alerts"));
     }
@@ -1077,7 +1141,7 @@ mod tests {
         assert_eq!(s.raw["is_self"], true);
         assert_eq!(s.raw["mentions_me"], true);
         assert!(s
-            .entities
+            .keys
             .iter()
             .any(|e| e.kind == "repo" && e.value == "acme/widgets"));
     }
@@ -1170,11 +1234,11 @@ mod tests {
         };
         let s = normalize_message(&m, "eng", "C2", false, Some("UME"), &[]).unwrap();
         assert!(
-            s.entities
+            s.keys
                 .iter()
                 .any(|e| e.kind == "pr" && e.value == "octo/repo#17"),
             "expected pr:octo/repo#17, got {:?}",
-            s.entities
+            s.keys
         );
     }
 
@@ -1190,11 +1254,11 @@ mod tests {
         };
         let s = normalize_message(&m, "eng", "C2", false, Some("UME"), &[]).unwrap();
         assert!(
-            s.entities
+            s.keys
                 .iter()
                 .any(|e| e.kind == "slack_thread" && e.value == "C2/1700000000.000100"),
             "reply should key on its root thread_ts, got {:?}",
-            s.entities
+            s.keys
         );
     }
 
@@ -1236,11 +1300,11 @@ mod tests {
         assert_eq!(s.raw["is_self"], false);
         // Falls back to the channel id as the label when a DM has no name.
         assert!(s
-            .entities
+            .keys
             .iter()
             .any(|e| e.kind == "channel" && e.value == "#D1"));
         assert!(s
-            .entities
+            .keys
             .iter()
             .any(|e| e.kind == "repo" && e.value == "acme/widgets"));
     }

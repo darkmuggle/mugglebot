@@ -2,15 +2,19 @@
 //!
 //! A multimodal chat surface: the engineer talks to MuggleBot and can drop
 //! screenshots, images, logs, or files. The agent reasons over everything
-//! MuggleBot holds — the board, signals, threads, memory, the context library —
+//! MuggleBot holds — the board, signals, subjects, memory, the context library —
 //! through the **same [`crate::tools`] surface as the MCP server**, so
 //! "what's going on with service-foo?" and "does this dashboard match the alert
 //! in #alerts?" both work.
 //!
-//! Routing is to the heavy reasoner (Claude), which handles vision for dropped
-//! images. The agent runs a small tool-use loop: it emits a JSON action each
-//! turn — call a tool, or give a final answer — and we execute tools and feed the
-//! results back until it answers or the step budget is spent.
+//! Routing is **local**, like everything else MuggleBot does unsupervised. A message
+//! carrying images goes to the local vision model instead, because a coder model has no
+//! image encoder and would answer about an attachment it never saw. The chat pane's model
+//! picker is how you ask a cloud model instead — that is the operator asking, by name.
+//!
+//! The agent runs a small tool-use loop: it emits a JSON action each turn — call a tool,
+//! or give a final answer — and we execute tools and feed the results back until it
+//! answers or the step budget is spent.
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -26,7 +30,10 @@ const MAX_STEPS: usize = 8;
 
 pub struct ChatAgent {
     tools: Arc<Tools>,
+    /// The local text model — the default for a chat turn.
     reasoner: Arc<dyn Reasoner>,
+    /// The local vision model, used when a turn carries images.
+    vision: Arc<dyn Reasoner>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -57,13 +64,27 @@ pub struct ChatResponse {
 }
 
 impl ChatAgent {
-    pub fn new(tools: Arc<Tools>, reasoner: Arc<dyn Reasoner>) -> Self {
-        Self { tools, reasoner }
+    pub fn new(tools: Arc<Tools>, reasoner: Arc<dyn Reasoner>, vision: Arc<dyn Reasoner>) -> Self {
+        Self {
+            tools,
+            reasoner,
+            vision,
+        }
     }
 
-    /// Respond to a conversation using the agent's default reasoner.
+    /// Respond to a conversation on the local models.
+    ///
+    /// Vision only when the turn actually carries an image: the local vision model is
+    /// small, and sending ordinary text to it instead of the 33B coder would be a
+    /// downgrade paid on every message for the sake of the few with screenshots.
     pub async fn respond(&self, history: &[ChatTurn], tags: &[String]) -> Result<ChatResponse> {
-        self.respond_with(history, tags, &self.reasoner).await
+        let has_images = history.iter().any(|t| !t.images.is_empty());
+        let reasoner = if has_images {
+            &self.vision
+        } else {
+            &self.reasoner
+        };
+        self.respond_with(history, tags, reasoner).await
     }
 
     /// Respond to a conversation (the full turn history, last turn = the new user
@@ -188,7 +209,7 @@ impl ChatAgent {
         format!(
             "You are MuggleBot, an ops-awareness assistant with a live view of the engineer's \
              GitHub/Slack/Granola signals, correlated threads, institutional memory, and a curated \
-             context library. Answer using the tools below — never invent signal/thread ids, look \
+             context library. Answer using the tools below — never invent signal/subject ids, look \
              them up. Cite the evidence you rely on. You inform and propose; you never take an \
              action on a production system.\n\n\
              Each turn, respond with ONE JSON object and nothing else:\n\
@@ -240,17 +261,23 @@ fn truncate_result(v: &Value) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::correlation::{Analyst, Correlator};
+    use crate::correlation::Analyst;
     use crate::embed::HashEmbedder;
     use crate::memory::MemoryManager;
     use crate::reasoner::MockReasoner;
     use crate::store::Store;
+    use crate::subject::Attributor;
     use async_trait::async_trait;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
     fn tools() -> Arc<Tools> {
         let store = Arc::new(Store::open_in_memory().unwrap());
+        let secrets = crate::secrets::Secrets::for_tests(store.clone());
+        let scorer = Arc::new(crate::score::Scorer {
+            store: store.clone(),
+            embedder: Arc::new(crate::embed::HashEmbedder),
+        });
         let embedder = Arc::new(HashEmbedder);
         let reasoner: Arc<dyn Reasoner> = Arc::new(MockReasoner::new("x"));
         let memory = Arc::new(MemoryManager::new(
@@ -261,17 +288,18 @@ mod tests {
         ));
         let context = Arc::new(crate::context::ContextManager::new(
             store.clone(),
+            secrets.clone(),
             embedder,
             reasoner.clone(),
             reasoner.clone(),
             "6h".into(),
         ));
-        let correlator = Arc::new(Correlator::new(store.clone(), Duration::from_secs(1800)));
+        let attributor = Arc::new(Attributor::new(store.clone()));
         let (investigator, repos, browser) =
-            crate::rootcause::offline_stack(store.clone(), correlator.clone(), reasoner.clone());
+            crate::rootcause::offline_stack(store.clone(), attributor.clone(), reasoner.clone());
         let analyst = Arc::new(Analyst::new(
             store.clone(),
-            correlator.clone(),
+            attributor.clone(),
             reasoner.clone(),
             reasoner.clone(),
             memory.clone(),
@@ -283,15 +311,22 @@ mod tests {
         ));
         Arc::new(Tools {
             store,
-            correlator,
+            agents: Arc::new(crate::agent::AgentSessions::for_tests()),
+            ingress: Arc::new(crate::restate::ingress::Ingress::new(
+                &crate::config::RestateConfig::default(),
+            )),
+            scorer: scorer.clone(),
+            secrets,
+            attributor,
             analyst,
             memory,
             context,
-            reasoner,
+            reasoner: reasoner.clone(),
             config: Arc::new(crate::config::Config::default()),
             investigator,
             repos,
             browser,
+            diffs: Arc::new(crate::prdiff::DiffReader::new(None, reasoner.clone()).unwrap()),
         })
     }
 
@@ -314,10 +349,8 @@ mod tests {
 
     #[tokio::test]
     async fn plain_text_reply_is_final() {
-        let agent = ChatAgent::new(
-            tools(),
-            Arc::new(MockReasoner::new("Hello, I'm MuggleBot.")),
-        );
+        let text = Arc::new(MockReasoner::new("Hello, I'm MuggleBot."));
+        let agent = ChatAgent::new(tools(), text.clone(), text);
         let resp = agent
             .respond(
                 &[ChatTurn {
@@ -344,7 +377,8 @@ mod tests {
             idx: AtomicUsize::new(0),
         };
         let t = tools();
-        let agent = ChatAgent::new(t.clone(), Arc::new(script));
+        let script: Arc<dyn Reasoner> = Arc::new(script);
+        let agent = ChatAgent::new(t.clone(), script.clone(), script);
         let resp = agent
             .respond(
                 &[ChatTurn {

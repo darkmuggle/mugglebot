@@ -19,7 +19,7 @@ See [AGENTS.md](AGENTS.md) for the full design and roadmap.
   analysis. Every summary cites its signals.
 - **Grounding** — editable institutional **memory**, a curated **context
   library** (URL + file ingest, ETag/mtime-aware refresh, Keychain-authed
-  fetches), semantic recall over both, and a generic-**mitigations** catalog.
+  fetches), and semantic recall over both.
 - **MCP** — the full read/correlation/grounding/live-assist tool surface plus
   resources, over stdio **and** HTTP JSON-RPC.
 - **Live assist** — debounced re-analysis of threads you're active in, grounded
@@ -43,34 +43,55 @@ See [AGENTS.md](AGENTS.md) for the full design and roadmap.
   carries decision-relevant information, and selection is by merit rather than
   position, so a decisive comment buried mid-thread survives and "+1" doesn't.
   Blocking reviews are pinned at maximum merit and can't be demoted.
+- **Diffs on the object** — a pull request's summarized diff is stored on the PR's own
+  virtual object and read back in ~40ms, so the pane opens itself — on the card, on the
+  issue the PR attempts, and in the click-in view — instead of paying a GitHub call and a
+  model pass per look.
+- **Dispatch strip** — what the AI is doing *now*, per subject: queued behind a
+  concurrency limit, running, done, refused as a duplicate because the same key
+  already ran, or failed with its message. Pushed live, so a button press has a
+  visible consequence even when the right answer is "nothing needed to happen".
 - **Attention + AI-decoration indicators** — the board leads with *does this need
   you* and *has the AI been over it* (per-facet, filled or hollow), with work
   attributed `⌂` on-device vs `☁` metered. The unseen/ack state machine is still
   there for filtering, but it's no longer the headline.
-- **LCARS UI** — board, thread detail (timeline, relation graph, mitigations,
+- **LCARS UI** — board, thread detail (timeline, relation graph,
   inline associate/merge/split/attach-context), memory editor, context library,
   live-assist, agent chat, config/credentials, and red-alert — all fed live over
   a WebSocket.
 
 ## Where each model runs
 
-The default model is the **local** one. Before running a task, the local model
-grades how much reasoning that task actually needs, and the grade picks the tier:
+**The local model does the work.** Every pass MuggleBot runs on its own — triage,
+correlation, PR critique, root cause, explanation, code indexing, tagging, live
+assist, chat — runs on `deepseek-coder:33b` via Ollama and nowhere else.
 
-| Grade | Who answers |
+A cloud model is used only when **you** ask for one, by name, in one of two places:
+
+| How you ask | What happens |
 |---|---|
-| `easy`, `medium` | local (`deepseek-coder:33b`) alone |
-| `hard` | local drafts, **Sonnet cleans it up** — or Sonnet does it outright if local fails |
-| `extra_hard` | **Opus** directly; local doesn't attempt it |
+| The chat pane's **model picker** | That turn, and only that turn, goes to the model you picked. |
+| **2ND OPINION** on a subject | Re-explains that one subject on the cloud tier and shows it beside the local answer, labelled. |
 
-There's a fourth model that isn't a reasoning tier at all: **Haiku** (`brief`)
-only rewrites an analysis another model already did into plain English. It's
-never asked to conclude anything, which is why a small fast model is correct
-there rather than merely cheap.
+Nothing else can. There is exactly one cloud-capable handle in the code and those
+are its only two callers, so it's checkable rather than a promise.
+
+Images dropped into chat go to a local **vision** model (`qwen2.5vl:7b`) instead —
+a different capability, not a better tier; a coder model has no image encoder and
+would answer confidently about a screenshot it never saw. Only turns that actually
+carry an image go there.
+
+Difficulty routing — the local model grading each task and escalating `hard` work to
+Sonnet, `extra_hard` to Opus — is still implemented and ships **off**. An always-on
+daemon deciding for itself to escalate is a bill arriving for work you didn't ask
+for, and where the local model was genuinely producing garbage what fixed it was a
+stricter prompt plus a deterministic check against the source data, not a bigger
+model. Turn it on with `[reasoner.routing] enabled = true` if you want the old
+behavior back.
 
 **Answers are cached.** MuggleBot re-reasons constantly — a thread is re-analyzed
-on every new signal, the same call sites get graded, a restart replays work
-already done — and most of those requests are byte-identical to one already
+on every new signal, a restart replays work already done — and most of those
+requests are byte-identical to one already
 answered. Identical request in, stored answer out, no model involved. The cache is
 in SQLite rather than memory because a restart is exactly when you most want the
 answers back. Deliberate redos bypass it: "reconsider on model X", "re-triage this
@@ -78,32 +99,31 @@ issue", and chat all force a fresh call, so those actions never look like they d
 nothing. Empty responses aren't cached either — a model returning nothing is a
 transient failure, not an answer. Tune with `[reasoner.cache]`.
 
-Grading is itself a local call, deliberately tiny (~10 output tokens, ~0.5s warm),
-and cached per call-site shape — so a task type grades roughly once per process,
-not once per invocation. Tune it in `[reasoner.routing]`: `cleanup = false` keeps
-hard tasks fully on-device, `cloud_fallback = false` means nothing ever leaves the
-machine, and `enabled = false` runs everything locally ungraded.
-
-For `hard`, the local draft is passed *to* Sonnet as material rather than thrown
-away — a draft that's 80% right anchors the cloud call, and the cleanup prompt
-insists the output format is preserved (most callers here parse strict JSON).
-
-Some work is pinned on-device **regardless of grade**, because it must never reach
-a cloud model at all: tag classification, repo-index crawling, and reopen-matching
-against handled threads. Those bypass routing entirely.
+If you do turn routing on, tune it in `[reasoner.routing]`: `cleanup = false` keeps
+hard tasks fully on-device, `cloud_fallback = false` means nothing leaves the
+machine even when Ollama is down, and `enabled = false` (the default) runs
+everything locally, ungraded — which also stops paying for the grading call itself.
 
 Two further rules:
 
-- **Handled threads never reach a cloud model.** A snoozed, acknowledged, or
-  resolved thread is settled work. New activity on one is matched *locally* to
+- **Handled threads aren't re-analyzed at all.** A snoozed, acknowledged, or
+  resolved thread is settled work. New activity on one is matched locally to
   decide whether the issue genuinely recurred; if it did, the thread reopens and
   earns normal treatment. Asking to "reconsider" a handled thread is an error,
   not a silent no-op — reopen it first.
-- **Investigation escalates, it doesn't start cloud-side.** Crawling repos and
-  filtering dozens of issues and commits happens on-device; only
-  `[investigation].shortlist_size` already-plausible candidates reach the routed
-  tier. So an investigation is a handful of local passes and at most one cloud
-  call — and only if that final verdict grades hard enough to need one.
+- **Investigation narrows before it reasons.** Crawling repos and filtering dozens
+  of issues and commits comes first; only `[investigation].shortlist_size`
+  already-plausible candidates reach the ranking pass. That narrowing is why the
+  local model is adequate for the ranking — it reads a handful of candidates with
+  their evidence, not a repository.
+
+**Explanations are checked, not just prompted.** The local model writes them, and a
+deterministic pass then removes anything the assembled dossier can't support: a
+link it never supplied, a claim about reviewers when nothing has been reviewed, a
+section with nothing behind it. Whatever it removed is shown under the explanation,
+because one that needed correcting should be read more carefully than one that
+didn't. The same check runs on a cloud second opinion — a pricier model gets no
+license to invent a link either.
 
 With no reachable reasoner at all, correlation, live-assist, and investigation
 degrade to deterministic behavior and the daemon keeps working. Pull the local
@@ -134,8 +154,9 @@ expensive part of picking an issue back up:
    plausible one: what the **diff** actually implements, a skeptical critique of
    whether it really fixes the issue, and which other open issues it would also
    resolve. A PR saying "closes #412" is a claim; the critique is the check. Local
-   model first, escalating only if it can't answer.
-6. **Plain English** — Haiku re-renders it for the board.
+   model reads the diff; a second local attempt covers an answer that came back as
+   prose instead of JSON.
+6. **Plain English** — the local model re-renders it for the board.
 
 Steps 2–5 never leave the machine. Patch options are **proposals, never applied** —
 nothing here commits, pushes, opens a PR, or comments on somebody else's, and paths

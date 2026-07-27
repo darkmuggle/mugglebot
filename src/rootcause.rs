@@ -4,7 +4,7 @@
 //! else is part of the same event?". This answers the next question — *why?* —
 //! by going looking in the code:
 //!
-//! 1. **Extract symptoms** from the thread's signals, including whatever the
+//! 1. **Extract symptoms** from the subject's signals, including whatever the
 //!    browser investigation read off the dashboard.
 //! 2. **Route to repos** through the code-derived repo index ([`crate::repos`]).
 //! 3. **Search issues and PRs** in those repos for the symptom. Someone may have
@@ -39,12 +39,13 @@ use std::time::Duration;
 use tracing::{debug, info, warn};
 
 use crate::config::Investigation as InvestigationCfg;
-use crate::correlation::{Correlator, ThreadView};
 use crate::github::{CodeHit, GithubClient, IssueHit};
 use crate::reasoner::{self, CompletionRequest, Reasoner};
 use crate::repos::RepoIndex;
-use crate::signal::{Signal, State};
+use crate::signal::Signal;
 use crate::store::{CommitEntry, RootCauseReport, Store};
+use crate::subject::Handled;
+use crate::subject::{Attributor, SubjectView};
 
 /// Issues/PRs pulled per search.
 const ISSUE_LIMIT: usize = 20;
@@ -53,24 +54,24 @@ const ISSUE_LIMIT: usize = 20;
 const COMMIT_LIMIT: usize = 60;
 /// Code-search hits kept for the fallback.
 const CODE_LIMIT: usize = 10;
-/// Associated PRs judged per thread. Each is a diff fetch plus a model read.
+/// Associated PRs judged per subject. Each is a diff fetch plus a model read.
 const MAX_JUDGED_PRS: usize = 3;
 /// How long a symptom search stays fresh. An investigation re-runs on every
-/// re-analysis of a busy thread; the underlying issue list does not change on
+/// re-analysis of a busy subject; the underlying issue list does not change on
 /// that timescale.
 const SEARCH_TTL: Duration = Duration::from_secs(900);
 
 pub struct Investigator {
     store: Arc<Store>,
-    correlator: Arc<Correlator>,
+    attributor: Arc<Attributor>,
     repos: Arc<RepoIndex>,
     github: Option<GithubClient>,
-    /// Local classifier: symptom extraction, and shortlisting the wide search
-    /// results down to what's worth a metered call.
+    /// Symptom extraction, and shortlisting the wide search results down to what is
+    /// worth reasoning over at all.
     local: Arc<dyn Reasoner>,
-    /// Cloud reasoner: the final verdict over the shortlist only.
-    heavy: Arc<dyn Reasoner>,
-    /// Judges the PRs correlation has already associated with this thread.
+    /// The final ranking pass, over the shortlist only.
+    ranker: Arc<dyn Reasoner>,
+    /// Judges the PRs correlation has already associated with this subject.
     pr_fixes: crate::prfix::PrFixFinder,
     cfg: InvestigationCfg,
 }
@@ -78,27 +79,22 @@ pub struct Investigator {
 impl Investigator {
     pub fn new(
         store: Arc<Store>,
-        correlator: Arc<Correlator>,
+        attributor: Arc<Attributor>,
         repos: Arc<RepoIndex>,
         token: Option<String>,
         local: Arc<dyn Reasoner>,
-        heavy: Arc<dyn Reasoner>,
+        ranker: Arc<dyn Reasoner>,
         cfg: InvestigationCfg,
     ) -> Self {
         let github = token.and_then(|t| GithubClient::new(t).ok());
         Self {
-            pr_fixes: crate::prfix::PrFixFinder::new(
-                store.clone(),
-                local.clone(),
-                heavy.clone(),
-                heavy.clone(),
-            ),
+            pr_fixes: crate::prfix::PrFixFinder::new(store.clone(), local.clone(), ranker.clone()),
             store,
-            correlator,
+            attributor,
             repos,
             github,
             local,
-            heavy,
+            ranker,
             cfg,
         }
     }
@@ -107,24 +103,24 @@ impl Investigator {
         self.cfg.enabled && self.github.is_some()
     }
 
-    pub fn get(&self, thread_id: &str) -> Result<Option<RootCauseReport>> {
-        self.store.get_root_cause(thread_id)
+    pub fn get(&self, subject_key: &str) -> Result<Option<RootCauseReport>> {
+        self.store.get_root_cause(subject_key)
     }
 
-    /// Investigate a thread, persisting the report as it goes so the UI can show
+    /// Investigate a subject, persisting the report as it goes so the UI can show
     /// `running` immediately rather than waiting on the whole pipeline.
     ///
-    /// Refuses to run on a **handled** thread: snoozed, resolved, and acknowledged
-    /// threads are settled work, and spending model calls (least of all metered
+    /// Refuses to run on a **handled** subject: snoozed, resolved, and acknowledged
+    /// subjects are settled work, and spending model calls (least of all metered
     /// ones) re-litigating them is exactly what the operator asked us not to do.
-    pub async fn investigate(&self, thread_id: &str) -> Result<RootCauseReport> {
-        let Some(view) = self.correlator.thread_view(thread_id)? else {
-            anyhow::bail!("no thread {thread_id}");
+    pub async fn investigate(&self, subject_key: &str) -> Result<RootCauseReport> {
+        let Some(view) = self.attributor.subject_view(subject_key)? else {
+            anyhow::bail!("no subject {subject_key}");
         };
-        if is_handled(view.state) {
+        if view.subject.handled.is_handled() {
             anyhow::bail!(
-                "thread {thread_id} is {} — handled threads are not investigated",
-                state_label(view.state)
+                "subject {subject_key} is {} — handled subjects are not investigated",
+                view.subject.handled.as_str()
             );
         }
         if !self.enabled() {
@@ -136,7 +132,7 @@ impl Investigator {
         }
 
         let mut report = RootCauseReport {
-            thread_id: thread_id.to_string(),
+            subject_key: subject_key.to_string(),
             status: "running".into(),
             symptoms: Vec::new(),
             repos: Vec::new(),
@@ -154,7 +150,7 @@ impl Investigator {
                 report.error = None;
             }
             Err(e) => {
-                warn!("investigation for {thread_id} failed: {e:#}");
+                warn!("investigation for {subject_key} failed: {e:#}");
                 report.status = "failed".into();
                 report.error = Some(format!("{e:#}"));
             }
@@ -165,7 +161,7 @@ impl Investigator {
 
     /// The pipeline proper. Writes progress into `report` as each stage lands so a
     /// later failure still leaves the useful partial result behind.
-    async fn run(&self, view: &ThreadView, report: &mut RootCauseReport) -> Result<()> {
+    async fn run(&self, view: &SubjectView, report: &mut RootCauseReport) -> Result<()> {
         let gh = self.github.as_ref().context("no GitHub client")?;
 
         // 1. Symptoms — the search vocabulary, on the local model.
@@ -173,12 +169,12 @@ impl Investigator {
         report.symptoms = symptoms.clone();
         self.store.put_root_cause(report)?;
         if symptoms.is_empty() {
-            anyhow::bail!("no searchable symptoms could be extracted from this thread");
+            anyhow::bail!("no searchable symptoms could be extracted from this subject");
         }
         let symptom_text = symptoms.join(", ");
         debug!(
             "investigation {}: symptoms = {symptom_text}",
-            view.thread.id
+            view.subject.key
         );
 
         // 2. Route to repos — keyword rules plus the local model reading the index.
@@ -190,7 +186,7 @@ impl Investigator {
         }
         info!(
             "investigation {}: searching {}",
-            view.thread.id,
+            view.subject.key,
             repos.join(", ")
         );
 
@@ -200,7 +196,7 @@ impl Investigator {
         let commits = self.commit_log(gh, &repos, since).await;
         debug!(
             "investigation {}: {} issue/PR hit(s), {} commit(s) since {since}",
-            view.thread.id,
+            view.subject.key,
             issues.len(),
             commits.len()
         );
@@ -225,7 +221,7 @@ impl Investigator {
         report.verdict = verdict;
         self.store.put_root_cause(report)?;
 
-        // 7. Judge the PRs this thread is *associated* with — the ones correlation
+        // 7. Judge the PRs this subject is *associated* with — the ones correlation
         // resolved through a branch, a CI run, or a closing keyword. Ranking a PR as
         // a candidate says it looks relevant; judging it says whether it actually
         // fixes the thing, which is the question worth answering. Doing the
@@ -234,36 +230,36 @@ impl Investigator {
         Ok(())
     }
 
-    /// Judge every pull request correlation has attached to this thread.
+    /// Judge every pull request correlation has attached to this subject.
     ///
     /// Sources of association, in the order the hierarchy establishes them: a `pr`
-    /// entity on the thread (a CI run resolved to its PR, or a PR notification), and
+    /// entity on the subject (a CI run resolved to its PR, or a PR notification), and
     /// any pull request that survived ranking. Deduplicated, and capped so a busy
-    /// thread can't fan out into a dozen diff reads.
-    async fn judge_associated_prs(&self, view: &ThreadView, gh: &GithubClient) {
-        // The subject: the issue this thread is about, else the thread itself.
-        let issue_entity = view.entities.iter().find(|e| e.kind == "issue");
+    /// subject can't fan out into a dozen diff reads.
+    async fn judge_associated_prs(&self, view: &SubjectView, gh: &GithubClient) {
+        // The subject: the issue this subject is about, else the subject itself.
+        let issue_entity = view.keys.iter().find(|e| e.kind == "issue");
         let subject = match issue_entity {
             Some(e) => match split_reference(&e.value) {
                 Some((repo, number)) => crate::prfix::Subject {
                     key: e.value.clone(),
                     repo,
                     number: number as i64,
-                    title: view.thread.title.clone(),
+                    title: view.subject.title.clone(),
                 },
                 None => return,
             },
-            // No issue: key the judgment on the thread so it still surfaces.
+            // No issue: key the judgment on the subject so it still surfaces.
             None => crate::prfix::Subject {
-                key: view.thread.id.clone(),
+                key: view.subject.key.to_string(),
                 repo: String::new(),
                 number: 0,
-                title: view.thread.title.clone(),
+                title: view.subject.title.clone(),
             },
         };
 
         let mut seen: Vec<(String, u64)> = Vec::new();
-        for e in view.entities.iter().filter(|e| e.kind == "pr") {
+        for e in view.keys.iter().filter(|e| e.kind == "pr") {
             if let Some(pair) = split_reference(&e.value) {
                 if !seen.contains(&pair) {
                     seen.push(pair);
@@ -284,13 +280,13 @@ impl Investigator {
             {
                 Some(fix) => info!(
                     "investigation {}: {} judged `{}`",
-                    view.thread.id,
+                    view.subject.key,
                     fix.reference(),
                     fix.verdict
                 ),
                 None => debug!(
                     "investigation {}: no usable judgment for {repo}#{number}",
-                    view.thread.id
+                    view.subject.key
                 ),
             }
         }
@@ -298,12 +294,12 @@ impl Investigator {
 
     // ---- stage 1: symptoms --------------------------------------------------
 
-    /// Turn a thread into searchable symptom terms, on the **local** model.
+    /// Turn a subject into searchable symptom terms, on the **local** model.
     ///
-    /// Falls back to deterministic extraction (entity values plus the thread
+    /// Falls back to deterministic extraction (entity values plus the subject
     /// title) when no model answers, so an investigation is never blocked on the
     /// classifier being up.
-    async fn extract_symptoms(&self, view: &ThreadView) -> Vec<String> {
+    async fn extract_symptoms(&self, view: &SubjectView) -> Vec<String> {
         let evidence = self.evidence_block(view);
         let system =
             "You extract search terms from an incident so an engineer can find the bug that \
@@ -311,7 +307,7 @@ impl Investigator {
              terms: error strings, component or service names, symptom phrases, and identifiers \
              that appear in the evidence. Use the exact wording from the evidence — these terms go \
              straight into a GitHub search. No explanations, no invented terms.";
-        let prompt = format!("Incident: {}\n\nEvidence:\n{evidence}", view.thread.title);
+        let prompt = format!("Incident: {}\n\nEvidence:\n{evidence}", view.subject.title);
         let terms = match self
             .local
             .complete(
@@ -343,15 +339,15 @@ impl Investigator {
         dedup(deterministic_symptoms(view), 8)
     }
 
-    /// The evidence the investigation reasons over: the thread's signals, plus any
+    /// The evidence the investigation reasons over: the subject's signals, plus any
     /// browser findings read off a linked dashboard. Browser findings come first —
     /// they carry the actual numbers, where the Slack message usually carries only
     /// "something's wrong".
-    fn evidence_block(&self, view: &ThreadView) -> String {
+    fn evidence_block(&self, view: &SubjectView) -> String {
         let mut ev = String::new();
         if let Ok(investigations) = self
             .store
-            .browser_investigations_for_thread(&view.thread.id)
+            .browser_investigations_for_subject(view.subject.key.as_str())
         {
             for inv in investigations {
                 if let Some(f) = inv.findings.filter(|f| !f.trim().is_empty()) {
@@ -370,7 +366,7 @@ impl Investigator {
                 ev.push_str(&format!("  {}\n", truncate(body.trim(), 500)));
             }
         }
-        for e in &view.entities {
+        for e in &view.keys {
             ev.push_str(&format!("- entity {}={}\n", e.kind, e.value));
         }
         truncate(&ev, 8_000)
@@ -419,9 +415,9 @@ impl Investigator {
         all
     }
 
-    /// The window to scan a commit log over: `commit_window` before the thread's
+    /// The window to scan a commit log over: `commit_window` before the subject's
     /// earliest signal. A cause precedes its symptom.
-    fn commit_since(&self, view: &ThreadView) -> DateTime<Utc> {
+    fn commit_since(&self, view: &SubjectView) -> DateTime<Utc> {
         let earliest = view
             .signals
             .iter()
@@ -594,7 +590,7 @@ impl Investigator {
     /// unreachable, so an investigation always returns something citable.
     async fn rank(
         &self,
-        view: &ThreadView,
+        view: &SubjectView,
         symptom_text: &str,
         shortlist: &[Candidate],
         code: &[CodeHit],
@@ -650,10 +646,10 @@ impl Investigator {
              list. Do not speculate beyond the evidence; say what is unknown.";
         let prompt = format!(
             "Incident: {}\nSymptoms: {symptom_text}\n\nEvidence:\n{evidence}\n\nCandidates:\n{catalog}",
-            view.thread.title
+            view.subject.title
         );
         let raw = match self
-            .heavy
+            .ranker
             .complete(
                 &CompletionRequest::single(prompt)
                     .with_system(system)
@@ -894,36 +890,30 @@ fn split_reference(value: &str) -> Option<(String, u64)> {
     Some((repo.to_string(), number.trim().parse().ok()?))
 }
 
-/// A thread the operator has already dealt with. These are never sent to a cloud
+/// A subject the operator has already dealt with. These are never sent to a cloud
 /// reasoner — see [`Investigator::investigate`] and [`crate::correlation::Analyst`].
-pub fn is_handled(state: State) -> bool {
-    matches!(
-        state,
-        State::Snoozed | State::Resolved | State::Acknowledged
-    )
+///
+/// Kept as a free function so the call sites read the same as before; the rule
+/// itself lives on [`Handled`].
+pub fn is_handled(handled: Handled) -> bool {
+    handled.is_handled()
 }
 
-pub fn state_label(state: State) -> &'static str {
-    match state {
-        State::Unseen => "unseen",
-        State::Seen => "seen",
-        State::Acknowledged => "acknowledged",
-        State::Resolved => "resolved",
-        State::Snoozed => "snoozed",
-    }
+pub fn state_label(handled: Handled) -> &'static str {
+    handled.as_str()
 }
 
 /// Symptoms without a model: the entity values plus the distinctive words of the
-/// thread title. Crude, but it keeps the pipeline running with Ollama down.
-fn deterministic_symptoms(view: &ThreadView) -> Vec<String> {
+/// subject title. Crude, but it keeps the pipeline running with Ollama down.
+fn deterministic_symptoms(view: &SubjectView) -> Vec<String> {
     let mut out: Vec<String> = view
-        .entities
+        .keys
         .iter()
         .filter(|e| e.kind != "person" && e.kind != "channel")
         .map(|e| e.value.clone())
         .collect();
     out.extend(
-        view.thread
+        view.subject
             .title
             .split_whitespace()
             .map(|w| w.trim_matches(|c: char| !c.is_alphanumeric() && c != '_' && c != '-'))
@@ -1017,7 +1007,7 @@ pub fn dashboard_links(sig: &Signal, matches: impl Fn(&str) -> bool) -> Option<&
 #[cfg(test)]
 pub fn offline_stack(
     store: Arc<Store>,
-    correlator: Arc<Correlator>,
+    attributor: Arc<Attributor>,
     reasoner: Arc<dyn Reasoner>,
 ) -> (
     Arc<Investigator>,
@@ -1034,7 +1024,7 @@ pub fn offline_stack(
     ));
     let investigator = Arc::new(Investigator::new(
         store,
-        correlator,
+        attributor,
         repos.clone(),
         None,
         reasoner.clone(),
@@ -1050,13 +1040,15 @@ pub fn offline_stack(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::signal::{Entity, Severity, SignalKind, Source};
+    use crate::signal::{ResolutionKey, Severity, SignalKind, Source};
 
-    fn view(title: &str, entities: Vec<Entity>) -> ThreadView {
+    fn view(title: &str, keys: Vec<ResolutionKey>) -> SubjectView {
         let now = Utc::now();
-        ThreadView {
-            thread: crate::correlation::Thread {
-                id: "thr/1".into(),
+        let key = crate::subject::SubjectKey::issue("o/r", 1);
+        SubjectView {
+            subject: crate::subject::Subject {
+                rank: key.rank(),
+                key,
                 title: title.into(),
                 summary: None,
                 created_at: now,
@@ -1065,14 +1057,21 @@ mod tests {
                 live: false,
                 tags: vec![],
                 tags_pinned: false,
+                handled: Handled::Open,
+                snoozed_until: None,
+                same_as: None,
+                parent: None,
+                merge_key: None,
             },
             signals: vec![],
-            entities,
+            keys,
             severity: Severity::Warning,
-            state: State::Unseen,
             edges: vec![],
             context: vec![],
-            attention: crate::correlation::Attention {
+            children: vec![],
+            pull_requests: vec![],
+            explanations: vec![],
+            attention: crate::subject::Attention {
                 needed: false,
                 reason: None,
                 decorated: Default::default(),
@@ -1092,11 +1091,11 @@ mod tests {
 
     #[test]
     fn handled_states_are_off_limits_to_cloud_reasoning() {
-        assert!(is_handled(State::Snoozed));
-        assert!(is_handled(State::Resolved));
-        assert!(is_handled(State::Acknowledged));
-        assert!(!is_handled(State::Unseen));
-        assert!(!is_handled(State::Seen));
+        assert!(is_handled(Handled::Snoozed));
+        assert!(is_handled(Handled::Resolved));
+        assert!(is_handled(Handled::Acknowledged));
+        assert!(!is_handled(Handled::Open));
+        assert!(!is_handled(Handled::Seen));
     }
 
     #[test]
@@ -1104,8 +1103,8 @@ mod tests {
         let v = view(
             "invocation retry storm failed on partition processor",
             vec![
-                Entity::new("service", "restate-worker"),
-                Entity::new("person", "ben"),
+                ResolutionKey::new("service", "restate-worker"),
+                ResolutionKey::new("person", "ben"),
             ],
         );
         let terms = deterministic_symptoms(&v);
@@ -1164,7 +1163,7 @@ mod tests {
     #[test]
     fn report_evidence_cites_every_candidate() {
         let report = RootCauseReport {
-            thread_id: "thr/1".into(),
+            subject_key: "thr/1".into(),
             status: "complete".into(),
             symptoms: vec!["pool exhausted".into()],
             repos: vec!["restatedev/restate".into()],
@@ -1197,12 +1196,13 @@ mod tests {
             body: None,
             url: None,
             actor: None,
-            entities: vec![],
+            keys: vec![],
             severity: Severity::Warning,
-            state: State::Unseen,
+            version: None,
+            upstream_gone: false,
             occurred_at: Utc::now(),
             ingested_at: Utc::now(),
-            thread: None,
+            subject: None,
             raw: json!({ "urls": ["https://github.com/x", "https://x.grafana.net/d/1"] }),
             tags: vec![],
         };

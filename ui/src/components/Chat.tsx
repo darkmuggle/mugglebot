@@ -5,10 +5,14 @@ import { chatSeed, setChatSeed } from "../state";
 import type { ChatBubble, ChatImage, ChatTurn, Tag } from "../types";
 
 // UI-facing provider labels; the id is what the backend maps to a reasoner.
+//
+// Local is FIRST because it is the default, and the default is what gets used. Picking
+// Anthropic here is the operator asking a cloud model by name — which is the only way one
+// is ever used — so it must be a choice, not what happens when nobody chooses.
 const PROVIDERS = [
+  { id: "ollama_local", label: "Ollama (Local)" },
   { id: "anthropic", label: "Anthropic" },
   { id: "openai", label: "OpenAI" },
-  { id: "ollama_local", label: "Ollama (Local)" },
   { id: "ollama", label: "Ollama Cloud" },
 ] as const;
 

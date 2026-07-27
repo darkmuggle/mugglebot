@@ -6,7 +6,7 @@
 //! Reasoning from the body alone reliably misses an answer someone already wrote
 //! down.
 //!
-//! But a long thread cannot go into a bounded context window whole, and the obvious
+//! But a long subject cannot go into a bounded context window whole, and the obvious
 //! shortcuts are both wrong:
 //!
 //! - **Keeping the most recent N** throws away the framing. The opening comments
@@ -14,13 +14,13 @@
 //!   resolution. Truncating to the tail keeps the conclusion and discards what it
 //!   was a conclusion *about*.
 //! - **Keeping the first N and last M** is better, but still decides by position.
-//!   A decisive comment in the middle of a fifty-comment thread — "this is a
+//!   A decisive comment in the middle of a fifty-comment subject — "this is a
 //!   duplicate of the connection-pool bug, see #204" — is exactly the one that
 //!   changes what you do, and position tells you nothing about that.
 //!
 //! So **every comment is considered on its own merits**: each is scored for whether
 //! it carries decision-relevant information, and what survives is chosen by that
-//! score rather than by where it sits in the thread. Scoring runs on the local model
+//! score rather than by where it sits in the subject. Scoring runs on the local model
 //! in a single batched pass (all comments, by index, one call), with a deterministic
 //! heuristic underneath so the pass still works with nothing reachable.
 //!
@@ -101,7 +101,7 @@ const NOISE_PATTERNS: &[&str] = &[
 const BOT_SUFFIXES: &[&str] = &["[bot]", "-bot", "bot"];
 
 pub struct CommentJudge {
-    /// Local model — scoring a thread's comments is high-volume mechanical work.
+    /// Local model — scoring a subject's comments is high-volume mechanical work.
     local: Arc<dyn Reasoner>,
 }
 
@@ -202,7 +202,7 @@ impl CommentJudge {
              approval, bot automation.\n\
              Judge substance, not length: two lines naming the root cause outrank three paragraphs \
              of speculation. Position is irrelevant — a decisive comment in the middle of a long \
-             thread scores high.";
+             subject scores high.";
         let prompt = format!("Subject: {context}\n\nComments:\n{catalog}");
         let mut req = CompletionRequest::single(prompt)
             .with_system(system)
@@ -417,7 +417,7 @@ mod tests {
     }
 
     /// The core requirement: merit, not position. A decisive comment in the middle
-    /// of a long thread must survive.
+    /// of a long subject must survive.
     #[tokio::test]
     async fn a_decisive_middle_comment_survives() {
         let judge = CommentJudge::new(Arc::new(MockReasoner::new("not json")));

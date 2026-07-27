@@ -44,7 +44,11 @@ body,
 }
 
 body {
-  background: radial-gradient(1200px 800px at 70% -10%, #0b1524 0%, var(--bg) 60%);
+  background: radial-gradient(
+    1200px 800px at 70% -10%,
+    #0b1524 0%,
+    var(--bg) 60%
+  );
   color: var(--text);
   font-family: system-ui, "Helvetica Neue", Arial, sans-serif;
   -webkit-font-smoothing: antialiased;
@@ -161,7 +165,10 @@ button {
   font-family: inherit;
   background: var(--surface);
   color: var(--text);
-  transition: background 0.15s, color 0.15s, box-shadow 0.15s;
+  transition:
+    background 0.15s,
+    color 0.15s,
+    box-shadow 0.15s;
 }
 .nav-pill:hover {
   background: var(--surface-2);
@@ -193,7 +200,9 @@ button {
   border-radius: var(--pill);
   cursor: pointer;
   border: 1px solid transparent;
-  transition: background 0.15s, border-color 0.15s;
+  transition:
+    background 0.15s,
+    border-color 0.15s;
 }
 .source-row:hover {
   background: var(--surface);
@@ -350,7 +359,10 @@ button {
   overflow: hidden;
   border: 1px solid var(--line);
   cursor: pointer;
-  transition: border-color 0.15s, transform 0.1s, box-shadow 0.15s;
+  transition:
+    border-color 0.15s,
+    transform 0.1s,
+    box-shadow 0.15s;
 }
 .card:hover {
   border-color: var(--line-strong);
@@ -532,7 +544,9 @@ button {
   border-radius: var(--radius);
   overflow: hidden;
   border: 1px solid var(--line);
-  transition: border-color 0.15s, box-shadow 0.15s;
+  transition:
+    border-color 0.15s,
+    box-shadow 0.15s;
 }
 .topic:hover {
   border-color: var(--line-strong);
@@ -740,7 +754,6 @@ button {
   grid-column: 1 / -1;
 }
 .timeline-panel,
-.mitigations-panel,
 .browser-investigations {
   grid-column: 1 / -1;
 }
@@ -984,7 +997,11 @@ button {
   border: 1px solid var(--line);
   border-radius: 8px;
   color: var(--dim);
-  font: 12px/1.45 ui-monospace, "SF Mono", Menlo, monospace;
+  font:
+    12px/1.45 ui-monospace,
+    "SF Mono",
+    Menlo,
+    monospace;
 }
 .browser-findings-entry {
   display: flex;
@@ -1099,7 +1116,11 @@ button {
 }
 .rc-ref {
   color: var(--blue);
-  font: 12px/1.4 ui-monospace, "SF Mono", Menlo, monospace;
+  font:
+    12px/1.4 ui-monospace,
+    "SF Mono",
+    Menlo,
+    monospace;
   text-decoration: none;
 }
 .rc-title {
@@ -1118,7 +1139,11 @@ button {
   margin-top: 6px;
   overflow-x: auto;
   color: var(--dim);
-  font: 11px/1.5 ui-monospace, "SF Mono", Menlo, monospace;
+  font:
+    11px/1.5 ui-monospace,
+    "SF Mono",
+    Menlo,
+    monospace;
 }
 .rc-fragment {
   padding: 8px;
@@ -1214,7 +1239,11 @@ button {
   color: var(--dim);
 }
 .triage-provenance code {
-  font: 11px/1.4 ui-monospace, "SF Mono", Menlo, monospace;
+  font:
+    11px/1.4 ui-monospace,
+    "SF Mono",
+    Menlo,
+    monospace;
 }
 .triage-provenance details {
   width: 100%;
@@ -1320,8 +1349,7 @@ button {
   letter-spacing: 0.03em;
 }
 
-/* mitigations + edges + context items */
-.mitigation,
+/* edges + context items */
 .edge,
 .ctx-item {
   border: 1px solid var(--line);
@@ -1329,11 +1357,6 @@ button {
   padding: 10px 12px;
   margin-bottom: 8px;
   background: var(--surface-2);
-}
-.mitigation p {
-  margin: 4px 0;
-  font-size: 13px;
-  color: var(--dim);
 }
 .edge-kind {
   font-weight: 700;
@@ -1381,7 +1404,9 @@ select {
   font-family: inherit;
   font-size: 13px;
   outline: none;
-  transition: border-color 0.15s, box-shadow 0.15s;
+  transition:
+    border-color 0.15s,
+    box-shadow 0.15s;
 }
 input:focus,
 textarea:focus,
@@ -1406,7 +1431,10 @@ button {
   font-weight: 700;
   font-size: 11px;
   cursor: pointer;
-  transition: background 0.12s, color 0.12s, border-color 0.12s;
+  transition:
+    background 0.12s,
+    color 0.12s,
+    border-color 0.12s;
 }
 button:hover:not(:disabled) {
   background: var(--blue);
@@ -1968,7 +1996,11 @@ code {
 .facet {
   padding: 1px 5px;
   border-radius: 4px;
-  font: 9px/1.6 ui-monospace, "SF Mono", Menlo, monospace;
+  font:
+    9px/1.6 ui-monospace,
+    "SF Mono",
+    Menlo,
+    monospace;
   letter-spacing: 0.04em;
   cursor: help;
 }
@@ -1985,7 +2017,11 @@ code {
 .passes {
   display: inline-flex;
   gap: 4px;
-  font: 10px/1.6 ui-monospace, "SF Mono", Menlo, monospace;
+  font:
+    10px/1.6 ui-monospace,
+    "SF Mono",
+    Menlo,
+    monospace;
 }
 .pass {
   padding: 1px 5px;
@@ -2015,4 +2051,1078 @@ code {
   background: color-mix(in srgb, var(--sev-warning) 14%, transparent);
   color: var(--sev-warning);
   font-size: 12px;
+}
+
+/* ---- Nested attempts and explanations ---------------------------------------
+   The hierarchy is the point: a problem, the attempts at it, and what each attempt
+   is judged to do. Indenting the attempts under the card (rather than giving them
+   cards of their own) is what makes an issue read as one piece of work.
+
+   Nothing rendered here is ever posted to GitHub — see `PrFix` in types.ts. */
+
+.attempts {
+  margin: 0.5rem 0 0.35rem 0;
+  padding-left: 0.85rem;
+  border-left: 3px solid var(--lcars-tan, #d69a78);
+}
+
+.attempts-label,
+.explain-label {
+  font-size: 0.62rem;
+  letter-spacing: 0.14em;
+  color: var(--lcars-tan, #d69a78);
+  margin-bottom: 0.3rem;
+}
+
+.attempt {
+  margin-bottom: 0.5rem;
+  padding: 0.4rem 0.55rem;
+  background: rgba(255, 255, 255, 0.035);
+  border-radius: 0 0.6rem 0.6rem 0;
+  border-left: 3px solid transparent;
+}
+
+/* Verdict drives the accent, so scanning a stack of attempts is scanning for the one
+   that actually fixes it. */
+.attempt.verdict-fixes {
+  border-left-color: #7ddf8f;
+}
+.attempt.verdict-partial {
+  border-left-color: #f0c674;
+}
+.attempt.verdict-related {
+  border-left-color: #8ab4f8;
+}
+.attempt.verdict-unrelated {
+  border-left-color: #6b6b6b;
+}
+
+.attempt-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.4rem;
+  margin-bottom: 0.25rem;
+}
+
+.verdict {
+  font-size: 0.6rem;
+  letter-spacing: 0.1em;
+  padding: 0.05rem 0.35rem;
+  border-radius: 0.5rem;
+  color: #10100f;
+  background: #6b6b6b;
+}
+.verdict.verdict-fixes {
+  background: #7ddf8f;
+}
+.verdict.verdict-partial {
+  background: #f0c674;
+}
+.verdict.verdict-related {
+  background: #8ab4f8;
+}
+
+.attempt-conf {
+  font-size: 0.66rem;
+  opacity: 0.75;
+}
+.attempt-ref {
+  font-size: 0.7rem;
+  font-weight: 600;
+}
+.attempt-title {
+  flex: 1 1 12rem;
+  font-size: 0.78rem;
+}
+.attempt-author {
+  font-size: 0.68rem;
+  opacity: 0.7;
+}
+
+.attempt-row {
+  display: flex;
+  gap: 0.5rem;
+  font-size: 0.74rem;
+  line-height: 1.35;
+  margin-top: 0.15rem;
+}
+
+.attempt-key {
+  flex: 0 0 5.2rem;
+  font-size: 0.6rem;
+  letter-spacing: 0.1em;
+  opacity: 0.65;
+  padding-top: 0.12rem;
+}
+
+/* A reviewer's objection is better evidence than the model's own reading of the same
+   diff, so it gets the emphasis rather than being folded into the critique. */
+.attempt-conversation {
+  color: #ffd9a0;
+}
+.attempt-conversation .attempt-key {
+  opacity: 0.9;
+}
+
+.attempt-foot {
+  font-size: 0.62rem;
+  opacity: 0.5;
+  margin-top: 0.25rem;
+}
+
+.explain-panel {
+  margin: 0.5rem 0;
+  padding: 0.5rem 0.7rem;
+  background: rgba(138, 180, 248, 0.07);
+  border-left: 3px solid #8ab4f8;
+  border-radius: 0 0.6rem 0.6rem 0;
+}
+
+.explain-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.3rem;
+  margin-bottom: 0.3rem;
+}
+
+.chip-stale {
+  background: #f0c674;
+  color: #10100f;
+}
+
+.explain-btn {
+  font-size: 0.6rem;
+  padding: 0.1rem 0.4rem;
+}
+
+/* A second opinion is visually distinct from the local explanation for the same reason it
+   is labelled: two answers to one question are only useful if you can tell them apart. */
+.explain-cloud {
+  background: rgba(214, 154, 120, 0.09);
+  border-left-color: var(--lcars-tan, #d69a78);
+}
+
+.model-chip {
+  background: rgba(255, 255, 255, 0.14);
+  letter-spacing: 0.1em;
+}
+
+.explain-cloud .model-chip {
+  background: var(--lcars-tan, #d69a78);
+  color: #10100f;
+}
+
+/* What the dossier check removed. Quiet — it is a footnote on the explanation, not a
+   warning about it — but present, because an explanation that needed correcting should be
+   read more carefully than one that didn't. */
+.explain-removed {
+  margin-top: 0.4rem;
+  padding-top: 0.35rem;
+  border-top: 1px dashed rgba(255, 255, 255, 0.14);
+  font-size: 0.66rem;
+  color: #f0c674;
+  opacity: 0.85;
+}
+
+/* The one control in MuggleBot that spends money. Marked so it can't be pressed by
+   accident while reaching for EXPLAIN next to it. */
+.cloud-btn {
+  border-color: var(--lcars-tan, #d69a78) !important;
+  color: var(--lcars-tan, #d69a78) !important;
+}
+
+.cloud-btn:hover:not(:disabled) {
+  background: var(--lcars-tan, #d69a78) !important;
+  color: #10100f !important;
+}
+
+.board-note {
+  font-size: 0.7rem;
+}
+
+/* ---- Issue scoring ----------------------------------------------------------
+   Where should I start? Ranked repo / component / commit, each with the passes that
+   found it. The evidence lines are not decoration: a score without them can't be
+   told apart from a lucky substring match. */
+
+.scores {
+  margin: 0.5rem 0;
+  padding: 0.5rem 0.7rem;
+  background: rgba(214, 154, 120, 0.07);
+  border-left: 3px solid var(--lcars-tan, #d69a78);
+  border-radius: 0 0.6rem 0.6rem 0;
+}
+
+.score-row {
+  margin-bottom: 0.45rem;
+  padding-bottom: 0.35rem;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+}
+.score-row:last-of-type {
+  border-bottom: none;
+}
+
+.score-head {
+  display: flex;
+  align-items: baseline;
+  gap: 0.5rem;
+}
+
+.score-pct {
+  flex: 0 0 3rem;
+  font-size: 0.86rem;
+  font-weight: 600;
+  text-align: right;
+  color: var(--lcars-tan, #d69a78);
+}
+
+.score-target {
+  font-size: 0.8rem;
+}
+.score-component {
+  color: #ffd9a0;
+  font-weight: 600;
+}
+.score-commit {
+  opacity: 0.7;
+  font-size: 0.72rem;
+}
+
+.score-evidence {
+  display: flex;
+  gap: 0.4rem;
+  align-items: baseline;
+  margin: 0.12rem 0 0 3.5rem;
+  font-size: 0.72rem;
+  opacity: 0.85;
+}
+
+/* One colour per pass, so "two different passes agreed" is visible at a glance —
+   which is the distinction the compounding score is built on. */
+.pass-semantic {
+  background: #8ab4f8;
+  color: #10100f;
+}
+.pass-lexical {
+  background: #7ddf8f;
+  color: #10100f;
+}
+.pass-dependency {
+  background: #f0c674;
+  color: #10100f;
+}
+
+.score-caveat {
+  font-size: 0.68rem;
+  margin-top: 0.3rem;
+}
+
+/* ---- code index panel ---------------------------------------------------------- */
+
+.index-totals {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.9rem;
+  align-items: center;
+  padding: 0.5rem 0.7rem;
+  margin-bottom: 0.5rem;
+  background: rgba(255, 255, 255, 0.04);
+  border-left: 3px solid var(--lcars-tan, #d69a78);
+  border-radius: 0 0.6rem 0.6rem 0;
+  font-size: 0.74rem;
+}
+
+.index-totals b {
+  color: var(--lcars-tan, #d69a78);
+  font-size: 0.9rem;
+}
+
+/* The Restate half. Kept visually separate from the totals because it answers a different
+   question — not "how much is built" but "is anything working on it". */
+.index-active {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  padding: 0.45rem 0.7rem;
+  margin-bottom: 0.7rem;
+  background: rgba(138, 180, 248, 0.07);
+  border-left: 3px solid #8ab4f8;
+  border-radius: 0 0.6rem 0.6rem 0;
+  font-size: 0.72rem;
+}
+
+.inv-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  align-items: center;
+}
+
+.inv-failed .inv-why {
+  color: #f28b82;
+}
+
+.inv-repo {
+  font-weight: 600;
+}
+
+.repo-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+}
+
+.repo-row {
+  background: rgba(255, 255, 255, 0.03);
+  border-radius: 0.4rem;
+}
+
+/* The row is a link to the repo's own screen; this is the affordance saying so. */
+.repo-open,
+.repo-open-spacer {
+  flex: 0 0 0.8rem;
+  text-align: right;
+  color: #9aa0a6;
+}
+
+.repo-line:hover .repo-open {
+  color: var(--lcars-tan, #d69a78);
+}
+
+.repo-line {
+  padding: 0.35rem 0.6rem;
+  cursor: pointer;
+  font-size: 0.74rem;
+}
+
+.repo-line:hover {
+  background: rgba(255, 255, 255, 0.05);
+}
+
+.repo-name {
+  font-weight: 600;
+  flex: 1 1 auto;
+  min-width: 10rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.repo-facts {
+  display: flex;
+  gap: 0.75rem;
+  color: #9aa0a6;
+  font-variant-numeric: tabular-nums;
+}
+
+/* Only ever drawn over commits actually fetched — see `phase()`. A bar with an absent
+   denominator reads as complete, which is the one thing this panel must not say. */
+.mini-bar {
+  width: 5rem;
+  height: 0.35rem;
+  background: rgba(255, 255, 255, 0.12);
+  border-radius: 0.2rem;
+  overflow: hidden;
+}
+
+.mini-fill {
+  display: block;
+  height: 100%;
+  background: var(--lcars-tan, #d69a78);
+}
+
+.ph-done {
+  background: #81c995;
+  color: #10100f;
+}
+
+.ph-work {
+  background: #8ab4f8;
+  color: #10100f;
+}
+
+.ph-idle {
+  background: rgba(255, 255, 255, 0.14);
+}
+
+/* ---- code index: one repo's own screen ------------------------------------------ */
+
+/* Replaces the inline expander. Everything the index holds about a repo is four unrelated
+   questions — what is this, what is inside it, what points at it, what changed — and answering
+   all four at once inside a list row buried both the answers and the list. */
+.repo-detail-view {
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+}
+
+.rd-head {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+}
+
+.rd-name {
+  margin: 0;
+  font-size: 0.95rem;
+  font-weight: 700;
+  color: var(--text);
+}
+
+.rd-spacer {
+  flex: 1 1 auto;
+}
+
+/* Counts on one line, above the tabs: they are why you opened the repo, and they stay put
+   while the panel below them changes. */
+.rd-facts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.9rem;
+  align-items: center;
+  padding: 0.45rem 0.7rem;
+  background: rgba(255, 255, 255, 0.04);
+  border-left: 3px solid var(--lcars-tan, #d69a78);
+  border-radius: 0 0.6rem 0.6rem 0;
+  font-size: 0.72rem;
+}
+
+.rd-facts b {
+  color: var(--lcars-tan, #d69a78);
+  font-size: 0.85rem;
+}
+
+.rd-tabs {
+  display: flex;
+  gap: 0.3rem;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.12);
+}
+
+.rd-tab {
+  background: transparent;
+  border: none;
+  border-bottom: 2px solid transparent;
+  color: #9aa0a6;
+  font-family: inherit;
+  font-size: 0.64rem;
+  letter-spacing: 0.12em;
+  padding: 0.35rem 0.7rem;
+  cursor: pointer;
+}
+
+.rd-tab:hover {
+  color: var(--lcars-tan, #d69a78);
+}
+
+.rd-tab.active {
+  color: var(--lcars-tan, #d69a78);
+  border-bottom-color: var(--lcars-tan, #d69a78);
+}
+
+.rd-tab-n {
+  margin-left: 0.35rem;
+  opacity: 0.65;
+  font-variant-numeric: tabular-nums;
+}
+
+.rd-body {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  min-height: 6rem;
+}
+
+.rd-card {
+  font-size: 0.76rem;
+  line-height: 1.5;
+  color: #c8ccd0;
+  max-width: 62rem;
+}
+
+.rd-desc {
+  margin: 0;
+  font-size: 0.72rem;
+  color: #9aa0a6;
+  max-width: 62rem;
+}
+
+/* Section headings inside a tab. Quiet — they separate, they don't announce. */
+.rd-section-label {
+  margin-top: 0.5rem;
+  font-size: 0.6rem;
+  letter-spacing: 0.14em;
+  color: #9aa0a6;
+}
+
+.rd-deps {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+
+.rd-recent {
+  display: flex;
+  flex-direction: column;
+}
+
+.rd-recent-row {
+  display: flex;
+  gap: 0.6rem;
+  align-items: baseline;
+  padding: 0.2rem 0;
+  font-size: 0.72rem;
+  cursor: pointer;
+}
+
+.rd-recent-row:hover .commit-subject {
+  color: var(--lcars-tan, #d69a78);
+}
+
+/* Components as a grid of cards rather than a column: they are peers, and a single column of
+   three-line blocks reads as a narrative order they don't have. */
+.rd-comps {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(20rem, 1fr));
+  gap: 0.5rem;
+}
+
+.rd-comp {
+  padding: 0.45rem 0.6rem;
+  background: rgba(255, 255, 255, 0.035);
+  border-radius: 0.4rem;
+  min-width: 0;
+}
+
+.comp-path {
+  font-weight: 600;
+  font-size: 0.74rem;
+}
+
+.comp-purpose {
+  font-size: 0.72rem;
+  color: #c8ccd0;
+}
+
+/* The routing key: what an incident's words are actually matched against. */
+.comp-symptoms {
+  font-size: 0.7rem;
+  color: var(--lcars-tan, #d69a78);
+}
+
+.dep-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  align-items: baseline;
+  font-size: 0.72rem;
+}
+
+/* One line per commit, the summary behind a click. A hundred paragraphs is not a list: the
+   subject and the date are what you scan by, and the behavioural summary is read once. */
+.rd-commits {
+  gap: 0;
+}
+
+.rd-commit {
+  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.rd-commit.open {
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.rd-commit-line {
+  display: flex;
+  gap: 0.5rem;
+  align-items: baseline;
+  padding: 0.3rem 0.4rem;
+  font-size: 0.72rem;
+  cursor: pointer;
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+.rd-commit-line:hover {
+  background: rgba(255, 255, 255, 0.05);
+}
+
+.rd-caret {
+  flex: 0 0 0.7rem;
+  color: #9aa0a6;
+  font-size: 0.6rem;
+}
+
+.rd-date {
+  flex: 0 0 5.5rem;
+  font-variant-numeric: tabular-nums;
+}
+
+/* The one elastic cell, so the author and the component chips stay in their columns down the
+   list instead of drifting with the length of each subject. */
+.rd-commit-line .commit-subject {
+  flex: 1 1 auto;
+  min-width: 6rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.rd-author {
+  flex: 0 0 9rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.rd-commit-body {
+  padding: 0 0.4rem 0.5rem 1.6rem;
+  max-width: 62rem;
+}
+
+.rd-commit-actions {
+  display: flex;
+  gap: 0.4rem;
+  align-items: center;
+  margin-top: 0.35rem;
+}
+
+/* Recorded-with-nothing commits: lockfile bumps and doc-only changes. Dimmed rather than
+   hidden — they are why the summarized count climbs without the index getting smarter, and
+   hiding them would make that look like progress. */
+.commit-noop {
+  opacity: 0.5;
+}
+
+.commit-subject {
+  font-weight: 600;
+}
+
+.commit-summary {
+  font-size: 0.72rem;
+  line-height: 1.5;
+  color: #c8ccd0;
+  margin-top: 0.15rem;
+}
+
+/* A repo the dependency graph raises as a candidate with nothing indexed inside it. Marked,
+   because it is a lead that cannot be followed — not merely an absence. */
+.ph-gap {
+  background: #f0c674;
+  color: #10100f;
+}
+
+/* ---- code index: header + columns ---------------------------------------------- */
+
+/* Column widths are fixed here and inherited by the rows, so the header and the list stay in
+   step. A row that sized itself would drift the moment one repo had a long name. */
+.repo-head,
+.repo-line {
+  display: flex;
+  gap: 0.5rem;
+  align-items: center;
+}
+
+.repo-head {
+  padding: 0.3rem 0.6rem;
+  font-size: 0.6rem;
+  letter-spacing: 0.1em;
+  color: #9aa0a6;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.12);
+  user-select: none;
+}
+
+.idx-status {
+  flex: 0 0 8.5rem;
+}
+
+/* Clickable column headers. Only the sortable ones get the affordance; DEPS and HISTORY FROM
+   are labels, and a pointer on them would promise something that doesn't happen. */
+.idx-th {
+  white-space: nowrap;
+}
+
+.repo-head .idx-th:not(.idx-deps):not(:last-child),
+.repo-head .repo-lang .idx-th,
+.repo-head .idx-status .idx-th {
+  cursor: pointer;
+}
+
+.repo-head .idx-th:hover {
+  color: var(--lcars-tan, #d69a78);
+}
+
+.repo-head .idx-th.active {
+  color: var(--lcars-tan, #d69a78);
+}
+
+/* Right-aligned and tabular so the digits form columns rather than a ragged edge. */
+.idx-num {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  flex: 0 0 6.5rem;
+}
+
+.idx-deps {
+  flex: 0 0 5rem;
+}
+
+/* Language lives at the far right, and the cell is always present — an absent chip must hold
+   its place or the column zigzags down the list. */
+.repo-lang {
+  flex: 0 0 7rem;
+  display: flex;
+  justify-content: flex-end;
+}
+
+/* Keeps the header aligned with the rows' progress bar, which has no header of its own. */
+.mini-bar-spacer {
+  flex: 0 0 5rem;
+}
+
+/* Group headings: code, examples, docs. Quiet, because they organize the list rather than
+   competing with the rows in it. */
+.kind-head {
+  padding: 0.5rem 0.6rem 0.2rem;
+  font-size: 0.6rem;
+  letter-spacing: 0.14em;
+  color: var(--lcars-tan, #d69a78);
+}
+
+.repo-rows + .repo-rows .kind-head {
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+  margin-top: 0.4rem;
+}
+
+/* Per-row kind tag. Dimmed while it is only a guess, and solid once a human has pinned it, so
+   the list shows at a glance which characterizations have been reviewed. */
+.kind-pick,
+.kind-pick-spacer {
+  flex: 0 0 5.5rem;
+}
+
+.kind-pick {
+  background: rgba(255, 255, 255, 0.06);
+  color: #9aa0a6;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 0.3rem;
+  font-size: 0.62rem;
+  padding: 0.1rem 0.2rem;
+  font-family: inherit;
+}
+
+.kind-pick.pinned {
+  color: var(--lcars-tan, #d69a78);
+  border-color: var(--lcars-tan, #d69a78);
+}
+
+/* ---- agent sessions ------------------------------------------------------------- */
+
+.agent-session {
+  margin: 0.5rem 0 0.8rem;
+  background: rgba(138, 180, 248, 0.07);
+  border-left: 3px solid #8ab4f8;
+  border-radius: 0 0.6rem 0.6rem 0;
+}
+
+.agent-head {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  align-items: center;
+  padding: 0.4rem 0.7rem;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+.agent-repo {
+  font-weight: 600;
+  font-size: 0.74rem;
+}
+
+/* Capped and scrolled: an agent can emit hundreds of lines, and a panel that grows without
+   bound pushes the list it belongs to off the screen. */
+.agent-stream {
+  max-height: 26rem;
+  overflow-y: auto;
+  padding: 0.4rem 0.7rem 0.6rem;
+  font-size: 0.72rem;
+}
+
+.ac {
+  display: flex;
+  gap: 0.4rem;
+  align-items: baseline;
+  padding: 0.15rem 0;
+}
+
+.ac-label {
+  flex: 0 0 4.5rem;
+  font-size: 0.58rem;
+  letter-spacing: 0.1em;
+  color: #9aa0a6;
+  text-align: right;
+}
+
+.ac-body {
+  white-space: pre-wrap;
+  min-width: 0;
+}
+
+.ac-text .ac-body {
+  color: #e8eaed;
+}
+
+/* Thinking and tool calls are deliberately quieter than text: they are for judging whether the
+   agent is on the right track, not for acting on. */
+.ac-thinking .ac-body {
+  color: #9aa0a6;
+  font-style: italic;
+}
+
+.ac-tool .ac-body {
+  color: #8ab4f8;
+  font-family: ui-monospace, monospace;
+}
+
+.ac-result .ac-body {
+  color: #81c995;
+}
+
+.ac-error .ac-body {
+  color: #f28b82;
+}
+
+.ac-meta .ac-body {
+  color: #9aa0a6;
+}
+
+/* ---- diff pane ------------------------------------------------------------------- */
+
+.diff-pane {
+  margin: 0.3rem 0 0.2rem;
+}
+
+.diff-head {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  align-items: center;
+  font-size: 0.66rem;
+}
+
+.diff-block {
+  margin: 0.3rem 0;
+}
+
+/* The summary leads: "what does this do" is the question a diff is opened with, and a file list
+   answers "how big is it" — which the counts already say in one line. */
+.diff-summary {
+  margin: 0.25rem 0 0.35rem;
+  padding: 0.35rem 0.5rem;
+  background: rgba(255, 255, 255, 0.04);
+  border-left: 2px solid var(--lcars-tan, #d69a78);
+  font-size: 0.72rem;
+  color: #c8ccd0;
+}
+
+.diff-stat {
+  color: #9aa0a6;
+}
+
+.diff-add {
+  color: #81c995;
+  font-variant-numeric: tabular-nums;
+}
+
+.diff-del {
+  color: #f28b82;
+  font-variant-numeric: tabular-nums;
+}
+
+.diff-error {
+  color: #f28b82;
+  font-size: 0.68rem;
+}
+
+.diff-file-head {
+  display: flex;
+  gap: 0.5rem;
+  align-items: baseline;
+  padding: 0.12rem 0;
+  cursor: pointer;
+  font-size: 0.68rem;
+}
+
+.diff-file-head:hover {
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.diff-path {
+  flex: 1 1 auto;
+  font-family: ui-monospace, monospace;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Scrolled in its own box: a long hunk must not stretch the card it belongs to, and a wide one
+   must not scroll the page sideways. */
+.diff-patch {
+  margin: 0.2rem 0 0.4rem;
+  max-height: 22rem;
+  overflow: auto;
+  background: rgba(0, 0, 0, 0.25);
+  border-radius: 0.3rem;
+  padding: 0.3rem 0.4rem;
+  font-size: 0.64rem;
+  line-height: 1.35;
+}
+
+.dl {
+  font-family: ui-monospace, monospace;
+  white-space: pre;
+  color: #9aa0a6;
+}
+
+/* Coloured by line kind — an uncoloured unified diff is the one presentation that makes a patch
+   harder to read than the file it came from. */
+.dl-add {
+  color: #81c995;
+  background: rgba(129, 201, 149, 0.08);
+}
+
+.dl-del {
+  color: #f28b82;
+  background: rgba(242, 139, 130, 0.08);
+}
+
+.dl-hunk {
+  color: #8ab4f8;
+}
+
+/* A collapsed diff still shows its header, so a folded pane reports the size of what it is
+   hiding — a pane that vanished entirely would leave no sign there is a diff to read. */
+.diff-toggle {
+  cursor: pointer;
+  user-select: none;
+  padding: 0.15rem 0;
+}
+
+.diff-toggle:hover {
+  background: rgba(255, 255, 255, 0.04);
+}
+
+/* ---- dispatch strip -----------------------------------------------------------
+   What the AI is doing, per subject. Sits directly under the detail header, above
+   everything the AI has produced, because it answers "did that button do anything" —
+   a question asked immediately after a press, not after scrolling. */
+.dispatch-strip {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 0 0 12px;
+}
+.dispatch {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 7px 12px;
+  border: 1px solid var(--line);
+  border-left-width: 3px;
+  border-radius: 12px;
+  background: var(--surface-2);
+  font-size: 12px;
+}
+/* In-flight rows read as live; finished ones recede rather than disappear, so a
+   failure or a duplicate is still legible after the fact. */
+.dispatch-queued,
+.dispatch-running {
+  border-left-color: var(--blue);
+}
+.dispatch-done {
+  border-left-color: var(--ok);
+  opacity: 0.7;
+}
+.dispatch-duplicate {
+  border-left-color: var(--slate);
+  opacity: 0.7;
+}
+.dispatch-failed {
+  border-left-color: var(--sev-critical);
+}
+.dispatch-state {
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  font-size: 11px;
+  min-width: 92px;
+}
+.ds-queued {
+  color: var(--dim);
+}
+.ds-running {
+  color: var(--blue);
+  animation: dispatch-pulse 1.4s ease-in-out infinite;
+}
+.ds-done {
+  color: var(--ok);
+}
+.ds-duplicate {
+  color: var(--dim);
+}
+.ds-failed {
+  color: var(--sev-critical);
+}
+@keyframes dispatch-pulse {
+  0%,
+  100% {
+    opacity: 0.55;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+.dispatch-kind {
+  font-weight: 600;
+  color: var(--text);
+  letter-spacing: 0.04em;
+}
+.dispatch-age {
+  color: var(--dim);
+  font-variant-numeric: tabular-nums;
+}
+.dispatch-error {
+  color: var(--sev-critical);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* The board's one-glyph version of the same thing. */
+.ai-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 1px 8px;
+  border-radius: var(--pill);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+}
+.ai-working {
+  color: var(--blue);
+  border: 1px solid var(--blue);
+}
+.ai-working .thinking-dots i {
+  width: 4px;
+  height: 4px;
+}
+.ai-failed {
+  color: var(--sev-critical);
+  border: 1px solid var(--sev-critical);
+}
+
+/* The attempts panel in the detail view spans both columns: an attempt carries a diff,
+   and a diff in a half-width column is a column of wrapped patch lines. */
+.attempts-panel {
+  grid-column: 1 / -1;
 }

@@ -1,5 +1,5 @@
 //! Configuration: non-secret behavior loaded from a TOML file. Credentials are
-//! **not** here — they live in the SQLite store (see [`crate::store`]).
+//! **not** here — they live in the SQLite store (see [`crate::secrets`]).
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -12,6 +12,8 @@ use crate::signal::Severity;
 #[serde(default)]
 pub struct Config {
     pub general: General,
+    pub secrets: SecretsConfig,
+    pub restate: RestateConfig,
     pub sources: Sources,
     pub notifications: Notifications,
     pub correlation: Correlation,
@@ -62,6 +64,86 @@ impl Default for General {
         Self {
             data_dir: "~/.mugglebot".into(),
             quiet_hours: None,
+        }
+    }
+}
+
+/// The credential store lives in the SQLite DB. This block holds only the one
+/// choice there is to make about it.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SecretsConfig {
+    /// Seal stored values under a key derived from `$MUGGLEBOT_MASTER_KEY`.
+    ///
+    /// Off by default, and deliberately not the default: it is a real improvement
+    /// against a stolen backup and no improvement at all against a process running
+    /// as you. Defaulting it on would imply a protection it doesn't provide.
+    pub encrypt: bool,
+}
+
+/// The local Restate server, and this process's service endpoint.
+///
+/// Restate holds the work in flight — virtual-object state, invocation journals,
+/// durable timers, vqueue occupancy. SQLite holds the record. That split is what
+/// makes wiping `restate-data` cost only in-flight work, which matters because
+/// enabling vqueues requires a fresh cluster.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RestateConfig {
+    /// Where the daemon submits signals and actions.
+    pub ingress: String,
+    /// Admin API: deployment registration, the rule book, SQL introspection.
+    pub admin: String,
+    /// Where this process serves its handlers for Restate to call back into.
+    pub endpoint_listen: String,
+    /// Self-register the deployment on boot. Restate discovers handlers at
+    /// registration, so a new or changed handler needs one.
+    pub register_on_boot: bool,
+    /// vqueue concurrency limits per scope (Phase 6). Requires the server's
+    /// experimental flags and a fresh cluster.
+    pub vqueues: bool,
+    pub limits: RestateLimits,
+}
+
+impl Default for RestateConfig {
+    fn default() -> Self {
+        Self {
+            ingress: "http://127.0.0.1:8080".into(),
+            admin: "http://127.0.0.1:9070".into(),
+            endpoint_listen: "127.0.0.1:9080".into(),
+            register_on_boot: true,
+            vqueues: false,
+            limits: RestateLimits::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RestateLimits {
+    /// One Ollama, one GPU.
+    pub local_llm: u32,
+    /// Bound metered spend.
+    pub cloud_llm: u32,
+    pub github: u32,
+    /// One Chrome.
+    pub browser: u32,
+    pub checkout: u32,
+    /// **One org crawl at a time.** Two would enumerate the same repos, pick the same
+    /// uncarded ones in the same order, and clone them into the same directory — a corrupt
+    /// working tree. Its own scope rather than sharing `github`, which allows four.
+    pub repo_index: u32,
+}
+
+impl Default for RestateLimits {
+    fn default() -> Self {
+        Self {
+            local_llm: 1,
+            cloud_llm: 3,
+            github: 4,
+            browser: 1,
+            checkout: 2,
+            repo_index: 1,
         }
     }
 }
@@ -400,24 +482,43 @@ impl Default for Live {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Reasoner {
-    /// **The default model for everything.** On-device, and the tier that answers
-    /// unless a task grades hard enough to escalate. It's also the grader.
+    /// **The model for everything MuggleBot does on its own.** On-device. Every
+    /// automatic pass — triage, correlation, critique, root cause, explanation,
+    /// indexing — runs here and nowhere else.
     pub local: String,
     pub local_model: String,
-    /// Escalation tier: cleans up a `hard` local draft, and takes over when the
-    /// local model can't answer.
+    /// Local vision model, for images dropped into chat. A separate setting because
+    /// vision is a different capability from reasoning and a coder model has no image
+    /// encoder: pointing this at one makes MuggleBot silently ignore the attachment.
+    pub vision_model: String,
+    /// **The tier used only when you ask for it**, by name: the chat pane's model
+    /// picker, or the second-opinion button on a subject. Nothing automatic reaches it.
+    pub cloud: String,
+    pub cloud_model: String,
+    /// Escalation tier for `[reasoner.routing]`, which is **off** by default. Only
+    /// reached if you turn routing on, and then only for tasks graded `hard`.
     pub mid: String,
     pub mid_model: String,
-    /// Top tier: `extra_hard` tasks only, where a plausible-but-wrong answer would
-    /// mislead an engineer mid-incident.
-    pub heavy: String,
-    pub heavy_model: String,
-    /// The **plain-English** tier: a small, fast cloud model whose only job is
-    /// rewriting something already worked out into language you can read at a
-    /// glance. Not used to reason — used to explain.
-    pub brief: String,
-    pub brief_model: String,
-    /// How a task's difficulty picks between the three tiers above.
+    /// How long a single local model request may take before it is abandoned.
+    ///
+    /// Generous, because a 33B model carding a component legitimately takes minutes — but
+    /// *finite*, which the underlying HTTP client is not by default. That default cost 2.5
+    /// hours of wedged indexing: one request hung, and because local calls share a single
+    /// permit (see `local_concurrency`) every subsequent one queued behind it forever. A
+    /// bounded request is what guarantees the permit is always released.
+    pub request_timeout: String,
+    /// Concurrent requests allowed against a **self-hosted** Ollama, process-wide.
+    ///
+    /// One, because one Ollama is one GPU. Priority is handled by *deference* rather than by
+    /// reserving a second worker: indexing stands aside whenever a foreground pass — a
+    /// notification, a PR critique, an issue triage — wants the slot, and fills the gaps.
+    ///
+    /// One, because one Ollama is one GPU: four concurrent requests to a 33B model are
+    /// slower *and* worse than a queue of one. Raise it only if the local model is small
+    /// enough that the GPU isn't the bottleneck, or if `ollama_url` points at a proxy in
+    /// front of more than one machine. Ollama Cloud is never gated by this — it is a fleet.
+    pub local_concurrency: usize,
+    /// How a task's difficulty picks a tier — off by default, see [`Routing`].
     pub routing: Routing,
     /// Reuse of previously-computed answers.
     pub cache: Cache,
@@ -439,12 +540,13 @@ impl Default for Reasoner {
         Self {
             local: "ollama_local".into(),
             local_model: "deepseek-coder:33b".into(),
+            vision_model: "qwen2.5vl:7b".into(),
+            cloud: "claude".into(),
+            cloud_model: "claude-opus-4-8".into(),
             mid: "claude".into(),
             mid_model: "claude-sonnet-5".into(),
-            heavy: "claude".into(),
-            heavy_model: "claude-opus-4-8".into(),
-            brief: "claude".into(),
-            brief_model: "claude-haiku-4-5".into(),
+            request_timeout: "10m".into(),
+            local_concurrency: 1,
             routing: Routing::default(),
             cache: Cache::default(),
             ollama_url: "http://127.0.0.1:11434".into(),
@@ -456,10 +558,17 @@ impl Default for Reasoner {
     }
 }
 
-/// Difficulty-based model routing. Before running a task, the local model grades
-/// how much reasoning it needs; the grade picks the tier. See
-/// [`crate::reasoner::router`].
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Difficulty-based model routing: the local model grades how much reasoning a task
+/// needs and the grade picks the tier. See [`crate::reasoner::router`].
+///
+/// **Off by default, and all three switches default off.** The policy is that the local
+/// model does the work and a cloud model is asked only when the operator asks for it by
+/// name. Grading is itself a local call, so leaving this off also stops paying for a
+/// judgment whose only purpose was deciding whether to escalate.
+///
+/// Turning `enabled` on re-enables automatic escalation — cloud calls will then happen
+/// without anyone asking, which is exactly what the default exists to prevent.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Routing {
     /// Off → every task runs on the local model, ungraded.
@@ -471,16 +580,6 @@ pub struct Routing {
     /// nothing. Off → a local outage surfaces as an error and nothing leaves the
     /// machine (callers' deterministic fallbacks still apply).
     pub cloud_fallback: bool,
-}
-
-impl Default for Routing {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            cleanup: true,
-            cloud_fallback: true,
-        }
-    }
 }
 
 /// The completion cache: identical requests are answered from SQLite instead of
@@ -597,13 +696,31 @@ mod tests {
         let cfg: Config = toml::from_str(include_str!("../config.example.toml"))
             .expect("config.example.toml should deserialize");
         assert!(cfg.sources.github.enabled);
-        // The default model is the local one; the cloud tiers are escalations.
+        // The local model does the work. The cloud tier is configured but unreachable
+        // except by an explicit ask, and difficulty routing — the one thing that would
+        // escalate on its own — ships off.
         assert_eq!(cfg.reasoner.local, "ollama_local");
         assert_eq!(cfg.reasoner.local_model, "deepseek-coder:33b");
-        assert_eq!(cfg.reasoner.mid_model, "claude-sonnet-5");
-        assert_eq!(cfg.reasoner.heavy_model, "claude-opus-4-8");
-        assert_eq!(cfg.reasoner.brief_model, "claude-haiku-4-5");
-        assert!(cfg.reasoner.routing.enabled);
+        assert_eq!(cfg.reasoner.cloud_model, "claude-opus-4-8");
+        assert!(
+            !cfg.reasoner.routing.enabled,
+            "automatic escalation must be opt-in"
+        );
+        assert!(!cfg.reasoner.routing.cloud_fallback);
+        // One Ollama, one GPU. Asserted from the example config because this is the setting
+        // that stops every local caller from piling onto the same weights at once.
+        assert_eq!(cfg.reasoner.local_concurrency, 1);
+        // Finite, and long enough for a real generation. An unbounded request holds the shared
+        // permit forever, which is how 2.5 hours of indexing went missing.
+        let t = parse_duration(&cfg.reasoner.request_timeout).expect("a parseable timeout");
+        assert!(
+            t >= std::time::Duration::from_secs(300),
+            "too tight for a 33B card"
+        );
+        assert!(
+            t <= std::time::Duration::from_secs(3600),
+            "not a bound in practice"
+        );
         // Keys written *after* a `[reasoner.routing]` header would silently belong
         // to the sub-table and fall back to defaults here — assert on a value the
         // example sets to something other than its default, so that ordering

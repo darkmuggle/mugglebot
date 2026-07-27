@@ -52,7 +52,7 @@ pub struct MemoryManager {
     /// Cheap/ambient reasoner: the fast initial tag pass.
     reasoner: Arc<dyn Reasoner>,
     /// Heavy reasoner: the refining tag pass that runs after the cheap one.
-    heavy: Arc<dyn Reasoner>,
+    refiner: Arc<dyn Reasoner>,
 }
 
 impl MemoryManager {
@@ -60,13 +60,13 @@ impl MemoryManager {
         store: Arc<Store>,
         embedder: Arc<dyn Embedder>,
         reasoner: Arc<dyn Reasoner>,
-        heavy: Arc<dyn Reasoner>,
+        refiner: Arc<dyn Reasoner>,
     ) -> Self {
         Self {
             store,
             embedder,
             reasoner,
-            heavy,
+            refiner,
         }
     }
 
@@ -143,8 +143,9 @@ impl MemoryManager {
         self.store.get_memory(id)
     }
 
-    /// Two-tier auto-tagging, mirroring the context library: cheap pass then heavy
-    /// refine, each persisting and registering new tags. Best-effort.
+    /// Two-pass auto-tagging, mirroring the context library: a first pass then a
+    /// refining one, each persisting and registering new tags. Both local, so the second
+    /// pass costs nothing but a little GPU time. Best-effort.
     async fn autotag(&self, mem: &Memory) {
         let body = mem.embed_text();
         let vocab = self.store.list_tags().unwrap_or_default();
@@ -154,7 +155,7 @@ impl MemoryManager {
             }
         }
         let vocab = self.store.list_tags().unwrap_or_default();
-        if let Some(sugg) = tags::suggest(self.heavy.as_ref(), &vocab, &body).await {
+        if let Some(sugg) = tags::suggest(self.refiner.as_ref(), &vocab, &body).await {
             if let Err(e) = self.apply_suggestions(&mem.id, &sugg) {
                 tracing::warn!("memory {}: refine autotag store failed: {e:#}", mem.id);
             }

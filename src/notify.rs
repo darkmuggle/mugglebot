@@ -14,8 +14,8 @@ pub struct Notifier {
     min_severity: Severity,
     quiet_hours: Option<(NaiveTime, NaiveTime)>,
     critical_sound: bool,
-    /// Highest severity already notified per thread — so we notify once per
-    /// thread state change (a new thread or an escalation), not once per signal.
+    /// Highest severity already notified per subject — so we notify once per
+    /// subject state change (a new subject or an escalation), not once per signal.
     notified: Mutex<HashMap<String, Severity>>,
 }
 
@@ -29,10 +29,10 @@ impl Notifier {
         }
     }
 
-    /// Notify for a thread-level change: fires only when a thread is first seen or
+    /// Notify for a subject-level change: fires only when a subject is first seen or
     /// escalates above the severity we last notified it at — deduped against the
-    /// board, per the design ("once per thread state change, not per signal").
-    pub fn maybe_notify_thread(&self, thread_id: &str, s: &Signal) {
+    /// board, per the design ("once per subject state change, not per signal").
+    pub fn maybe_notify_subject(&self, subject_key: &str, s: &Signal) {
         if s.severity < self.min_severity {
             return;
         }
@@ -45,28 +45,28 @@ impl Notifier {
         }
         {
             let mut map = self.notified.lock().expect("notifier mutex poisoned");
-            if let Some(prev) = map.get(thread_id) {
+            if let Some(prev) = map.get(subject_key) {
                 if s.severity <= *prev {
-                    return; // already notified this thread at an equal/higher severity
+                    return; // already notified this subject at an equal/higher severity
                 }
             }
-            map.insert(thread_id.to_string(), s.severity);
+            map.insert(subject_key.to_string(), s.severity);
         }
         self.fire(s);
     }
 
-    /// Forget a thread's "already notified" mark — called when you triage it
+    /// Forget a subject's "already notified" mark — called when you triage it
     /// (ack/snooze/resolve), so genuinely new activity on it can notify again
     /// rather than being deduped away.
-    pub fn clear_notified(&self, thread_id: &str) {
+    pub fn clear_notified(&self, subject_key: &str) {
         self.notified
             .lock()
             .expect("notifier mutex poisoned")
-            .remove(thread_id);
+            .remove(subject_key);
     }
 
-    /// Post a notification for a single signal unconditionally-of-thread (used when
-    /// a signal couldn't be correlated into a thread).
+    /// Post a notification for a single signal with no subject (used when a signal
+    /// resolved to nothing and sits in the unattributed lane).
     pub fn maybe_notify(&self, s: &Signal) {
         if s.severity < self.min_severity {
             return;
