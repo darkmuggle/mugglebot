@@ -3034,7 +3034,11 @@ impl Store {
     /// this repo, but the whole point of following the reference is that they might not — so a
     /// sha that exists only in another indexed repo still resolves, and the caller is told which
     /// repo it came from.
-    pub fn commit_by_sha(&self, repo: Option<&str>, sha_prefix: &str) -> Result<Option<RegistryCommit>> {
+    pub fn commit_by_sha(
+        &self,
+        repo: Option<&str>,
+        sha_prefix: &str,
+    ) -> Result<Option<RegistryCommit>> {
         let prefix = sha_prefix.trim().to_ascii_lowercase();
         // A one-character prefix would match most of the index. Seven is git's own default
         // abbreviation and the shortest thing anyone actually writes down.
@@ -3049,9 +3053,12 @@ impl Store {
              WHERE c.sha LIKE ?1 || '%' \
              ORDER BY (c.full_name = ?2) DESC, c.committed_at DESC LIMIT 1",
         )?;
-        stmt.query_row(params![prefix, repo.unwrap_or_default()], row_to_registry_commit)
-            .optional()
-            .map_err(Into::into)
+        stmt.query_row(
+            params![prefix, repo.unwrap_or_default()],
+            row_to_registry_commit,
+        )
+        .optional()
+        .map_err(Into::into)
     }
 
     /// The commit a pull request landed as, if the index has walked past it.
@@ -5354,7 +5361,10 @@ mod tests {
 
         // A reference into a repo we did not expect still resolves: the point of following it
         // is that the fix may not be where you assumed.
-        assert!(store.commit_by_sha(Some("other/repo"), "a1b2c3d").unwrap().is_some());
+        assert!(store
+            .commit_by_sha(Some("other/repo"), "a1b2c3d")
+            .unwrap()
+            .is_some());
         // Too short to mean anything, and not a sha at all.
         assert!(store.commit_by_sha(None, "a1b2").unwrap().is_none());
         assert!(store.commit_by_sha(None, "zzzzzzz").unwrap().is_none());
@@ -5368,25 +5378,42 @@ mod tests {
         store
             .put_commits(&[
                 commit("o/r", "aaaaaaa1", "Bound the pool (#412)"),
-                commit("o/r", "bbbbbbb2", "Merge pull request #500 from fork/branch\n\nFix retries"),
+                commit(
+                    "o/r",
+                    "bbbbbbb2",
+                    "Merge pull request #500 from fork/branch\n\nFix retries",
+                ),
                 commit("o/r", "ccccccc3", "Unrelated (#4120)"),
                 commit("other/repo", "ddddddd4", "Something else (#412)"),
             ])
             .unwrap();
 
-        let squashed = store.commit_for_pull("o/r", 412).unwrap().expect("squash merge");
+        let squashed = store
+            .commit_for_pull("o/r", 412)
+            .unwrap()
+            .expect("squash merge");
         assert_eq!(squashed.sha, "aaaaaaa1");
-        let merged = store.commit_for_pull("o/r", 500).unwrap().expect("merge commit");
+        let merged = store
+            .commit_for_pull("o/r", 500)
+            .unwrap()
+            .expect("merge commit");
         assert_eq!(merged.sha, "bbbbbbb2");
         assert!(
             store.commit_for_pull("o/r", 41).unwrap().is_none(),
             "#41 must not match inside #412 or #4120"
         );
         assert_eq!(
-            store.commit_for_pull("other/repo", 412).unwrap().unwrap().sha,
+            store
+                .commit_for_pull("other/repo", 412)
+                .unwrap()
+                .unwrap()
+                .sha,
             "ddddddd4",
             "#412 means a different commit in a different repo"
         );
-        assert!(store.commit_for_pull("never/indexed", 412).unwrap().is_none());
+        assert!(store
+            .commit_for_pull("never/indexed", 412)
+            .unwrap()
+            .is_none());
     }
 }

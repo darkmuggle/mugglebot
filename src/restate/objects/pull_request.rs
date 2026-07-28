@@ -164,6 +164,32 @@ impl PullRequest {
         Ok(Json(stored.map(|d| d.into_inner())))
     }
 
+    /// Store this pull request's code review. Same shape as [`Self::put_diff`], and stored
+    /// separately for the same reason it is computed separately: the diff is a fact, the
+    /// review is a judgment about it, and one arriving does not imply the other.
+    #[handler]
+    async fn put_review(
+        &self,
+        ctx: ObjectContext<'_>,
+        review: Json<crate::prdiff::StoredReview>,
+    ) -> HandlerResult<()> {
+        let key = ctx.key().to_string();
+        ctx.set(state::REVIEW, review);
+        tracing::debug!("stored review for {key}");
+        Ok(())
+    }
+
+    /// This pull request's stored review, or `null` if it has not been reviewed. **Shared**,
+    /// for the same reason [`Self::diff`] is.
+    #[handler]
+    async fn review(
+        &self,
+        ctx: SharedObjectContext<'_>,
+    ) -> HandlerResult<Json<Option<crate::prdiff::StoredReview>>> {
+        let stored: Option<Json<crate::prdiff::StoredReview>> = ctx.get(state::REVIEW).await?;
+        Ok(Json(stored.map(|r| r.into_inner())))
+    }
+
     /// Receive a durable subject write. See [`super::put_subject`].
     #[handler]
     async fn put_subject(

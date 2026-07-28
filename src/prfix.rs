@@ -369,12 +369,7 @@ impl PrFixFinder {
     }
 
     /// Resolve the fix-is-elsewhere references in some text against the code index.
-    fn follow_references(
-        &self,
-        subject: &Subject,
-        pr: &PullRequest,
-        text: &str,
-    ) -> Option<String> {
+    fn follow_references(&self, subject: &Subject, pr: &PullRequest, text: &str) -> Option<String> {
         // This conversation's own numbers: a PR saying "fixes #412" about the issue under
         // judgment is the ordinary case, not a claim that the work happened elsewhere.
         let mut skip = vec![pr.number];

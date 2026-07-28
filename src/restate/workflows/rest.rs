@@ -209,7 +209,7 @@ impl RepoIndex {
 
 // ---- PrDiff ------------------------------------------------------------------
 
-/// Read a pull request's diff, summarize it, and store it on the pull request.
+/// Read a pull request's diff, summarize it, **review it**, and store both on the pull request.
 ///
 /// Keyed `{owner}/{repo}!{n}@{watermark}`: the same activity is the same diff, so a
 /// re-submission for a PR nothing has happened to is a refused key rather than another API
@@ -218,6 +218,8 @@ impl RepoIndex {
 ///
 /// The result goes to the object rather than back to the caller. Nothing awaits this: the
 /// pane reads the object's state, and a diff that is not there yet is fetched inline once.
+///
+/// Two steps, two state keys, and they fail independently — see the handler.
 pub struct PrDiff {
     ops: Arc<WorkflowOps>,
 }
@@ -271,10 +273,52 @@ impl PrDiff {
             .into_inner();
 
         let ok = stored.report.error.is_none();
-        ctx.object_client::<crate::restate::objects::pull_request::PullRequestClient>(pr.clone())
-            .put_diff(Json(stored))
-            .send();
+        let client = ctx
+            .object_client::<crate::restate::objects::pull_request::PullRequestClient>(pr.clone());
+        client.put_diff(Json(stored.clone())).send();
         tracing::info!("diff for {pr} (watermark {watermark}): stored, ok={ok}");
+
+        // Step 2: review it. A separate journalled step, so a model that returns prose costs
+        // the review and not the diff that was already fetched and stored — and a retry does
+        // not re-read GitHub.
+        //
+        // Same workflow rather than a second one because the patches are already in hand here:
+        // splitting it would mean either passing the diff through another invocation's journal
+        // or reading it back out of state to review it.
+        if ok {
+            let ops = self.ops.clone();
+            let (repo_for_review, watermark_for_review) = (repo.clone(), watermark.clone());
+            let report = stored.report.clone();
+            let reviewed = ctx
+                .run(|| {
+                    let ops = ops.clone();
+                    let (repo, watermark) = (repo_for_review.clone(), watermark_for_review.clone());
+                    let report = report.clone();
+                    async move {
+                        let review = ops.diff_reader().review(&repo, number, &report).await;
+                        Ok(Json(review.map(|review| crate::prdiff::StoredReview {
+                            watermark,
+                            reviewed_at: chrono::Utc::now(),
+                            review,
+                        })))
+                    }
+                })
+                .await?
+                .into_inner();
+            match reviewed {
+                Some(review) => {
+                    tracing::info!(
+                        "review for {pr}: {:?}, {} inline comment(s)",
+                        review.review.recommendation,
+                        review.review.comments.len()
+                    );
+                    client.put_review(Json(review)).send();
+                }
+                // Nothing stored, so the pane keeps offering the review rather than showing an
+                // empty one that looks like "no comments".
+                None => tracing::debug!("no review for {pr}: the model did not return JSON"),
+            }
+        }
         Ok(ok)
     }
 }

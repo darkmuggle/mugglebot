@@ -3253,3 +3253,118 @@ select[data-tip],
 [data-tip].source-row {
   cursor: pointer;
 }
+
+/* ---- review: the recommendation, and notes on lines --------------------------------
+   The review is the part that takes a position, so it is styled to be found: a labelled
+   pill in the header that survives folding, the rationale in a bordered block, and notes
+   coloured by severity so a reader who skips nits can skip them by colour. */
+.rec {
+  padding: 0.05rem 0.4rem;
+  border-radius: 0.5rem;
+  font-size: 0.6rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  color: #10100f;
+}
+.rec-approve {
+  background: #7ddf8f;
+}
+.rec-comment {
+  background: #8ab4f8;
+}
+.rec-request_changes {
+  background: #f0a08a;
+}
+
+.review-rationale {
+  display: flex;
+  gap: 0.5rem;
+  margin: 0.35rem 0 0.5rem;
+  padding: 0.4rem 0.6rem;
+  background: rgba(255, 255, 255, 0.035);
+  border-left: 3px solid var(--line-strong);
+  border-radius: 0 0.5rem 0.5rem 0;
+  font-size: 0.75rem;
+  line-height: 1.45;
+}
+.rec-border-approve {
+  border-left-color: #7ddf8f;
+}
+.rec-border-comment {
+  border-left-color: #8ab4f8;
+}
+.rec-border-request_changes {
+  border-left-color: #f0a08a;
+}
+
+.review-note {
+  display: flex;
+  gap: 0.5rem;
+  align-items: baseline;
+  margin: 0.15rem 0;
+  padding: 0.25rem 0.5rem;
+  border-left: 2px solid var(--line-strong);
+  border-radius: 0 0.4rem 0.4rem 0;
+  background: rgba(255, 255, 255, 0.04);
+  font-size: 0.72rem;
+  line-height: 1.45;
+}
+/* Inline notes sit inside the monospace patch box, so they have to opt back out of `pre`
+   whitespace and the monospace family — a wrapped sentence in a `white-space: pre` block
+   runs off the side instead of wrapping. */
+.note-inline {
+  white-space: normal;
+  font-family: inherit;
+  margin: 0.2rem 0 0.35rem 1.5rem;
+  background: rgba(0, 0, 0, 0.35);
+}
+.note-sev {
+  flex: 0 0 auto;
+  font-size: 0.58rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+}
+.note-text {
+  color: var(--text);
+}
+.note-blocker {
+  border-left-color: #f28b82;
+}
+.sev-blocker {
+  color: #f28b82;
+}
+.note-concern {
+  border-left-color: #f0c674;
+}
+.sev-concern {
+  color: #f0c674;
+}
+.note-nit {
+  border-left-color: #8ab4f8;
+}
+.sev-nit {
+  color: #8ab4f8;
+}
+.note-praise {
+  border-left-color: #7ddf8f;
+}
+.sev-praise {
+  color: #7ddf8f;
+}
+
+/* Click-in view: the review is prose to read, at the same size as the rest of it. */
+.attempts-panel .review-rationale {
+  font-size: 0.92rem;
+  line-height: 1.55;
+  padding: 0.55rem 0.7rem;
+}
+.attempts-panel .review-note {
+  font-size: 0.88rem;
+  padding: 0.4rem 0.6rem;
+}
+.attempts-panel .note-sev {
+  font-size: 0.68rem;
+}
+.attempts-panel .rec {
+  font-size: 0.72rem;
+}

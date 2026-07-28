@@ -29,6 +29,7 @@ import type {
 } from "../types";
 import { AttentionBadge } from "./Attention";
 import Attempt, { prKey } from "./Attempt";
+import DiffPane from "./DiffPane";
 import DispatchStrip from "./DispatchStrip";
 import { SignalModal, signalHref } from "./SignalModal";
 
@@ -219,6 +220,27 @@ export default function SubjectDetail(props: {
       return out;
     },
   );
+  /// Every pull request on this work, from both places one can be recorded, deduped by
+  /// `repo!number`.
+  ///
+  /// The subject itself is excluded: when this subject is a PR, its diff already leads the page
+  /// under THE CHANGE, and listing it again as an attempt at itself is a second copy of the same
+  /// diff.
+  const attempts = createMemo(() => {
+    const seen = new Set<string>([props.id]);
+    const out: PrFix[] = [];
+    for (const pr of [
+      ...(thread()?.pull_requests ?? []),
+      ...Object.values(prFixes() ?? {}).flat(),
+    ]) {
+      const key = prKey(pr);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push(pr);
+    }
+    return out;
+  });
+
   // The browser worker and the investigator both run in the background, so poll
   // while either is in flight rather than leaving a stale "running" on screen.
   createEffect(() => {
@@ -1070,20 +1092,43 @@ export default function SubjectDetail(props: {
               </section>
             </Show>
 
+            {/* The change itself, when this subject *is* a pull request.
+                A PR subject has no attempt rows of its own — `pull_requests` is keyed by the
+                issue a PR attempts, so a PR is never listed under itself — and the result was a
+                PR whose diff had been read, stored, and then shown nowhere. Its own diff is the
+                single most relevant thing on the page, so it leads, unfolded. */}
+            <Show when={t().rank === "pull_request"}>
+              <section class="panel attempts-panel">
+                <h3>
+                  THE CHANGE
+                  <span class="muted">
+                    {" "}
+                    — this pull request's diff and review
+                  </span>
+                </h3>
+                <DiffPane subjectKey={props.id} expand />
+              </section>
+            </Show>
+
             {/* The attempts, with their diffs — the same renderer the board uses.
                 Clicking into an issue used to lose the pull requests attempting it, which
                 is the opposite of what clicking in is for: the card is the summary and
                 this is supposed to be the whole story. The diff comes from the pull
                 request's own object state, so this costs a state read rather than an API
-                call and a model pass. */}
-            <Show when={t().pull_requests.length}>
+                call and a model pass.
+
+                Two sources, unioned: the view's own `pull_requests`, and the PR-fix rows the
+                triage panel fetches per triaged issue. Either can be populated without the
+                other — a judged PR lands in the first, a triage pass fills the second — and
+                "any pull request means show me the diff" has to hold whichever one has it. */}
+            <Show when={attempts().length}>
               <section class="panel attempts-panel">
                 <h3>
-                  {t().pull_requests.length} ATTEMPT
-                  {t().pull_requests.length === 1 ? "" : "S"}
+                  {attempts().length} ATTEMPT
+                  {attempts().length === 1 ? "" : "S"}
                   <span class="muted"> — pull requests on this work</span>
                 </h3>
-                <For each={t().pull_requests}>
+                <For each={attempts()}>
                   {(pr) => (
                     <Attempt
                       expand
@@ -1218,7 +1263,8 @@ export default function SubjectDetail(props: {
                       ALREADY BEING FIXED?
                       <span class="muted">
                         {" "}
-                        — open pull requests that may cover this
+                        — open pull requests that may cover this; the diff and
+                        review for each are in ATTEMPTS above
                       </span>
                     </h4>
                     <For each={prFixes()![t.issue_key]}>

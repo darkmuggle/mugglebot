@@ -108,6 +108,12 @@ pub mod state {
     /// more often than it changes — from the PR's card, from the issue it attempts, and
     /// again after clicking in. See [`crate::prdiff`] for what is kept and what is trimmed.
     pub const DIFF: &str = "diff";
+    /// A pull request's code review, as [`crate::prdiff::StoredReview`] JSON.
+    ///
+    /// Beside the diff and separate from it, because they fail independently: a GitHub outage
+    /// costs the diff, a model that returns prose costs the review, and neither should take
+    /// the other with it.
+    pub const REVIEW: &str = "review";
     /// How many signals this subject has recorded — a ranking hint. The
     /// authoritative count is the SQL query; see AGENTS.md on reconciling the two.
     pub const SIGNAL_COUNT: &str = "signal_count";

@@ -43,6 +43,11 @@ See [AGENTS.md](AGENTS.md) for the full design and roadmap.
   carries decision-relevant information, and selection is by merit rather than
   position, so a decisive comment buried mid-thread survives and "+1" doesn't.
   Blocking reviews are pinned at maximum merit and can't be demoted.
+- **PR review, not just an explainer** — every pull request gets a recommendation
+  (approve / comment / request changes), the note you'd write above the Approve button, and
+  inline comments anchored to lines of the patch. Findings first, verdict from the findings;
+  claims the diff can't support are discarded rather than trusted. Local models, never posted
+  to GitHub.
 - **Diffs on the object** — a pull request's summarized diff is stored on the PR's own
   virtual object and read back in ~40ms, so the pane opens itself — on the card, on the
   issue the PR attempts, and in the click-in view — instead of paying a GitHub call and a

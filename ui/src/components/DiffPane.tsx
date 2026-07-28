@@ -1,6 +1,18 @@
-import { createSignal, For, onMount, Show } from "solid-js";
+import {
+  createEffect,
+  createSignal,
+  For,
+  onCleanup,
+  onMount,
+  Show,
+} from "solid-js";
 import { api } from "../api";
-import type { DiffFile, PrDiffReport } from "../types";
+import type {
+  DiffFile,
+  PrDiffReport,
+  Recommendation,
+  ReviewComment,
+} from "../types";
 
 /// A pull request's diff, summarized first and readable underneath.
 ///
@@ -66,6 +78,29 @@ export default function DiffPane(props: {
     return r.diffs.length < r.target_count;
   };
 
+  /// Whether some shown diff has no review beside it — the model failed to produce one, or the
+  /// diff predates reviews existing. Offered as its own button because the fix is a model pass
+  /// over a diff already in hand, not another read of GitHub.
+  const needsReview = () =>
+    (report()?.diffs ?? []).some((d) => !d.review && !d.error);
+
+  /// Poll for a review that is still being written.
+  ///
+  /// The review is several model passes and runs in the background, so the diff arrives first
+  /// and the verdict lands a minute or two later. Polling object state is a ~40ms read, which
+  /// is cheap enough to do while the answer is outstanding and stops the moment it arrives —
+  /// the alternative is a pane that stays wrong until the operator thinks to reload.
+  ///
+  /// Only while something is actually pending, and only after a diff has been shown: an idle
+  /// pane makes no requests at all.
+  createEffect(() => {
+    if (!report() || !needsReview() || busy()) return;
+    const timer = setInterval(() => {
+      void load({ storedOnly: true });
+    }, 8000);
+    onCleanup(() => clearInterval(timer));
+  });
+
   const toggle = (key: string) =>
     setOpen((prev) => ({ ...prev, [key]: !(prev[key] ?? !!props.expand) }));
 
@@ -92,6 +127,22 @@ export default function DiffPane(props: {
                   <span class="explain-label">
                     DIFF · {d.repo}#{d.number}
                   </span>
+                  {/* The recommendation sits in the header so it survives folding: "should this
+                      land" is the one thing worth reading without opening anything. */}
+                  <Show when={d.review}>
+                    <span
+                      class={`rec rec-${d.review!.recommendation}`}
+                      data-tip={`reviewed by ${d.review!.produced_by} · never posted to GitHub`}
+                    >
+                      {REC_LABEL[d.review!.recommendation]}
+                    </span>
+                    <Show when={d.review!.comments.length}>
+                      <span class="muted">
+                        {d.review!.comments.length} note
+                        {d.review!.comments.length === 1 ? "" : "s"}
+                      </span>
+                    </Show>
+                  </Show>
                   <Show when={!d.error}>
                     <span class="diff-stat">
                       {d.file_count} file{d.file_count === 1 ? "" : "s"}
@@ -127,9 +178,30 @@ export default function DiffPane(props: {
                   <div class="diff-summary">{d.summary}</div>
                 </Show>
 
+                {/* Then the review — the part that takes a position. Kept distinct from the
+                    summary above it: one explains the change, the other says what to do about
+                    it, and merging them makes the advice read as description. */}
+                <Show when={d.review?.rationale && !isShut()}>
+                  <div
+                    class={`review-rationale rec-border-${d.review!.recommendation}`}
+                  >
+                    <span class="rc-label">REVIEW</span>
+                    <span>{d.review!.rationale}</span>
+                  </div>
+                </Show>
+
                 <For each={isShut() ? [] : d.files}>
                   {(f) => {
                     const key = `${d.repo}#${d.number}:${f.path}`;
+                    const notes = () =>
+                      (d.review?.comments ?? []).filter(
+                        (c) => c.path === f.path,
+                      );
+                    /// Notes the backend could not pin to a line. Rendered under the file
+                    /// header rather than dropped: the note is still about this file, and
+                    /// guessing a line would be worse than admitting we don't have one.
+                    const loose = () =>
+                      notes().filter((c) => c.patch_index === undefined);
                     return (
                       <div class="diff-file">
                         <div class="diff-file-head" onClick={() => toggle(key)}>
@@ -165,8 +237,9 @@ export default function DiffPane(props: {
                             <span class="muted">{isOpen(key) ? "▾" : "▸"}</span>
                           </Show>
                         </div>
+                        <For each={loose()}>{(c) => <Note comment={c} />}</For>
                         <Show when={isOpen(key) && f.patch}>
-                          <Patch patch={f.patch!} />
+                          <Patch patch={f.patch!} comments={notes()} />
                         </Show>
                       </div>
                     );
@@ -184,14 +257,31 @@ export default function DiffPane(props: {
         <Show
           when={unread()}
           fallback={
-            <button
-              class="explain-btn"
-              disabled={busy()}
-              data-tip="read the diff again from GitHub"
-              onClick={() => load({ refresh: true })}
+            <Show
+              when={needsReview()}
+              fallback={
+                <button
+                  class="explain-btn"
+                  disabled={busy()}
+                  data-tip="read the diff again from GitHub"
+                  onClick={() => load({ refresh: true })}
+                >
+                  {busy() ? "READING DIFF…" : "RE-READ"}
+                </button>
+              }
             >
-              {busy() ? "READING DIFF…" : "RE-READ"}
-            </button>
+              <button
+                class="explain-btn"
+                disabled={busy()}
+                data-tip="review the stored diff — runs in the background, no GitHub call"
+                onClick={() => load({})}
+              >
+                {busy() ? "REVIEWING…" : "REVIEW"}
+              </button>
+              {/* Said while the poll is waiting, so the pane does not look finished-and-empty
+                  for the minute or two a review takes. */}
+              <span class="muted">review in progress…</span>
+            </Show>
           }
         >
           <button
@@ -229,26 +319,62 @@ function age(iso: string): string {
 /// Rendered line by line rather than as one block so additions and deletions are distinguishable
 /// — an uncoloured unified diff is the one presentation that makes a patch harder to read than the
 /// file it came from.
-function Patch(props: { patch: string }) {
+function Patch(props: { patch: string; comments?: ReviewComment[] }) {
   const lines = () => props.patch.split("\n");
+  /// Notes by the patch line they hang under, so a line with two remarks shows both.
+  const at = (i: number) =>
+    (props.comments ?? []).filter((c) => c.patch_index === i);
   return (
     <pre class="diff-patch">
       <For each={lines()}>
-        {(line) => (
-          <div
-            class="dl"
-            classList={{
-              "dl-add": line.startsWith("+") && !line.startsWith("+++"),
-              "dl-del": line.startsWith("-") && !line.startsWith("---"),
-              "dl-hunk": line.startsWith("@@"),
-            }}
-          >
-            {line || " "}
-          </div>
+        {(line, i) => (
+          <>
+            <div
+              class="dl"
+              classList={{
+                "dl-add": line.startsWith("+") && !line.startsWith("+++"),
+                "dl-del": line.startsWith("-") && !line.startsWith("---"),
+                "dl-hunk": line.startsWith("@@"),
+              }}
+            >
+              {line || " "}
+            </div>
+            {/* Inline, directly under the line it is about — the position that makes a review
+                comment worth more than the same sentence in a summary. */}
+            <For each={at(i())}>{(c) => <Note comment={c} inline />}</For>
+          </>
         )}
       </For>
     </pre>
   );
 }
+
+/// One review note.
+///
+/// Severity is a colour and a word, not an icon: "blocker" and "nit" have to be
+/// distinguishable at a glance without a legend, and a reader who ignores nits should be able
+/// to ignore them by colour.
+function Note(props: { comment: ReviewComment; inline?: boolean }) {
+  const c = () => props.comment;
+  return (
+    <div
+      class={`review-note note-${c().severity}`}
+      classList={{ "note-inline": props.inline }}
+    >
+      <span class={`note-sev sev-${c().severity}`}>
+        {c().severity.toUpperCase()}
+      </span>
+      <span class="note-text">{c().note}</span>
+    </div>
+  );
+}
+
+/// The header label per recommendation. `REQUEST CHANGES` rather than an emoji or a colour
+/// alone, because the folded card is where this gets read and a bare colour is not a claim.
+const REC_LABEL: Record<Recommendation, string> = {
+  approve: "APPROVE",
+  comment: "COMMENT",
+  request_changes: "REQUEST CHANGES",
+};
 
 export type { DiffFile };

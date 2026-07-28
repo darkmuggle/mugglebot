@@ -809,7 +809,47 @@ impl Tools {
                     }
                 }
             };
+            // The review lives beside the diff and is read the same way. A diff with no
+            // review yet renders as a diff — the pane says the review is missing rather than
+            // implying an empty one means "no comments".
+            // `refresh` means the operator asked for the change to be looked at again, so it
+            // has to reach the review too. Keeping the stored one here is how a re-read came
+            // back with a fresh diff and yesterday's verdict.
+            let review = if refresh {
+                None
+            } else {
+                match crate::prdiff::stored_review(&self.ingress, &repo, number).await {
+                    Ok(r) => r,
+                    Err(e) => {
+                        debug!("pr_diff: reading the stored review for {pr_key} failed: {e:#}");
+                        None
+                    }
+                }
+            };
             if let Some(stored) = stored {
+                // A stored diff with no review beside it: either the model failed to produce
+                // one, or this diff predates reviews existing. Either way the workflow key is
+                // spent, so nothing will ever fill it in — so fill it in here, on the read
+                // that noticed. `stored_only` opts out: that call is on a render path and must
+                // stay a state read.
+                let mut review = review;
+                if review.is_none() && !stored_only && stored.report.error.is_none() {
+                    if let Some(fresh) = self.diffs.review(&repo, number, &stored.report).await {
+                        let payload = crate::prdiff::StoredReview {
+                            watermark: stored.watermark.clone(),
+                            reviewed_at: chrono::Utc::now(),
+                            review: fresh,
+                        };
+                        if let Err(e) = self
+                            .ingress
+                            .send_object("PullRequest", &pr_key, "put_review", None, &payload)
+                            .await
+                        {
+                            debug!("pr_diff: storing the review for {pr_key} failed: {e:#}");
+                        }
+                        review = Some(payload);
+                    }
+                }
                 diffs.push(json!({
                     "repo": repo,
                     "number": number,
@@ -824,6 +864,8 @@ impl Tools {
                     // as the last activity on the PR, and a force-push produces no activity.
                     "stored": true,
                     "fetched_at": stored.fetched_at,
+                    "review": review.as_ref().map(|r| &r.review),
+                    "reviewed_at": review.as_ref().map(|r| r.reviewed_at),
                 }));
                 continue;
             }
@@ -842,7 +884,7 @@ impl Tools {
                 .and_then(|s| s.last().map(|s| s.id.clone()))
                 .unwrap_or_else(|| "inline".into());
             let payload = crate::prdiff::StoredDiff {
-                watermark,
+                watermark: watermark.clone(),
                 fetched_at: chrono::Utc::now(),
                 report: report.clone(),
             };
@@ -853,6 +895,12 @@ impl Tools {
             {
                 debug!("pr_diff: storing the diff for {pr_key} failed: {e:#}");
             }
+            // The review runs in the background rather than on this call. It is several model
+            // passes over the patches — five minutes on an eighteen-file change, measured —
+            // and a button that holds the page for five minutes is a hung button. The diff
+            // comes back now; the pane polls object state for the verdict, and the dispatch
+            // strip shows the work in flight meanwhile.
+            self.submit_pr_review(&pr_key, &watermark, refresh).await;
             diffs.push(json!({
                 "repo": repo,
                 "number": number,
@@ -865,9 +913,43 @@ impl Tools {
                 "error": report.error,
                 "stored": false,
                 "fetched_at": payload.fetched_at,
+                "review": review,
+                "reviewed_at": review.as_ref().map(|_| payload.fetched_at),
             }));
         }
         Ok(json!({ "subject_key": key, "diffs": diffs, "target_count": target_count }))
+    }
+
+    /// Ask for a review of a pull request whose diff is already known.
+    ///
+    /// Keyed with a `#review` suffix on the watermark, so it is distinct from the diff-only key
+    /// for the same activity — already spent by the time anybody notices a review is missing —
+    /// while staying deterministic: pressing the button twice is still free.
+    ///
+    /// `force` is what an explicit RE-READ needs: without it the key for this watermark is
+    /// already spent, Restate refuses the submission as a redo, and the operator gets the old
+    /// verdict back with a fresh diff — which is exactly what happened the first time this ran.
+    async fn submit_pr_review(&self, pr_key: &str, watermark: &str, force: bool) {
+        let suffix = if force {
+            // Per-second, so a double click is still free while a deliberate re-read is not.
+            format!("#r{}", chrono::Utc::now().timestamp())
+        } else {
+            String::new()
+        };
+        let wf_key = format!("{pr_key}@{watermark}#review{suffix}");
+        match self
+            .ingress
+            .submit_workflow(
+                "PrDiff",
+                &wf_key,
+                Some(crate::restate::workflows::rest::PrDiff::SCOPE),
+            )
+            .await
+        {
+            Ok(true) => debug!("reviewing {pr_key}"),
+            Ok(false) => debug!("{pr_key} is already being reviewed at this watermark"),
+            Err(e) => debug!("submitting a review for {pr_key} failed: {e:#}"),
+        }
     }
 
     /// Assemble a context block for a chat about a repo, or about one commit in it.
@@ -1657,7 +1739,7 @@ pub fn definitions() -> Vec<ToolDef> {
             description: "Agent sessions running right now, with their repo and which CLI is driving them.",
             schema: obj(json!({}), &[]) },
         ToolDef { name: "pr_diff", read_only: true,
-            description: "A pull request's diff with a model summary of what it changes. Pass a PR subject key for that PR, or an issue key for every PR attempting it. Read from the pull request's own object state, so it costs a state read rather than an API call and a model pass; a PR with nothing stored yet is fetched inline once and then kept. `stored_only` answers from state alone and omits what isn't there — for a pane opening itself. `refresh` forces a re-read, for a PR that moved without notifying anybody.",
+            description: "A pull request's diff, the summary of what it changes, and the code review of it — recommendation (approve / comment / request_changes), the general rationale, and inline comments resolved to lines of the patch. Pass a PR subject key for that PR, or an issue key for every PR attempting it. Read from the pull request's own object state, so it costs a state read rather than an API call and a model pass; a PR with nothing stored yet is fetched inline once and then kept. `stored_only` answers from state alone and omits what isn't there — for a pane opening itself. `refresh` forces a re-read, for a PR that moved without notifying anybody.",
             schema: obj(json!({ "subject_key": s(), "stored_only": {"type":"boolean"}, "refresh": {"type":"boolean"} }), &["subject_key"]) },
         ToolDef { name: "chat_context", read_only: true,
             description: "Assemble everything the code index knows about a repo — its card, component cards, dependency edges and recent commit summaries — or about one commit in it (pass `sha`), as a context block ready to hand to a chat. Built deterministically from the store: a model asked to go and find this would invent some of it.",

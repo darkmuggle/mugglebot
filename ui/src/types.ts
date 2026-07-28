@@ -663,6 +663,44 @@ export interface DiffFile {
   patch_omitted?: boolean;
 }
 
+/**
+ * What a review advises doing with the pull request.
+ *
+ * The three actions a reviewer actually has, rather than a score — a number reads as a grade
+ * on the author, and this is only ever about the code.
+ */
+export type Recommendation = "approve" | "comment" | "request_changes";
+
+/** How much one inline note matters. `praise` is not padding: it is what makes an approval specific. */
+export type ReviewSeverity = "blocker" | "concern" | "nit" | "praise";
+
+/** One note against a place in the diff. */
+export interface ReviewComment {
+  path: string;
+  severity: ReviewSeverity;
+  note: string;
+  /** The line the model quoted, verbatim from the patch. */
+  anchor?: string;
+  line?: number;
+  /**
+   * Index into that file's patch lines, resolved by the backend.
+   *
+   * Absent when neither the quoted line nor the line number matched anything — the note then
+   * renders at file level rather than being pinned to a guess, because a confident comment on
+   * the wrong line is worse than one with no line.
+   */
+  patch_index?: number;
+}
+
+/** A code review of one pull request. */
+export interface Review {
+  recommendation: Recommendation;
+  /** The review you would write above the Approve button. */
+  rationale: string;
+  comments: ReviewComment[];
+  produced_by: string;
+}
+
 export interface PrDiff {
   repo: string;
   number: number;
@@ -678,6 +716,9 @@ export interface PrDiff {
   error?: string;
   /** Came from the pull request's object state rather than a fresh read. */
   stored?: boolean;
+  /** The review of this change. Absent when the model hasn't produced one. */
+  review?: Review | null;
+  reviewed_at?: string | null;
   /** When the diff was read from GitHub. */
   fetched_at?: string;
 }

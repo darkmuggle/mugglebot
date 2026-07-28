@@ -726,6 +726,76 @@ and clicking into an issue lost the attempt altogether.
   state counts as outstanding, because the cost of showing a change is scrolling and the cost
   of hiding one is missing what happened.
 
+### Reviewing the change, not explaining it
+
+The diff summary says what a change does. That is useful and it is not a review: it leaves the
+reader to decide whether the change is good, which is the judgment they wanted help with. So
+each pull request also gets a **review** — a recommendation (`approve` / `comment` /
+`request_changes`), the note you would write above the Approve button, and inline comments
+anchored to lines of the patch. It is stored beside the diff on the `PullRequest` object, and
+like every critique here it is **never posted to GitHub**.
+
+It reviews the code and says nothing about who wrote it. Most pull requests on this board are
+the operator's own, and a review that goes easy on those is worthless exactly where it is read
+most.
+
+**Findings first, verdict second.** Asked for both in one pass, the on-device model returned
+`approve` with an empty comment list and a rationale that restated the title — "a good
+improvement to the system" on an eighteen-file feature. That is the explainer problem wearing a
+verdict, and it happens because one prompt asks a small model to read a large diff, decide, and
+justify at once. Now each batch of files is reviewed for *findings only*, with no verdict to
+reach for, and a final pass decides the recommendation **from the findings**. Two consequences
+worth keeping:
+
+- Batches are largest-file-first and capped (`MAX_REVIEW_BATCHES`), so a review that must
+  truncate drops the one-line files rather than the seven-thousand-character one.
+- The findings are the evidence, so they override the verdict, **both ways**
+  (`prdiff::reconcile`). A blocker means the verdict is `request_changes` whatever the model
+  labelled it; *no* blocker demotes `request_changes` to `comment`. The second direction is not
+  symmetry for its own sake — a real pull request enabling Linkerd HA correctly came back
+  `request_changes` on two `concern` findings whose substance was "not recommended in a
+  production environment", which is an appeal to a norm rather than to anything in the diff. A
+  verdict that blocks a merge has to rest on a finding that says something *is* wrong, or it is
+  the generic-advice failure again wearing a stronger word. Nits and praise never block and
+  never prevent an approval.
+
+**Claims the diff cannot support are discarded.** The first real run produced five `blocker`
+findings of the form "not used anywhere in the codebase", every one of them wrong, about symbols
+the diff had just introduced. A review of a few hunks cannot see callers, exports, tests, or the
+rest of the file. Hardening the prompt was not enough on its own — told not to say "not used
+anywhere", the model said "not used in the file" and returned the same five — so
+`prdiff::unverifiable` drops the whole claim shape deterministically, the same way
+`explain::verify` strips claims the dossier cannot support. The cost is accepted: a genuinely
+unused parameter, fully visible in the diff, is dropped along with the guesses. A false blocker
+is the one finding a reader acts on.
+
+**Where the diff shows up.** Any pull request in view carries its diff, and there are three ways
+one gets there: the subject *is* a PR, the view's `pull_requests` lists it, or a triage pass
+turned it up as an attempt on an issue. A PR subject is the case that was silently broken —
+`pull_requests` is keyed by the issue a PR attempts, so a PR is never listed under itself, and a
+PR subject's own diff had been read, stored, and then rendered nowhere. Its own diff now leads
+the click-in view under THE CHANGE, unfolded; the attempt sources are unioned and deduped so
+"any PR means show me the diff" holds whichever one has it.
+
+**Anchoring.** A comment carries the line it is about, copied verbatim, and the backend resolves
+that to an index into the patch. The quoted line is tried before any line *number* the model
+offered, because a model copying a line it is looking at is usually exact and the same model
+counting positions in a hunk is often off by a few. Unresolvable notes render at file level —
+guessing a line would attach a confident comment to the wrong code, which is the only failure
+mode worse than having no line.
+
+**It runs in the background.** Several model passes over the patches measured at ~5 minutes on
+an eighteen-file change, so the diff returns immediately and the review is submitted as a
+workflow. The pane polls object state (~40ms) while a review is outstanding and stops the moment
+it lands; the dispatch strip shows the pass in flight. A `refresh` must force a *new* workflow
+key — the first version reused the spent one, so a re-read came back with a fresh diff and
+yesterday's verdict.
+
+**How this differs from the PR *critique*.** `PrFixFinder` answers "does this pull request fix
+_that issue_" — a question about a relationship, used to tell you somebody is already on it. The
+review answers "should this land", about the code alone. Neither replaces the other, and only
+the review takes a position on merging.
+
 ### Secrets in SQLite
 
 Credentials — GitHub token, Slack app + bot tokens, Granola key, Anthropic /
