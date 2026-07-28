@@ -15,7 +15,26 @@ export function prKey(pr: PrFix): string {
 ///
 /// None of this is ever posted to GitHub. It is a note in MuggleBot's own store,
 /// rendered here and nowhere else.
-export default function Attempt(props: { pr: PrFix; onExplain: () => void }) {
+/// Whether this attempt's diff is worth unfolding without being asked.
+///
+/// An outstanding or merged PR is the meat of the fix — the reason you opened the subject —
+/// so hiding it behind a disclosure triangle hides the answer. A PR closed *without* merging
+/// is a dead end: worth listing, not worth the screen.
+///
+/// An unknown state counts as outstanding. Erring towards showing the change is the right
+/// error: the cost is scrolling, and the cost the other way is missing what happened.
+function worthUnfolding(pr: PrFix): boolean {
+  return pr.pr_state !== "closed";
+}
+
+export default function Attempt(props: {
+  pr: PrFix;
+  onExplain: () => void;
+  /// Unfold the diff — patches and all — rather than a file list to click through. Set in the
+  /// click-in view, where screen space is the point; left off on the board, where a card is a
+  /// list row.
+  expand?: boolean;
+}) {
   const pr = () => props.pr;
   return (
     <div class={`attempt verdict-${pr().verdict}`}>
@@ -47,7 +66,7 @@ export default function Attempt(props: { pr: PrFix; onExplain: () => void }) {
         </Show>
         <button
           class="explain-btn"
-          title="Explain just this pull request"
+          data-tip="Explain just this pull request"
           onClick={props.onExplain}
         >
           EXPLAIN
@@ -61,7 +80,10 @@ export default function Attempt(props: { pr: PrFix; onExplain: () => void }) {
       </Show>
       {/* The diff, per attempt. Keyed to this PR rather than the issue so one click reads one
           change — an issue with five attempts would otherwise fetch five diffs to show one. */}
-      <DiffPane subjectKey={`${pr().pr_repo}!${pr().pr_number}`} />
+      <DiffPane
+        subjectKey={`${pr().pr_repo}!${pr().pr_number}`}
+        expand={props.expand && worthUnfolding(pr())}
+      />
       <Show when={pr().critique}>
         <div class="attempt-row">
           <span class="attempt-key">CRITIQUE</span>

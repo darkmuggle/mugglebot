@@ -41,7 +41,7 @@ function isActive(d: Dispatch) {
 function Row(props: { dispatch: Dispatch }) {
   const d = () => props.dispatch;
   return (
-    <div class={`dispatch dispatch-${d().state}`} title={d().detail ?? ""}>
+    <div class={`dispatch dispatch-${d().state}`} data-tip={d().detail ?? ""}>
       <span class={`dispatch-state ds-${d().state}`}>{label(d().state)}</span>
       <span class="dispatch-kind">{pretty(d().kind)}</span>
       <Show when={isActive(d())} fallback={<Took dispatch={d()} />}>

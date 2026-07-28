@@ -53,7 +53,7 @@ export default function AgentSession(props: {
         <span class="explain-label">AGENT · {props.tool.toUpperCase()}</span>
         <span class="agent-repo">{props.repo}</span>
         <Show when={cost() > 0}>
-          <span class="chip model-chip" title="Reported by the CLI for this session">
+          <span class="chip model-chip" data-tip="Reported by the CLI for this session">
             ${cost().toFixed(4)}
           </span>
         </Show>
@@ -62,7 +62,7 @@ export default function AgentSession(props: {
           fallback={
             <button
               class="explain-btn"
-              title="Kill this session"
+              data-tip="Kill this session"
               onClick={() => void api.stopAgentSession(props.sessionId)}
             >
               STOP
@@ -101,7 +101,7 @@ export default function AgentSession(props: {
                 {/* A subagent's output is attributed to the tool call that spawned it —
                     otherwise it reads as the main agent talking to itself. */}
                 <Show when={c.subagent_of}>
-                  <span class="chip src-chip" title={`subagent of ${c.subagent_of}`}>
+                  <span class="chip src-chip" data-tip={`subagent of ${c.subagent_of}`}>
                     subagent
                   </span>
                 </Show>

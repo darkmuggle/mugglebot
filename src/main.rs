@@ -19,6 +19,7 @@ mod components;
 mod config;
 mod context;
 mod correlation;
+mod crossref;
 mod dispatch;
 mod ecosystem;
 mod embed;

@@ -148,7 +148,7 @@ function Topic(props: {
             <Show when={isBusy(t().key)}>
               <span
                 class="ai-badge ai-working"
-                title="an AI pass is running or queued"
+                data-tip="an AI pass is running or queued"
               >
                 <span class="thinking-dots">
                   <i />
@@ -159,7 +159,7 @@ function Topic(props: {
               </span>
             </Show>
             <Show when={!isBusy(t().key) && lastFailure(t().key)}>
-              <span class="ai-badge ai-failed" title={lastFailure(t().key)!}>
+              <span class="ai-badge ai-failed" data-tip={lastFailure(t().key)!}>
                 AI FAILED
               </span>
             </Show>
@@ -223,7 +223,7 @@ function Topic(props: {
                 <span class="explain-label">
                   {x.produced_by === "cloud" ? "2ND OPINION" : "EXPLANATION"}
                 </span>
-                <span class="chip model-chip" title="which model wrote this">
+                <span class="chip model-chip" data-tip="which model wrote this">
                   {x.produced_by === "cloud" ? "CLOUD" : "LOCAL"}
                 </span>
                 <For each={x.sources}>
@@ -236,7 +236,7 @@ function Topic(props: {
                 <Show when={staleExplanation(t(), x)}>
                   <span
                     class="chip chip-stale"
-                    title="new activity has landed since this was written"
+                    data-tip="new activity has landed since this was written"
                   >
                     STALE
                   </span>
@@ -248,7 +248,7 @@ function Topic(props: {
               <Show when={x.removed.length}>
                 <div
                   class="explain-removed"
-                  title="removed because the dossier could not support it"
+                  data-tip="removed because the dossier could not support it"
                 >
                   <For each={x.removed}>{(r) => <div>— {r}</div>}</For>
                 </div>
@@ -427,7 +427,7 @@ export default function Board(props: {
                       proposed causes, the triage. On a PR, just that change. */}
                   <button
                     disabled={explaining() === t.key}
-                    title="Distil this and everything under it, on the local model"
+                    data-tip="Distil this and everything under it, on the local model"
                     onClick={() => explain(t.key)}
                   >
                     {explaining() === t.key ? "EXPLAINING…" : "EXPLAIN"}

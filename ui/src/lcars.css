@@ -3126,3 +3126,130 @@ code {
 .attempts-panel {
   grid-column: 1 / -1;
 }
+
+/* ---- the click-in view reads, the board scans -----------------------------------
+   Every size below is the board size scaled up. On a card the attempt is a dense row in a
+   list of subjects, and 0.6–0.7rem is right for scanning. In the click-in view it is the
+   substance of the page — the critique, what reviewers said, and the diff itself — and the
+   same type is squinting at the answer. Scoped to `.attempts-panel`, which exists only in
+   the detail view, so the board keeps its density. */
+.attempts-panel .attempt {
+  padding: 0.7rem 0.9rem;
+  margin-bottom: 0.8rem;
+}
+.attempts-panel .attempt-title {
+  font-size: 1rem;
+}
+.attempts-panel .attempt-ref {
+  font-size: 0.9rem;
+}
+.attempts-panel .verdict,
+.attempts-panel .attempt-conf,
+.attempts-panel .attempt-author {
+  font-size: 0.8rem;
+}
+.attempts-panel .attempt-row {
+  font-size: 0.92rem;
+  line-height: 1.5;
+  margin-top: 0.45rem;
+}
+.attempts-panel .attempt-key {
+  flex: 0 0 6.5rem;
+  font-size: 0.72rem;
+  padding-top: 0.2rem;
+}
+.attempts-panel .attempt-foot {
+  font-size: 0.75rem;
+  margin-top: 0.5rem;
+}
+.attempts-panel .explain-label,
+.attempts-panel .diff-head {
+  font-size: 0.8rem;
+}
+.attempts-panel .diff-summary {
+  font-size: 0.92rem;
+  line-height: 1.55;
+  padding: 0.55rem 0.7rem;
+  margin: 0.45rem 0 0.6rem;
+}
+.attempts-panel .diff-file-head {
+  font-size: 0.85rem;
+  padding: 0.2rem 0;
+}
+/* The patch is the thing being read, and it is monospace: below ~0.8rem a unified diff
+   stops being legible and becomes a texture. Taller too — an unfolded patch that scrolls
+   inside 22rem defeats the point of unfolding it. */
+.attempts-panel .diff-patch {
+  font-size: 0.82rem;
+  line-height: 1.5;
+  max-height: 46rem;
+  padding: 0.5rem 0.7rem;
+}
+
+/* ---- tooltips ------------------------------------------------------------------- */
+
+/* The app's own hover help, replacing the browser's `title`. Fixed to the viewport so a
+   tooltip raised inside a scrolling panel is never clipped by it, and pointer-events:none so
+   the bubble can't sit between the cursor and the thing it describes. */
+.tip {
+  position: fixed;
+  z-index: 200;
+  max-width: 26rem;
+  padding: 7px 10px;
+  background: var(--surface);
+  border: 1px solid var(--line-strong);
+  border-radius: 8px;
+  box-shadow: var(--glow);
+  color: var(--text);
+  font: 11px/1.45 inherit;
+  letter-spacing: 0.01em;
+  /* Long explanations are the point — several of these are a sentence or two, and the
+     native tooltip's single clipped line is what made them useless. */
+  white-space: pre-wrap;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 90ms ease-out;
+}
+
+.tip.ready {
+  opacity: 1;
+}
+
+/* The pointer. Below-placement flips it to the top edge. */
+.tip::after {
+  content: "";
+  position: absolute;
+  left: 50%;
+  bottom: -5px;
+  width: 8px;
+  height: 8px;
+  margin-left: -4px;
+  background: var(--surface);
+  border-right: 1px solid var(--line-strong);
+  border-bottom: 1px solid var(--line-strong);
+  transform: rotate(45deg);
+}
+
+.tip.tip-below::after {
+  bottom: auto;
+  top: -5px;
+  border: none;
+  border-left: 1px solid var(--line-strong);
+  border-top: 1px solid var(--line-strong);
+}
+
+/* The affordance, now that hovering actually answers: anything carrying a tip says so. */
+[data-tip] {
+  cursor: help;
+}
+
+/* …except the ones you click. There the pointer must keep saying "click me"; the tip is
+   extra, not the purpose. */
+button[data-tip],
+a[data-tip],
+select[data-tip],
+[data-tip].idx-th,
+[data-tip].repo-line,
+[data-tip].source-row {
+  cursor: pointer;
+}

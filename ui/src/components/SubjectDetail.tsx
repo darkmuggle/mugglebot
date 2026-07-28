@@ -166,7 +166,7 @@ function renderSummary(src: string): string {
         );
       const label =
         entries.length === 1 ? "evidence" : `evidence ×${entries.length}`;
-      return `<span class="citation" title="${detail}">${label}</span>`;
+      return `<span class="citation" data-tip="${detail}">${label}</span>`;
     },
   );
 }
@@ -440,7 +440,7 @@ export default function SubjectDetail(props: {
                       </span>
                       <span
                         class="chip model-chip"
-                        title="which model wrote this"
+                        data-tip="which model wrote this"
                       >
                         {x.produced_by === "cloud" ? "CLOUD" : "LOCAL"}
                       </span>
@@ -459,7 +459,7 @@ export default function SubjectDetail(props: {
                       >
                         <span
                           class="chip chip-stale"
-                          title="activity has landed since this was written"
+                          data-tip="activity has landed since this was written"
                         >
                           STALE
                         </span>
@@ -470,7 +470,7 @@ export default function SubjectDetail(props: {
                     <Show when={x.removed.length}>
                       <div
                         class="explain-removed"
-                        title="removed because the dossier could not support it"
+                        data-tip="removed because the dossier could not support it"
                       >
                         <For each={x.removed}>{(r) => <div>— {r}</div>}</For>
                       </div>
@@ -702,7 +702,7 @@ export default function SubjectDetail(props: {
                 </Show>
                 <button
                   disabled={busy() !== ""}
-                  title="Re-run the LLM analysis on the selected model"
+                  data-tip="Re-run the LLM analysis on the selected model"
                   onClick={() =>
                     run(
                       "reanalyze",
@@ -729,7 +729,7 @@ export default function SubjectDetail(props: {
                     and the one a 147-repo org can't answer by searching. */}
                 <button
                   disabled={busy() !== ""}
-                  title="Rank which repo, component and change this is likely about"
+                  data-tip="Rank which repo, component and change this is likely about"
                   onClick={() =>
                     run("score", async () => {
                       setScores(await api.scoreIssue(props.id));
@@ -740,7 +740,7 @@ export default function SubjectDetail(props: {
                 </button>
                 <button
                   disabled={busy() !== ""}
-                  title="Distil this subject and everything under it, on the local model"
+                  data-tip="Distil this subject and everything under it, on the local model"
                   onClick={() =>
                     run("explain", async () => {
                       const r = await api.explain(props.id);
@@ -756,7 +756,7 @@ export default function SubjectDetail(props: {
                 <button
                   class="cloud-btn"
                   disabled={busy() !== "" || awaitingSecond()}
-                  title={
+                  data-tip={
                     cloudOpinion()
                       ? "A cloud second opinion is already below; asking again re-reads the same dossier"
                       : "Ask the cloud model for its own read of the same dossier"
@@ -778,29 +778,35 @@ export default function SubjectDetail(props: {
                       ? "2ND OPINION ✓"
                       : "2ND OPINION ↗"}
                 </button>
+                {/* Not on a pull request. A postmortem is written about something that
+                    went wrong; a PR is the attempt to put it right, and drafting one from
+                    a change's timeline produces a postmortem of the fix. The incident is
+                    the issue this PR is filed under, and that is where the button is. */}
+                <Show when={t().rank !== "pull_request"}>
+                  <button
+                    disabled={busy() !== ""}
+                    onClick={() =>
+                      run("postmortem", async () => {
+                        // Save on generate: a drafted postmortem is persisted to
+                        // memory (linked to the thread) as soon as it's produced.
+                        const r = await api.tool<{
+                          draft: string;
+                          saved_memory: unknown;
+                        }>("draft_postmortem", {
+                          subject_key: props.id,
+                          save: true,
+                        });
+                        setPostmortem(r.draft);
+                        setPmSaved(!!r.saved_memory);
+                      })
+                    }
+                  >
+                    {busy() === "postmortem" ? "DRAFTING…" : "DRAFT POSTMORTEM"}
+                  </button>
+                </Show>
                 <button
                   disabled={busy() !== ""}
-                  onClick={() =>
-                    run("postmortem", async () => {
-                      // Save on generate: a drafted postmortem is persisted to
-                      // memory (linked to the thread) as soon as it's produced.
-                      const r = await api.tool<{
-                        draft: string;
-                        saved_memory: unknown;
-                      }>("draft_postmortem", {
-                        subject_key: props.id,
-                        save: true,
-                      });
-                      setPostmortem(r.draft);
-                      setPmSaved(!!r.saved_memory);
-                    })
-                  }
-                >
-                  {busy() === "postmortem" ? "DRAFTING…" : "DRAFT POSTMORTEM"}
-                </button>
-                <button
-                  disabled={busy() !== ""}
-                  title="Distill this thread into a one-sentence memory"
+                  data-tip="Distill this thread into a one-sentence memory"
                   onClick={() =>
                     run("distill", async () => {
                       const m = await api.tool<Memory>("distill_memory", {
@@ -814,7 +820,7 @@ export default function SubjectDetail(props: {
                 </button>
                 <button
                   disabled={busy() !== ""}
-                  title="Start a chat seeded with this thread"
+                  data-tip="Start a chat seeded with this thread"
                   onClick={() => {
                     setChatSeed({
                       prompt: `Let's dig into the thread "${t().title}" (thread id: ${props.id}). Summarize what's happening and suggest next steps.`,
@@ -843,7 +849,7 @@ export default function SubjectDetail(props: {
                     <span class="pm-actions">
                       <button
                         class="icon-btn"
-                        title="Copy raw Markdown"
+                        data-tip="Copy raw Markdown"
                         onClick={copyPostmortem}
                       >
                         {pmCopied() ? "✓ copied" : "📋 copy"}
@@ -882,7 +888,7 @@ export default function SubjectDetail(props: {
                           {(outcome) => (
                             <span
                               class={`tl-outcome outcome-${outcome().kind}`}
-                              title={`System outcome: ${outcome().label}`}
+                              data-tip={`System outcome: ${outcome().label}`}
                             >
                               <span aria-hidden="true">
                                 {outcome().kind === "success" ||
@@ -1080,6 +1086,7 @@ export default function SubjectDetail(props: {
                 <For each={t().pull_requests}>
                   {(pr) => (
                     <Attempt
+                      expand
                       pr={pr}
                       onExplain={() =>
                         run("explain-pr", () =>
@@ -1166,7 +1173,7 @@ export default function SubjectDetail(props: {
                             </span>
                             <span
                               class="rc-confidence"
-                              title="The model's confidence — a proposal, not a verdict"
+                              data-tip="The model's confidence — a proposal, not a verdict"
                             >
                               {Math.round(p.confidence * 100)}%
                             </span>
@@ -1239,7 +1246,7 @@ export default function SubjectDetail(props: {
                             </Show>
                             <span
                               class="rc-confidence"
-                              title="Confidence in this judgment"
+                              data-tip="Confidence in this judgment"
                             >
                               {Math.round(pr.confidence * 100)}%
                             </span>
@@ -1420,7 +1427,7 @@ export default function SubjectDetail(props: {
                             </Show>
                             <span
                               class="rc-confidence"
-                              title="How confident the model is — a hypothesis, not a verdict"
+                              data-tip="How confident the model is — a hypothesis, not a verdict"
                             >
                               {Math.round(c.confidence * 100)}%
                             </span>
@@ -1546,7 +1553,7 @@ export default function SubjectDetail(props: {
                         <Show
                           when={target()}
                           fallback={
-                            <span class="muted" title={other(e)}>
+                            <span class="muted" data-tip={other(e)}>
                               {other(e)} (off board — resolved, snoozed, or
                               merged)
                             </span>

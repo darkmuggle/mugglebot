@@ -716,6 +716,15 @@ and clicking into an issue lost the attempt altogether.
   nothing), falls back to a button for a PR nothing is stored for — the first read costs what
   it always cost, and it is the last time — and offers RE-READ with the age of what it has,
   because a force-push notifies nobody and so cannot move the watermark.
+- **Folded on the board, unfolded in the click-in view.** A card is a row in a list of
+  subjects, so there the diff is a file list at scanning density. Clicking in is the opposite
+  request: the patches are the substance of the page, at a size a unified diff is legible at,
+  and hiding them behind a disclosure triangle hides the answer the view exists to give. The
+  one exception is a PR **closed without merging** — a dead end, worth listing and not worth
+  the screen — which is why `github::PullRequest` carries `merged_at`: GitHub reports merged
+  and abandoned alike as `state: "closed"`, and those are nearly opposite facts. An unknown
+  state counts as outstanding, because the cost of showing a change is scrolling and the cost
+  of hiding one is missing what happened.
 
 ### Secrets in SQLite
 

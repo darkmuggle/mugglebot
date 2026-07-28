@@ -34,6 +34,7 @@ use tracing::{debug, warn};
 
 use crate::comments::CommentJudge;
 use crate::correlation::{Analyst, RelationKind};
+use crate::crossref;
 use crate::github::{GithubClient, PullFile, PullRequest};
 use crate::reasoner::{self, CompletionRequest, Reasoner};
 pub use crate::store::PrFix;
@@ -64,6 +65,20 @@ impl From<&IssueTriage> for Subject {
             title: t.title.clone(),
         }
     }
+}
+
+/// What the discussion on a PR amounts to: what people said, and what they pointed at.
+///
+/// Two fields rather than one blob because they are different kinds of evidence and the judge
+/// is told to weigh them differently — a reviewer's objection is an opinion about this diff, a
+/// commit message followed out of the discussion is a fact about another one.
+#[derive(Debug, Default)]
+struct Discussion {
+    /// The meritorious reviews and comments, rendered.
+    reviews: String,
+    /// Commits the discussion said the fix lives in, read out of the code index. `None` when
+    /// nobody pointed anywhere.
+    referenced: Option<String>,
 }
 
 /// Open PRs pulled per repo before shortlisting.
@@ -213,14 +228,14 @@ impl PrFixFinder {
                     Vec::new()
                 }
             };
-            let reviews = self.reviews(gh, issue, &pr, fresh).await;
+            let discussion = self.discussion(gh, issue, &pr, fresh).await;
             match self
                 .analyze(
                     issue,
                     issue_body,
                     &pr,
                     &files,
-                    &reviews,
+                    &discussion,
                     other_open_issues,
                     fresh,
                 )
@@ -271,14 +286,14 @@ impl PrFixFinder {
             .pull_files(pr_repo, pr_number, MAX_PR_FILES, MAX_PATCH_CHARS)
             .await
             .unwrap_or_default();
-        let reviews = self.reviews(gh, subject, &pr, fresh).await;
+        let discussion = self.discussion(gh, subject, &pr, fresh).await;
         let fix = self
             .analyze(
                 subject,
                 subject_body,
                 &pr,
                 &files,
-                &reviews,
+                &discussion,
                 other_open_issues,
                 fresh,
             )
@@ -290,18 +305,23 @@ impl PrFixFinder {
         Some(fix)
     }
 
-    /// The PR's reviews and inline comments, scored on merit.
+    /// The PR's reviews and inline comments, scored on merit — plus whatever they point at.
     ///
     /// This is the highest-value input to a critique: a reviewer who read the change
     /// and requested changes has already found what's wrong with it, and a model
     /// second-guessing that is worse than a model deferring to it.
-    async fn reviews(
+    ///
+    /// And when a reviewer says the fix is somewhere else — another commit, or a PR in another
+    /// repo — that reference is followed into the code index, because judging this diff on its
+    /// own against an issue that has already been fixed elsewhere is the confident wrong answer
+    /// this pass exists to avoid.
+    async fn discussion(
         &self,
         gh: &GithubClient,
         subject: &Subject,
         pr: &PullRequest,
         fresh: bool,
-    ) -> String {
+    ) -> Discussion {
         let mut all = gh
             .pull_reviews(&pr.repo, pr.number)
             .await
@@ -311,25 +331,69 @@ impl PrFixFinder {
         if let Ok(discussion) = gh.issue_comments(&pr.repo, pr.number).await {
             all.extend(discussion);
         }
-        if all.is_empty() {
-            return "(no reviews or comments)".into();
+        // The description is scanned for references alongside the comments: "the real fix is in
+        // X" is as often written by the author as by a reviewer.
+        let mut pointing = pr.body.clone().unwrap_or_default();
+
+        let reviews = if all.is_empty() {
+            "(no reviews or comments)".to_string()
+        } else {
+            let total = all.len();
+            let context = format!(
+                "PR #{}: {} — judged against {}",
+                pr.number, pr.title, subject.title
+            );
+            let judged = self
+                .comments
+                .select(&all, &context, REVIEW_CHARS, fresh)
+                .await;
+            debug!(
+                "pr-fix: {}#{}: {} of {total} review comment(s) judged substantive",
+                pr.repo,
+                pr.number,
+                judged.len()
+            );
+            // Only the meritorious comments are followed. A "+1" that happens to contain a sha
+            // is not someone telling you where the fix is.
+            for j in &judged {
+                pointing.push('\n');
+                pointing.push_str(&j.comment.body);
+            }
+            crate::comments::render(&judged, total)
+        };
+
+        Discussion {
+            reviews,
+            referenced: self.follow_references(subject, pr, &pointing),
         }
-        let total = all.len();
-        let context = format!(
-            "PR #{}: {} — judged against {}",
-            pr.number, pr.title, subject.title
-        );
-        let judged = self
-            .comments
-            .select(&all, &context, REVIEW_CHARS, fresh)
-            .await;
+    }
+
+    /// Resolve the fix-is-elsewhere references in some text against the code index.
+    fn follow_references(
+        &self,
+        subject: &Subject,
+        pr: &PullRequest,
+        text: &str,
+    ) -> Option<String> {
+        // This conversation's own numbers: a PR saying "fixes #412" about the issue under
+        // judgment is the ordinary case, not a claim that the work happened elsewhere.
+        let mut skip = vec![pr.number];
+        if subject.repo == pr.repo {
+            skip.push(subject.number as u64);
+        }
+        let refs = crossref::extract(text, &pr.repo, &skip);
+        if refs.is_empty() {
+            return None;
+        }
+        let resolved = crossref::resolve(&self.store, &refs);
         debug!(
-            "pr-fix: {}#{}: {} of {total} review comment(s) judged substantive",
+            "pr-fix: {}#{}: following {} fix-is-elsewhere reference(s); {} found in the index",
             pr.repo,
             pr.number,
-            judged.len()
+            resolved.len(),
+            resolved.iter().filter(|r| r.commit.is_some()).count(),
         );
-        crate::comments::render(&judged, total)
+        crossref::render(&resolved)
     }
 
     /// Narrow open PRs to the ones plausibly about this issue, on the local model.
@@ -433,7 +497,7 @@ impl PrFixFinder {
         issue_body: &str,
         pr: &PullRequest,
         files: &[PullFile],
-        reviews: &str,
+        discussion: &Discussion,
         other_open_issues: &[String],
         fresh: bool,
     ) -> Option<PrFix> {
@@ -463,15 +527,36 @@ impl PrFixFinder {
              Rules: `fixes` only if the diff plainly resolves the issue's mechanism; `partial` if it \
              addresses part of it or papers over it; `related` if it touches the same code without \
              fixing it; `unrelated` otherwise. Do not invent file names or behavior not in the diff.\n\
+             If a WORK REFERENCED ELSEWHERE section is present, the discussion claimed the fix lives \
+             in another commit or another repository, and those commits were read out of the code \
+             index for you. Weigh them: a fix that already landed elsewhere is not delivered by THIS \
+             diff, so say so in the critique, name the commit, and judge this PR on what it changes \
+             rather than on the issue being resolved — `fixes` requires the resolving change to be in \
+             the diff above. A reference the index could not resolve means work that may exist and \
+             cannot be read: say that it is unverified rather than assuming either way.\n\
              `also_fixes` is almost always EMPTY — most patches fix exactly one thing. Include an \
              entry only if you can point to the specific hunk that resolves that other issue too. \
              Never copy the other-issues list back; unrelated work in the same repository is not \
              \"also fixed\" just because it is listed.";
+        // Only present when the discussion actually pointed somewhere. An empty section under a
+        // header reads as "nothing was referenced", which is a claim we would be making up.
+        let referenced = discussion
+            .referenced
+            .as_deref()
+            .map(|r| {
+                format!(
+                    "=== WORK REFERENCED ELSEWHERE (followed out of the discussion, read from \
+                     the code index) ===\n{r}\n\n"
+                )
+            })
+            .unwrap_or_default();
+        let reviews = &discussion.reviews;
         let prompt = format!(
             "=== ISSUE #{} in {} ===\n{}\n\n{}\n\n\
              === CANDIDATE PULL REQUEST #{} ===\nTitle: {}\nAuthor: {}\nState: {}{}\n\
              Description: {}\n\n=== DIFF ===\n{diff}\n\n\
              === REVIEWS AND DISCUSSION ON THIS PR ===\n{reviews}\n\n\
+             {referenced}\
              === OTHER OPEN ISSUES (for also_fixes) ===\n{others}\n\n\
              === YOUR TASK ===\nJudge PR #{} against issue #{}: what it implements, whether it \
              really fixes the issue, and what else it resolves. Reply with the JSON object only.",

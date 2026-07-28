@@ -69,14 +69,14 @@ export function AttentionBadge(props: {
       <Show
         when={props.attention.needed}
         fallback={
-          <span class="att att-clear" title="Nothing here is asking for you">
+          <span class="att att-clear" data-tip="Nothing here is asking for you">
             CLEAR
           </span>
         }
       >
         <span
           class="att att-needed"
-          title={props.attention.reason ?? "Needs your attention"}
+          data-tip={props.attention.reason ?? "Needs your attention"}
         >
           NEEDS YOU
         </span>
@@ -91,13 +91,13 @@ export function AttentionBadge(props: {
 
       <span
         class="facets"
-        title={untouched() ? "The AI has not analyzed this yet" : "AI analysis"}
+        data-tip={untouched() ? "The AI has not analyzed this yet" : "AI analysis"}
       >
         <For each={facets(d())}>
           {(f) => (
             <span
               class={`facet ${f.on ? "facet-on" : "facet-off"}`}
-              title={f.title}
+              data-tip={f.title}
             >
               {f.label}
             </span>
@@ -111,7 +111,7 @@ export function AttentionBadge(props: {
           <Show when={d().local_passes > 0}>
             <span
               class="pass pass-local"
-              title={`${d().local_passes} pass(es) ran on this machine`}
+              data-tip={`${d().local_passes} pass(es) ran on this machine`}
             >
               ⌂{d().local_passes}
             </span>
@@ -119,7 +119,7 @@ export function AttentionBadge(props: {
           <Show when={d().cloud_passes > 0}>
             <span
               class="pass pass-cloud"
-              title={`${d().cloud_passes} metered cloud call(s)`}
+              data-tip={`${d().cloud_passes} metered cloud call(s)`}
             >
               ☁{d().cloud_passes}
             </span>

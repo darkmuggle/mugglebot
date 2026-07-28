@@ -47,7 +47,7 @@ export function SignalModal(props: { signal: Signal; onClose: () => void }) {
           <Show when={s().upstream_gone}>
             <span class="state state-resolved">gone upstream</span>
           </Show>
-          <button class="modal-close" title="Close (Esc)" onClick={props.onClose}>
+          <button class="modal-close" data-tip="Close (Esc)" onClick={props.onClose}>
             ✕
           </button>
         </div>

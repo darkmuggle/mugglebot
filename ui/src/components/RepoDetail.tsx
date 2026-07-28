@@ -75,7 +75,7 @@ export default function RepoDetailView(props: {
         <select
           class="kind-pick"
           classList={{ pinned: !!props.row?.kind_pinned }}
-          title={
+          data-tip={
             props.row?.kind_pinned
               ? "Tagged by you — the crawl will not overwrite it"
               : "Guessed from the name and topics; pick one to pin it"
@@ -96,7 +96,7 @@ export default function RepoDetailView(props: {
         </select>
         <button
           class="explain-btn"
-          title="Check this repo out and run an agent in it"
+          data-tip="Check this repo out and run an agent in it"
           onClick={() => props.onAgent()}
         >
           AGENT
@@ -126,7 +126,7 @@ export default function RepoDetailView(props: {
               </span>
               <Show when={d().entry?.indexed_sha}>
                 {(sha) => (
-                  <span class="chip" title="the commit the repo card was written from">
+                  <span class="chip" data-tip="the commit the repo card was written from">
                     {short(sha())}
                   </span>
                 )}
@@ -329,7 +329,7 @@ function CommitRow(props: {
             {/* Per commit, because "what did this change break" is asked about one change. */}
             <button
               class="explain-btn"
-              title="Run an agent on this commit, seeded with the index's summary of it"
+              data-tip="Run an agent on this commit, seeded with the index's summary of it"
               onClick={props.onAgent}
             >
               AGENT

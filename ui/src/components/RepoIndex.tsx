@@ -215,7 +215,7 @@ export default function RepoIndexView(props: { onChat?: () => void }) {
     <span
       class="idx-th"
       classList={{ "idx-num": props.num, active: sortBy() === props.col }}
-      title={props.title}
+      data-tip={props.title}
       onClick={() => sortOn(props.col)}
     >
       {props.label}
@@ -290,7 +290,7 @@ export default function RepoIndexView(props: { onChat?: () => void }) {
             <span
               class="chip"
               classList={{ "ph-done": pushes() > 0, "ph-idle": pushes() === 0 }}
-              title={
+              data-tip={
                 pushes() > 0
                   ? `${pushes()} repo(s) reporting live; progress arrives as each batch lands`
                   : "no live updates yet — progress appears as batches land"
@@ -301,7 +301,7 @@ export default function RepoIndexView(props: { onChat?: () => void }) {
             <div class="row">
               <select
                 class="kind-pick"
-                title="Which agent CLI runs in the checkout"
+                data-tip="Which agent CLI runs in the checkout"
                 value={agentTool()}
                 onChange={(e) => setAgentTool(e.currentTarget.value)}
               >
@@ -347,7 +347,7 @@ export default function RepoIndexView(props: { onChat?: () => void }) {
                   <Show when={s().totals.repos_untouched}>
                     <span
                       class="chip chip-stale"
-                      title="scoring cannot reach these repos at all"
+                      data-tip="scoring cannot reach these repos at all"
                     >
                       {s().totals.repos_untouched} untouched
                     </span>
@@ -415,13 +415,13 @@ export default function RepoIndexView(props: { onChat?: () => void }) {
                     />
                     <span
                       class="idx-th idx-num idx-deps"
-                      title="Dependency edges out ↗ / in ↘"
+                      data-tip="Dependency edges out ↗ / in ↘"
                     >
                       DEPS
                     </span>
                     <span
                       class="idx-th idx-num"
-                      title="How far BACK the walk has reached — the oldest commit fetched. History is walked backwards from HEAD, so this is not the last commit."
+                      data-tip="How far BACK the walk has reached — the oldest commit fetched. History is walked backwards from HEAD, so this is not the last commit."
                     >
                       HISTORY FROM
                     </span>
@@ -463,7 +463,7 @@ export default function RepoIndexView(props: { onChat?: () => void }) {
                             <div class="repo-row">
                               <div
                                 class="repo-line"
-                                title="Open this repo's index"
+                                data-tip="Open this repo's index"
                                 onClick={() => setOpenRepo(r.full_name)}
                               >
                                 <span class={`chip ${ph.cls}`}>{ph.label}</span>
@@ -509,7 +509,7 @@ export default function RepoIndexView(props: { onChat?: () => void }) {
                                 <select
                                   class="kind-pick"
                                   classList={{ pinned: r.kind_pinned }}
-                                  title={
+                                  data-tip={
                                     r.kind_pinned
                                       ? "Tagged by you — the crawl will not overwrite it"
                                       : "Guessed from the name and topics; pick one to pin it"

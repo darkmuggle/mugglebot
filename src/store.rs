@@ -803,6 +803,24 @@ pub struct CommitSummaryRow {
     pub url: Option<String>,
 }
 
+/// A commit the index already holds, looked up because something pointed at it.
+///
+/// Carries the **commit message** rather than just the behavioural summary: when a reviewer
+/// says "this was fixed in a1b2c3d", the message — and for a merge, the PR title it carries —
+/// is the thing that says whether it was. The summary is the index's reading of the diff and
+/// rides along when it exists.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RegistryCommit {
+    pub full_name: String,
+    pub sha: String,
+    pub author: Option<String>,
+    pub committed_at: String,
+    pub message: String,
+    pub url: Option<String>,
+    /// The index's behavioural summary, when this commit has been summarized.
+    pub summary: Option<String>,
+}
+
 /// One component of a repo — a module root, which is the granularity an engineer acts
 /// on.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -3010,6 +3028,57 @@ impl Store {
         collect(rows)
     }
 
+    /// Look a commit up by sha, or by any unambiguous prefix of one.
+    ///
+    /// `repo` is a preference, not a filter: a reviewer writing "fixed in a1b2c3d" usually means
+    /// this repo, but the whole point of following the reference is that they might not — so a
+    /// sha that exists only in another indexed repo still resolves, and the caller is told which
+    /// repo it came from.
+    pub fn commit_by_sha(&self, repo: Option<&str>, sha_prefix: &str) -> Result<Option<RegistryCommit>> {
+        let prefix = sha_prefix.trim().to_ascii_lowercase();
+        // A one-character prefix would match most of the index. Seven is git's own default
+        // abbreviation and the shortest thing anyone actually writes down.
+        if prefix.len() < 7 || !prefix.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Ok(None);
+        }
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT c.full_name, c.sha, c.author, c.committed_at, c.message, c.url, s.summary \
+             FROM repo_commits c \
+             LEFT JOIN commit_summaries s ON s.full_name = c.full_name AND s.sha = c.sha \
+             WHERE c.sha LIKE ?1 || '%' \
+             ORDER BY (c.full_name = ?2) DESC, c.committed_at DESC LIMIT 1",
+        )?;
+        stmt.query_row(params![prefix, repo.unwrap_or_default()], row_to_registry_commit)
+            .optional()
+            .map_err(Into::into)
+    }
+
+    /// The commit a pull request landed as, if the index has walked past it.
+    ///
+    /// Both merge styles, and both are anchored so `#412` cannot match inside `#4120`: GitHub's
+    /// merge commits open `Merge pull request #N from …`, and squash merges end their subject
+    /// with `(#N)`. A PR that was never merged — or that landed before the history walk reached
+    /// back this far — simply isn't here, which is a different answer from "it didn't fix it".
+    ///
+    /// The repo is required rather than optional: `#42` means something different in every
+    /// repository, and searching the whole index for one would answer with a stranger's commit.
+    pub fn commit_for_pull(&self, repo: &str, number: u64) -> Result<Option<RegistryCommit>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT c.full_name, c.sha, c.author, c.committed_at, c.message, c.url, s.summary \
+             FROM repo_commits c \
+             LEFT JOIN commit_summaries s ON s.full_name = c.full_name AND s.sha = c.sha \
+             WHERE c.full_name = ?2 \
+               AND (c.message LIKE '%(#' || ?1 || ')%' \
+                    OR c.message LIKE 'Merge pull request #' || ?1 || ' from%') \
+             ORDER BY c.committed_at DESC LIMIT 1",
+        )?;
+        stmt.query_row(params![number.to_string(), repo], row_to_registry_commit)
+            .optional()
+            .map_err(Into::into)
+    }
+
     pub fn component_embeddings(&self) -> Result<Vec<(ComponentSummary, Vec<u8>)>> {
         let conn = self.lock();
         let mut stmt = conn.prepare(
@@ -3487,6 +3556,18 @@ fn row_to_component(row: &Row) -> rusqlite::Result<ComponentSummary> {
         symptoms: row.get(3)?,
         digest: row.get(4)?,
         indexed_sha: row.get(5)?,
+    })
+}
+
+fn row_to_registry_commit(row: &Row) -> rusqlite::Result<RegistryCommit> {
+    Ok(RegistryCommit {
+        full_name: row.get(0)?,
+        sha: row.get(1)?,
+        author: row.get(2)?,
+        committed_at: row.get(3)?,
+        message: row.get(4)?,
+        url: row.get(5)?,
+        summary: row.get(6)?,
     })
 }
 
@@ -5238,5 +5319,74 @@ mod tests {
             .unwrap()
             .expect("addressable by author");
         assert_eq!(one.markdown, "cloud read");
+    }
+
+    // ---- the registry lookups that follow a "fixed elsewhere" reference ----------
+
+    fn commit(repo: &str, sha: &str, message: &str) -> CommitEntry {
+        CommitEntry {
+            full_name: repo.into(),
+            sha: sha.into(),
+            author: Some("alice".into()),
+            committed_at: Utc::now(),
+            message: message.into(),
+            url: None,
+            files: vec!["src/pool.rs".into()],
+        }
+    }
+
+    #[test]
+    fn a_commit_resolves_from_an_abbreviated_sha() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .put_commits(&[commit(
+                "o/r",
+                "a1b2c3d4e5f6a7b8c9d0",
+                "Drain the pool on terminal errors",
+            )])
+            .unwrap();
+
+        let found = store
+            .commit_by_sha(Some("o/r"), "a1b2c3d")
+            .unwrap()
+            .expect("git's own abbreviation length must resolve");
+        assert_eq!(found.message, "Drain the pool on terminal errors");
+
+        // A reference into a repo we did not expect still resolves: the point of following it
+        // is that the fix may not be where you assumed.
+        assert!(store.commit_by_sha(Some("other/repo"), "a1b2c3d").unwrap().is_some());
+        // Too short to mean anything, and not a sha at all.
+        assert!(store.commit_by_sha(None, "a1b2").unwrap().is_none());
+        assert!(store.commit_by_sha(None, "zzzzzzz").unwrap().is_none());
+    }
+
+    /// Both merge styles, and neither may match a longer number: `#412` inside `#4120` would
+    /// hand the judge a stranger's commit as the fix.
+    #[test]
+    fn a_pull_request_resolves_to_the_commit_it_landed_as() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .put_commits(&[
+                commit("o/r", "aaaaaaa1", "Bound the pool (#412)"),
+                commit("o/r", "bbbbbbb2", "Merge pull request #500 from fork/branch\n\nFix retries"),
+                commit("o/r", "ccccccc3", "Unrelated (#4120)"),
+                commit("other/repo", "ddddddd4", "Something else (#412)"),
+            ])
+            .unwrap();
+
+        let squashed = store.commit_for_pull("o/r", 412).unwrap().expect("squash merge");
+        assert_eq!(squashed.sha, "aaaaaaa1");
+        let merged = store.commit_for_pull("o/r", 500).unwrap().expect("merge commit");
+        assert_eq!(merged.sha, "bbbbbbb2");
+        assert!(
+            store.commit_for_pull("o/r", 41).unwrap().is_none(),
+            "#41 must not match inside #412 or #4120"
+        );
+        assert_eq!(
+            store.commit_for_pull("other/repo", 412).unwrap().unwrap().sha,
+            "ddddddd4",
+            "#412 means a different commit in a different repo"
+        );
+        assert!(store.commit_for_pull("never/indexed", 412).unwrap().is_none());
     }
 }

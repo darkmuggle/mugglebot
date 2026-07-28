@@ -7,6 +7,7 @@ import MemoryEditor from "./components/Memory";
 import RepoIndexView from "./components/RepoIndex";
 import TagEditor from "./components/Tags";
 import SubjectDetail from "./components/SubjectDetail";
+import TooltipLayer from "./components/Tooltip";
 import { connect, connected, disconnect, health, hints, redAlert, signals, subjects } from "./state";
 
 type View = "board" | "memory" | "context" | "tags" | "index" | "chat" | "config";
@@ -97,7 +98,7 @@ export default function App() {
                 <div
                   class="source-row"
                   classList={{ active: sourceFilter() === src }}
-                  title={h()?.detail ?? ""}
+                  data-tip={h()?.detail ?? ""}
                   onClick={toggle}
                 >
                   <span
@@ -161,6 +162,10 @@ export default function App() {
           </Switch>
         </main>
       </div>
+
+      {/* One layer for every `data-tip` in the app, at the root so a tooltip is never
+          clipped by the panel that raised it. */}
+      <TooltipLayer />
     </div>
   );
 }

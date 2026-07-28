@@ -172,7 +172,7 @@ export default function Chat() {
                 onClick={() => openChat(c.id)}
               >
                 <span class="chat-list-title">{c.title}</span>
-                <button class="chat-del" title="Delete chat" onClick={(e) => removeChat(c.id, e)}>✕</button>
+                <button class="chat-del" data-tip="Delete chat" onClick={(e) => removeChat(c.id, e)}>✕</button>
               </div>
             )}
           </For>
@@ -240,7 +240,7 @@ export default function Chat() {
             </select>
           </div>
           <Show when={tags()?.length}>
-            <div class="tag-bar" title="Attach tags to ground the chat in matching memory & context">
+            <div class="tag-bar" data-tip="Attach tags to ground the chat in matching memory & context">
               <span class="tag-bar-label">CONTEXT</span>
               <For each={tags()}>
                 {(tag) => (
@@ -248,7 +248,7 @@ export default function Chat() {
                     type="button"
                     class="chip tag tag-toggle"
                     classList={{ on: selectedTags().includes(tag.name) }}
-                    title={tag.summary}
+                    data-tip={tag.summary}
                     onClick={() => toggleTag(tag.name)}
                   >
                     {tag.name}

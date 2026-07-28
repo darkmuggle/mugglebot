@@ -13,13 +13,24 @@ import type { DiffFile, PrDiffReport } from "../types";
 /// issue. What is *not* cheap is reading a diff GitHub hasn't been asked for yet: that is an API
 /// call plus a local model pass, so a PR with nothing stored still shows a button. The
 /// distinction is the whole reason `stored_only` exists.
-export default function DiffPane(props: { subjectKey: string }) {
+export default function DiffPane(props: {
+  subjectKey: string;
+  /// Show the patches without being asked.
+  ///
+  /// The click-in view sets this for an outstanding or merged PR: that diff is the meat of
+  /// the fix, and a disclosure triangle over it hides the answer the view exists to give.
+  /// The board leaves it off — a card is a list row, and sixty unfurled patches in one is a
+  /// wall.
+  expand?: boolean;
+}) {
   const [report, setReport] = createSignal<PrDiffReport | null>(null);
   const [busy, setBusy] = createSignal(false);
   const [error, setError] = createSignal("");
-  /// Which files are expanded. Collapsed by default — sixty patches unfurled is a wall, and the
-  /// summary plus the per-file counts is usually the whole answer.
-  const [open, setOpen] = createSignal<Record<string, boolean>>({});
+  /// Per-file overrides of the default expansion. Absent means "whatever `expand` says", so a
+  /// click always wins over the default in either direction — the reader can fold a noisy file
+  /// away in the click-in view, and open one on a board card.
+  const [open, setOpen] = createSignal<Record<string, boolean | undefined>>({});
+  const isOpen = (key: string) => open()[key] ?? !!props.expand;
   /// Which diff blocks are collapsed, by `repo#number`.
   ///
   /// Per block rather than one flag for the pane, because an issue with several attempts renders
@@ -56,7 +67,7 @@ export default function DiffPane(props: { subjectKey: string }) {
   };
 
   const toggle = (key: string) =>
-    setOpen((prev) => ({ ...prev, [key]: !prev[key] }));
+    setOpen((prev) => ({ ...prev, [key]: !(prev[key] ?? !!props.expand) }));
 
   const toggleBlock = (key: string) =>
     setShut((prev) => ({ ...prev, [key]: !prev[key] }));
@@ -92,7 +103,7 @@ export default function DiffPane(props: { subjectKey: string }) {
                     <Show when={d.truncated}>
                       <span
                         class="chip chip-stale"
-                        title="more files than were fetched"
+                        data-tip="more files than were fetched"
                       >
                         TRUNCATED
                       </span>
@@ -100,7 +111,7 @@ export default function DiffPane(props: { subjectKey: string }) {
                     {/* When it was read, because a stored diff is only as fresh as the last
                         activity on the PR — and a force-push notifies nobody. */}
                     <Show when={d.fetched_at}>
-                      <span class="muted" title={d.fetched_at}>
+                      <span class="muted" data-tip={d.fetched_at}>
                         read {age(d.fetched_at!)}
                       </span>
                     </Show>
@@ -136,7 +147,7 @@ export default function DiffPane(props: { subjectKey: string }) {
                                 fallback={
                                   <span
                                     class="muted"
-                                    title="binary, or no textual hunk"
+                                    data-tip="binary, or no textual hunk"
                                   >
                                     —
                                   </span>
@@ -144,17 +155,17 @@ export default function DiffPane(props: { subjectKey: string }) {
                               >
                                 <span
                                   class="muted"
-                                  title="the patch was not kept, to bound what one PR costs in state — open it on GitHub"
+                                  data-tip="the patch was not kept, to bound what one PR costs in state — open it on GitHub"
                                 >
                                   not stored
                                 </span>
                               </Show>
                             }
                           >
-                            <span class="muted">{open()[key] ? "▾" : "▸"}</span>
+                            <span class="muted">{isOpen(key) ? "▾" : "▸"}</span>
                           </Show>
                         </div>
-                        <Show when={open()[key] && f.patch}>
+                        <Show when={isOpen(key) && f.patch}>
                           <Patch patch={f.patch!} />
                         </Show>
                       </div>
@@ -176,7 +187,7 @@ export default function DiffPane(props: { subjectKey: string }) {
             <button
               class="explain-btn"
               disabled={busy()}
-              title="read the diff again from GitHub"
+              data-tip="read the diff again from GitHub"
               onClick={() => load({ refresh: true })}
             >
               {busy() ? "READING DIFF…" : "RE-READ"}
