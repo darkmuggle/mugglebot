@@ -1,4 +1,14 @@
-import { createMemo, createSignal, For, Match, onCleanup, onMount, Show, Switch } from "solid-js";
+import {
+  createEffect,
+  createMemo,
+  createSignal,
+  For,
+  Match,
+  onCleanup,
+  onMount,
+  Show,
+  Switch,
+} from "solid-js";
 import Board from "./components/Board";
 import Chat from "./components/Chat";
 import ConfigPage from "./components/Config";
@@ -14,15 +24,66 @@ type View = "board" | "memory" | "context" | "tags" | "index" | "chat" | "config
 
 const SOURCES = ["github", "slack", "granola"] as const;
 
+const VIEWS: View[] = [
+  "board",
+  "memory",
+  "context",
+  "tags",
+  "index",
+  "chat",
+  "config",
+];
+
+/// Where you are, as a URL: `#/board`, `#/chat`, `#/t/restatedev/nuon-byoc!140`.
+///
+/// This used to live only in component signals, which meant a refresh dropped you
+/// back on the board, the browser's Back button did nothing, and a thread could not
+/// be linked to from Slack or a ticket — for a tool whose whole job is pointing at
+/// one piece of work, that last one is the real cost. A subject key can contain `/`
+/// and `#`, so it is encoded rather than interpolated.
+function parseHash(): { view: View; selected: string | null } {
+  const raw = location.hash.replace(/^#\/?/, "");
+  if (raw.startsWith("t/")) {
+    return { view: "board", selected: decodeURIComponent(raw.slice(2)) };
+  }
+  const view = VIEWS.find((v) => v === raw);
+  return { view: view ?? "board", selected: null };
+}
+
+function toHash(view: View, selected: string | null): string {
+  // The open thread is a *board* location. Keying the hash off `selected` alone left
+  // the URL pointing at a thread after navigating to Chat, so a refresh went back to
+  // the thread rather than to where the operator actually was.
+  return view === "board" && selected
+    ? `#/t/${encodeURIComponent(selected)}`
+    : `#/${view}`;
+}
+
 export default function App() {
-  const [view, setView] = createSignal<View>("board");
-  const [selected, setSelected] = createSignal<string | null>(null);
+  const initial = parseHash();
+  const [view, setView] = createSignal<View>(initial.view);
+  const [selected, setSelected] = createSignal<string | null>(initial.selected);
   // Active board filter: show only subjects carrying a signal from this source.
   // null = no filter (show all). Toggled from the SOURCES rail.
   const [sourceFilter, setSourceFilter] = createSignal<string | null>(null);
 
   onMount(connect);
   onCleanup(disconnect);
+
+  // Push the location whenever it changes, and follow it when the user navigates
+  // (Back/Forward, or a pasted link). Writing the same hash we just read is a no-op,
+  // so the two directions don't fight.
+  createEffect(() => {
+    const next = toHash(view(), selected());
+    if (location.hash !== next) location.hash = next;
+  });
+  const onHash = () => {
+    const { view: v, selected: s } = parseHash();
+    setView(v);
+    setSelected(s);
+  };
+  onMount(() => window.addEventListener("hashchange", onHash));
+  onCleanup(() => window.removeEventListener("hashchange", onHash));
 
   const openThread = (id: string) => {
     setSelected(id);
@@ -39,26 +100,32 @@ export default function App() {
   // `sep: true` draws a divider above the item, splitting the interactive views
   // (board, chat) from the reference/knowledge views (memory, context, tags, …).
   const nav: { id: View; label: string; sep?: boolean }[] = [
-    { id: "board", label: "BOARD" },
-    { id: "chat", label: "CHAT" },
-    { id: "memory", label: "MEMORY", sep: true },
-    { id: "context", label: "CONTEXT" },
-    { id: "tags", label: "TAGS" },
-    { id: "index", label: "CODE INDEX" },
-    { id: "config", label: "CONFIG" },
+    { id: "board", label: "Board" },
+    { id: "chat", label: "Chat" },
+    { id: "memory", label: "Memory", sep: true },
+    { id: "context", label: "Context" },
+    { id: "tags", label: "Tags" },
+    { id: "index", label: "Code index" },
+    { id: "config", label: "Config" },
   ];
 
   return (
     <div class="lcars" classList={{ "red-alert": redAlert() !== null }}>
+      {/* One LCARS gesture (the elbow), the wordmark, and the link state as a dot.
+          The band used to also carry a full-width gradient panel that displayed
+          nothing, and spell the connection out as LINK ESTABLISHED — 56px of the
+          most valuable strip on the screen, spent on set-dressing. */}
       <header class="lcars-top">
         <div class="elbow" />
         <div class="title">MUGGLEBOT</div>
         <Show when={redAlert()} fallback={<div class="bar" />}>
-          <div class="bar alert-bar">RED ALERT · {redAlert()!.message}</div>
+          <div class="bar alert-bar">Red alert · {redAlert()!.message}</div>
         </Show>
-        <div class="status" classList={{ online: connected() }}>
-          {connected() ? "LINK ESTABLISHED" : "RECONNECTING…"}
-        </div>
+        <div
+          class="status"
+          classList={{ online: connected() }}
+          data-tip={connected() ? "Link established" : "Reconnecting…"}
+        />
       </header>
 
       <div class="lcars-body">
@@ -83,7 +150,7 @@ export default function App() {
             )}
           </For>
 
-          <div class="rail-sep">SOURCES</div>
+          <div class="rail-sep">Sources</div>
           <For each={SOURCES}>
             {(src) => {
               const h = () => healthFor(src);
@@ -112,9 +179,11 @@ export default function App() {
           </For>
 
           <div class="rail-spacer" />
-          <div class="count">{Object.keys(subjects).length}</div>
-          <div class="count-label">THREADS</div>
+          {/* Totals, small. The count that gets acted on ("2 to decide") is in the
+              board header, beside the rows it counts. */}
           <div class="subcount">
+            {Object.keys(subjects).length} threads
+            <br />
             {Object.keys(signals).length} signals · {hints().length} hints
           </div>
         </nav>

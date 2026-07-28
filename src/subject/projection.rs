@@ -74,8 +74,16 @@ impl Board {
         // count judged PRs and attribute their cost, and the board renders every subject
         // on every push.
         let attention = self.attention(&subject, &signals, severity, &pull_requests)?;
+        // Only a *reasoned* summary can produce a headline. `deterministic_summary` is a
+        // preview of the newest event body — fine as a placeholder in the detail view,
+        // but presenting a chat message's first sentence as "what this needs from you"
+        // would be a claim the board hasn't earned.
+        let headline = subject
+            .last_reasoned_at
+            .and_then(|_| super::headline_from(subject.summary.as_deref()));
         Ok(Some(SubjectView {
             subject,
+            headline,
             signals,
             keys,
             severity,
@@ -135,8 +143,11 @@ impl Board {
         let key = subject.key.as_str();
         let mut decorated = Decorations {
             // `last_reasoned_at` distinguishes a real grounded summary from the
-            // deterministic one-liner every subject gets for free.
-            summary: subject.last_reasoned_at.is_some(),
+            // deterministic one-liner every subject gets for free — but a pass that
+            // stored the prompt back at us set that timestamp too, so the text has to
+            // agree that it's a summary before the facet claims one exists.
+            summary: subject.last_reasoned_at.is_some()
+                && super::is_usable_summary(subject.summary.as_deref().unwrap_or_default()),
             tags: !subject.tags.is_empty(),
             dashboard: self
                 .store

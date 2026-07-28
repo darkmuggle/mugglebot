@@ -185,7 +185,7 @@ export default function DiffPane(props: {
                   <div
                     class={`review-rationale rec-border-${d.review!.recommendation}`}
                   >
-                    <span class="rc-label">REVIEW</span>
+                    <span class="rc-label">Review</span>
                     <span>{d.review!.rationale}</span>
                   </div>
                 </Show>
@@ -266,7 +266,7 @@ export default function DiffPane(props: {
                   data-tip="read the diff again from GitHub"
                   onClick={() => load({ refresh: true })}
                 >
-                  {busy() ? "READING DIFF…" : "RE-READ"}
+                  {busy() ? "Reading diff…" : "Re-read"}
                 </button>
               }
             >
@@ -276,7 +276,7 @@ export default function DiffPane(props: {
                 data-tip="review the stored diff — runs in the background, no GitHub call"
                 onClick={() => load({})}
               >
-                {busy() ? "REVIEWING…" : "REVIEW"}
+                {busy() ? "Reviewing…" : "REVIEW"}
               </button>
               {/* Said while the poll is waiting, so the pane does not look finished-and-empty
                   for the minute or two a review takes. */}
@@ -289,7 +289,7 @@ export default function DiffPane(props: {
             disabled={busy()}
             onClick={() => load({})}
           >
-            {busy() ? "READING DIFF…" : "DIFF"}
+            {busy() ? "Reading diff…" : "DIFF"}
           </button>
         </Show>
         <Show when={error()}>

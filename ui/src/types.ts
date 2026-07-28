@@ -94,6 +94,10 @@ export interface SubjectView {
   rank: SubjectRank;
   title: string;
   summary: string | null;
+  /// The one line a board row shows: `summary` reduced to a single plain-text
+  /// sentence by the backend, or null when there is no usable summary yet. Derived
+  /// on read, so it can never disagree with `summary`.
+  headline: string | null;
   created_at: string;
   updated_at: string;
   last_reasoned_at: string | null;

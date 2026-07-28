@@ -281,7 +281,7 @@ export default function Chat() {
                 }
               }}
             />
-            <button disabled={busy()} onClick={send}>SEND</button>
+            <button disabled={busy()} onClick={send}>Send</button>
           </div>
         </div>
       </div>

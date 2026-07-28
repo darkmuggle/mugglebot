@@ -363,27 +363,7 @@ async fn write_with(
     g: GatheredContext,
 ) -> anyhow::Result<serde_json::Value> {
     let sources = g.sources();
-    // The structure is built from what the dossier actually holds. Naming every
-    // possible section up front reliably produced all of them — including an
-    // "Attempts" section on a dossier with no attempts in it.
-    let mut sections = vec!["**Bottom line** — one line".to_string()];
-    if !g.events.is_empty() {
-        sections.push("**What happened** — from the events, citing [sig:ID]".into());
-    }
-    if g.root_cause.is_some() {
-        sections.push("**Why** — the proposed causes, as hypotheses, citing [cause:REF]".into());
-    }
-    if !g.pull_requests.is_empty() {
-        sections.push(
-            "**The attempts** — one short block per pull request: what it does, whether it \
-             fixes this, and what reviewers said (or that nobody has reviewed it)"
-                .into(),
-        );
-    }
-    if g.triage.is_some() {
-        sections.push("**Options** — the proposed approaches, with their risk".into());
-    }
-    sections.push("**What to do next** — one or two concrete moves".into());
+    let sections = sections_for(subject_key, &g);
     let system = format!(
         "You are explaining one piece of engineering work to the engineer who owns it, from a \
          dossier that has already been assembled for you. Write Markdown, no preamble.\n\
@@ -644,6 +624,41 @@ fn split_sentences(line: &str) -> Vec<String> {
 }
 
 /// Remove a `**Heading**` block whose subject matter isn't in the dossier at all.
+/// Is this subject itself a pull request?
+///
+/// On a PR page the diff and its review lead the page under "The change", so anything
+/// that narrates the same PR a second time is a duplicate rather than context.
+fn subject_is_pr(subject_key: &str) -> bool {
+    crate::subject::SubjectKey::parse(subject_key)
+        .is_ok_and(|k| k.rank() == crate::subject::SubjectRank::PullRequest)
+}
+
+/// The sections to ask for, built from what the dossier actually holds.
+///
+/// Naming every possible section up front reliably produced all of them — including an
+/// "Attempts" section on a dossier with no attempts in it.
+fn sections_for(subject_key: &str, g: &GatheredContext) -> Vec<String> {
+    let mut sections = vec!["**Bottom line** — one line".to_string()];
+    if !g.events.is_empty() {
+        sections.push("**What happened** — from the events, citing [sig:ID]".into());
+    }
+    if g.root_cause.is_some() {
+        sections.push("**Why** — the proposed causes, as hypotheses, citing [cause:REF]".into());
+    }
+    if !g.pull_requests.is_empty() && !subject_is_pr(subject_key) {
+        sections.push(
+            "**The attempts** — one short block per pull request: what it does, whether it \
+             fixes this, and what reviewers said (or that nobody has reviewed it)"
+                .into(),
+        );
+    }
+    if g.triage.is_some() {
+        sections.push("**Options** — the proposed approaches, with their risk".into());
+    }
+    sections.push("**What to do next** — one or two concrete moves".into());
+    sections
+}
+
 fn drop_unsupported_sections(markdown: &str, g: &GatheredContext) -> (String, Vec<String>) {
     // Only headings whose material is *absent* are candidates. Anything not listed here is
     // left alone — the check is for invented sections, not a style rule.
@@ -1127,6 +1142,25 @@ mod tests {
         let (out, notes) = verify(text, &ctx());
         assert_eq!(out, text);
         assert!(notes.is_empty(), "{notes:?}");
+    }
+
+    #[test]
+    fn a_pr_is_not_asked_to_narrate_itself_as_an_attempt() {
+        // On a PR page the diff and its review lead the page, so "The attempts" would be
+        // the third telling of the same change.
+        let g = ctx();
+        assert!(!g.pull_requests.is_empty(), "fixture must have attempts");
+        let pr = sections_for("restatedev/nuon-byoc!140", &g);
+        assert!(
+            !pr.iter().any(|s| s.contains("The attempts")),
+            "{pr:#?}"
+        );
+        // On the issue those PRs attempt, it is exactly what the reader wants.
+        let issue = sections_for("restatedev/nuon-byoc#1200", &g);
+        assert!(
+            issue.iter().any(|s| s.contains("The attempts")),
+            "{issue:#?}"
+        );
     }
 
     #[test]

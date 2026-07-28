@@ -84,7 +84,7 @@ export default function ConfigPage() {
           <div class="row">
             <input placeholder="account (e.g. github)" value={account()} onInput={(e) => setAccount(e.currentTarget.value)} />
             <input class="grow" type="password" placeholder="secret / token" value={secret()} onInput={(e) => setSecret(e.currentTarget.value)} />
-            <button onClick={saveCred}>STORE</button>
+            <button onClick={saveCred}>Store</button>
           </div>
           <Show when={credMsg()}>
             <div class="muted">{credMsg()}</div>
@@ -97,10 +97,10 @@ export default function ConfigPage() {
           <h3>CONFIGURATION (config.toml)</h3>
           <span class="tl-actions">
             <button disabled={saving() || !dirty()} onClick={save}>
-              {saving() ? "SAVING…" : dirty() ? "SAVE" : "SAVED"}
+              {saving() ? "Saving…" : dirty() ? "SAVE" : "Saved"}
             </button>
             <Show when={dirty()}>
-              <button onClick={() => setDraft(null)}>REVERT</button>
+              <button onClick={() => setDraft(null)}>Revert</button>
             </Show>
           </span>
         </div>

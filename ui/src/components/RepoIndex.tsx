@@ -284,7 +284,7 @@ export default function RepoIndexView(props: { onChat?: () => void }) {
       >
         <section class="panel repo-index">
           <div class="panel-head">
-            <h3>CODE INDEX</h3>
+            <h3>Code index</h3>
             {/* Whether the numbers are arriving by push. Worth showing, because a stalled index
                 and a dropped WebSocket look identical on a panel of static numbers. */}
             <span
@@ -309,10 +309,10 @@ export default function RepoIndexView(props: { onChat?: () => void }) {
                 <option value="codex">codex</option>
               </select>
               <button disabled={busy() !== ""} onClick={refresh}>
-                {busy() === "refresh" ? "REFRESHING…" : "REFRESH CARDS"}
+                {busy() === "refresh" ? "Refreshing…" : "Refresh cards"}
               </button>
               <button onClick={() => setShowAll(!showAll())}>
-                {showAll() ? "HIDE UNTOUCHED" : "SHOW ALL"}
+                {showAll() ? "Hide untouched" : "Show all"}
               </button>
             </div>
           </div>

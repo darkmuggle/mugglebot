@@ -74,7 +74,7 @@ export default function Attempt(props: {
       </div>
       <Show when={pr().implementation}>
         <div class="attempt-row">
-          <span class="attempt-key">IMPLEMENTS</span>
+          <span class="attempt-key">Implements</span>
           <span>{pr().implementation}</span>
         </div>
       </Show>
@@ -86,13 +86,13 @@ export default function Attempt(props: {
       />
       <Show when={pr().critique}>
         <div class="attempt-row">
-          <span class="attempt-key">CRITIQUE</span>
+          <span class="attempt-key">Critique</span>
           <span>{pr().critique}</span>
         </div>
       </Show>
       <Show when={pr().conversation}>
         <div class="attempt-row attempt-conversation">
-          <span class="attempt-key">REVIEWERS</span>
+          <span class="attempt-key">Reviewers</span>
           <span>{pr().conversation}</span>
         </div>
       </Show>

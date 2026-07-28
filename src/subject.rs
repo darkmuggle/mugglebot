@@ -280,6 +280,12 @@ impl Subject {
 pub struct SubjectView {
     #[serde(flatten)]
     pub subject: Subject,
+    /// The one line the board row shows: `summary` reduced to a single plain-text
+    /// sentence (see [`headline_from`]), or `None` when there is no usable summary
+    /// yet — which the row says out loud rather than filling with truncated markdown.
+    ///
+    /// Derived on read, not stored: it must not be able to disagree with `summary`.
+    pub headline: Option<String>,
     pub signals: Vec<Signal>,
     /// Resolution keys and context drawn from the members, for display.
     pub keys: Vec<ResolutionKey>,
@@ -394,6 +400,195 @@ pub fn title_from(s: &Signal) -> String {
     }
 }
 
+/// How long a board row's headline is allowed to be before it is cut. Sized to the
+/// row, not to the model: past roughly this the line wraps and the row stops being
+/// one line tall, which is the entire point of it.
+const HEADLINE_MAX: usize = 160;
+
+/// Fragments of the summariser's own instructions. A summary containing one of
+/// these is the model reciting the brief instead of doing it.
+const PROMPT_ECHOES: &[&str] = &[
+    "(blast radius)",
+    "(current outcome",
+    "(what to do now",
+    "labeled sections",
+    "at most 120 characters",
+];
+
+/// Is this summary content, or a failed pass wearing content's clothes?
+///
+/// Two failures show up in practice and both are worse than no summary at all,
+/// because storing either one also sets `last_reasoned_at` and so convinces the
+/// board it has a real summary and nothing retries:
+///
+/// 1. **Prompt echo** — the model repeats the section brief back, so the board
+///    shows the operator `**Impact:** (blast radius)`.
+/// 2. **Evidence dump** — the model pastes the `[sig:ID] source · kind · time:` lines
+///    it was given. Legitimate summaries *do* cite `[sig:ID]` inline, so the tell is
+///    not the citation but the signal-line shape following it.
+pub fn is_usable_summary(summary: &str) -> bool {
+    let text = summary.trim();
+    if text.is_empty() {
+        return false;
+    }
+    let lower = text.to_ascii_lowercase();
+    if PROMPT_ECHOES.iter().any(|e| lower.contains(e)) {
+        return false;
+    }
+    // Count lines that look like a pasted evidence line rather than prose: a signal
+    // citation followed by the ` · `-separated header `signal_line` emits.
+    let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+    let dumped = lines
+        .iter()
+        .filter(|l| l.contains("[sig:") && l.matches(" · ").count() >= 2)
+        .count();
+    // One such line in a long summary is a heavily-cited sentence; half of them is a
+    // transcript.
+    dumped * 2 < lines.len().max(1)
+}
+
+/// The one line the board shows for a subject.
+///
+/// Prefers the `**Headline:**` the summariser is asked to open with; falls back to
+/// the first sentence of `**Status:**`, then to the first sentence of anything. The
+/// result is plain text: citations, markdown emphasis and links are stripped,
+/// because a row is not a place to render them.
+pub fn headline_from(summary: Option<&str>) -> Option<String> {
+    let text = summary.map(str::trim).filter(|s| !s.is_empty())?;
+    if !is_usable_summary(text) {
+        return None;
+    }
+    let candidate = labelled_section(text, "headline")
+        .or_else(|| labelled_section(text, "status"))
+        .unwrap_or_else(|| text.to_string());
+    let flat = strip_for_row(&candidate);
+    let sentence = first_sentence(&flat);
+    let out = truncate_on_word(sentence, HEADLINE_MAX);
+    (!out.is_empty()).then_some(out)
+}
+
+/// The body of a `**Label:**` section, up to the next blank line or next label.
+fn labelled_section(text: &str, label: &str) -> Option<String> {
+    let needle = format!("{label}:");
+    let mut out = String::new();
+    let mut found = false;
+    for line in text.lines() {
+        let bare = line.trim().trim_start_matches(['*', '#', '-', ' ']);
+        let lower = bare.to_ascii_lowercase();
+        if found {
+            // A blank line or the next label ends the section.
+            if line.trim().is_empty() || is_label_line(bare) {
+                break;
+            }
+            out.push(' ');
+            out.push_str(line.trim());
+            continue;
+        }
+        if lower.starts_with(&needle) {
+            found = true;
+            out.push_str(bare[needle.len()..].trim_start_matches(['*', ' ']).trim());
+        }
+    }
+    found.then(|| out.trim().to_string()).filter(|s| !s.is_empty())
+}
+
+/// Does this line open one of the summariser's labelled sections?
+fn is_label_line(bare: &str) -> bool {
+    let lower = bare.to_ascii_lowercase();
+    ["headline:", "status:", "impact:", "next:", "next steps:"]
+        .iter()
+        .any(|l| lower.starts_with(l))
+}
+
+/// Reduce summary markdown to plain single-line text fit for a table row.
+fn strip_for_row(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            // Drop `[sig:…]`, `[mem:…]`, `[cause:REF]` citations wholesale, but keep
+            // the text of a real markdown link `[text](url)`.
+            '[' => {
+                let mut inner = String::new();
+                while let Some(&n) = chars.peek() {
+                    chars.next();
+                    if n == ']' {
+                        break;
+                    }
+                    inner.push(n);
+                }
+                let is_citation = ["sig:", "mem:", "ctx:", "cause:", "browser:"]
+                    .iter()
+                    .any(|p| inner.starts_with(p));
+                if !is_citation {
+                    out.push_str(&inner);
+                }
+                // Swallow a following `(…)` target either way.
+                if chars.peek() == Some(&'(') {
+                    for n in chars.by_ref() {
+                        if n == ')' {
+                            break;
+                        }
+                    }
+                }
+            }
+            // Emphasis and code markers only. `_` and `#` are deliberately absent: both
+            // are rarer as markup here than inside the things these summaries quote, and
+            // stripping them turned `review_requested` into `reviewrequested` and `#25`
+            // into `25`. Leading `#` heading markers are handled by `labelled_section`,
+            // which trims them off the line.
+            '*' | '`' => {}
+            '\n' | '\r' | '\t' => out.push(' '),
+            _ => out.push(c),
+        }
+    }
+    let flat = out.split_whitespace().collect::<Vec<_>>().join(" ");
+    // Removing an inline `[sig:…]` leaves the space that preceded it stranded in front
+    // of the sentence's own punctuation — "the last blocker ." — so close those up.
+    let mut tidy = String::with_capacity(flat.len());
+    let mut chars = flat.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == ' '
+            && chars
+                .peek()
+                .is_some_and(|n| matches!(n, '.' | ',' | ';' | ':' | '!' | '?' | ')'))
+        {
+            continue;
+        }
+        tidy.push(c);
+    }
+    tidy
+}
+
+/// The first sentence, or the whole thing if it has no terminator. Abbreviations
+/// aren't worth handling here — the result is a row preview, not a citation.
+fn first_sentence(text: &str) -> &str {
+    let bytes = text.as_bytes();
+    for (i, c) in text.char_indices() {
+        if matches!(c, '.' | '!' | '?')
+            // Not a decimal point or a version number.
+            && bytes.get(i + 1).is_none_or(|n| n.is_ascii_whitespace())
+        {
+            return text[..=i].trim_end();
+        }
+    }
+    text
+}
+
+/// Cut at a word boundary and mark the cut, so a row never ends mid-word.
+fn truncate_on_word(text: &str, max: usize) -> String {
+    let text = text.trim();
+    if text.chars().count() <= max {
+        return text.to_string();
+    }
+    let cut: String = text.chars().take(max).collect();
+    let stem = match cut.rfind(' ') {
+        Some(i) if i > max / 2 => &cut[..i],
+        _ => cut.as_str(),
+    };
+    format!("{}…", stem.trim_end_matches([',', ';', ':', ' ']))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -445,6 +640,90 @@ mod tests {
         let slack = SubjectKey::slack_thread("C02ABC/1721822400.001");
         assert_eq!(slack.repo(), None);
         assert_eq!(slack.number(), None);
+    }
+
+    /// The real summary stored for restate-cloud#1179: the model recited the section
+    /// brief instead of writing the sections, and the board rendered it.
+    const PROMPT_ECHO: &str = "**Status:** (current outcome, including whether a later \
+         success cleared a failure), \r\n**Impact:** (blast radius), and \r\n**Next:** (what \
+         to do now, or explicitly say no action is needed). Cite the evidence";
+
+    /// The real summary stored for gcp-gke-sandbox#25: the evidence block, pasted.
+    const EVIDENCE_DUMP: &str = "**Status:** [sig:github/24809234539@2026-07-28T11:17:58Z] \
+         github · review_requested · 2026-07-28T11:17:58+00:00: linkerd multi replica — \
+         restatedev/gcp-gke-sandbox · review_requested · open · @lukebond\n\n\
+         [sig:github/assigned/restatedev/gcp-gke-sandbox#25] github · assigned · \
+         2026-07-28T11:35:16+00:00: PR: linkerd multi replica — stacked on #24.\n";
+
+    #[test]
+    fn a_recited_prompt_is_not_a_summary() {
+        assert!(!is_usable_summary(PROMPT_ECHO));
+        assert_eq!(headline_from(Some(PROMPT_ECHO)), None);
+    }
+
+    #[test]
+    fn a_pasted_evidence_block_is_not_a_summary() {
+        assert!(!is_usable_summary(EVIDENCE_DUMP));
+        assert_eq!(headline_from(Some(EVIDENCE_DUMP)), None);
+    }
+
+    #[test]
+    fn a_cited_sentence_is_still_a_summary() {
+        // The guard must not reject legitimate citation, which is the house style.
+        let good = "**Status:** The tunnel conflict is the last blocker [sig:github/9].\n\n\
+                    **Impact:** Human UI access only.\n\n**Next:** Resolve it, then merge.";
+        assert!(is_usable_summary(good));
+        assert_eq!(
+            headline_from(Some(good)).as_deref(),
+            Some("The tunnel conflict is the last blocker."),
+        );
+    }
+
+    #[test]
+    fn the_headline_section_wins_when_present() {
+        let s = "**Headline:** Approved by pcholakov, pending one cleanup.\n\n\
+                 **Status:** The PR bumps the ingress image to PR1200.\n\n**Next:** Merge.";
+        assert_eq!(
+            headline_from(Some(s)).as_deref(),
+            Some("Approved by pcholakov, pending one cleanup."),
+        );
+    }
+
+    #[test]
+    fn a_headline_is_one_plain_line() {
+        let s = "**Headline:** The `restate-cloud` bump to \
+                 [PR1200](https://github.com/restatedev/restate-cloud/pull/1200) is\nready \
+                 [sig:github/1]. Second sentence is dropped.";
+        assert_eq!(
+            headline_from(Some(s)).as_deref(),
+            Some("The restate-cloud bump to PR1200 is ready."),
+        );
+    }
+
+    #[test]
+    fn an_identifier_survives_emphasis_stripping() {
+        // Live regression: `_` was treated as emphasis, so a summary quoting a signal
+        // kind rendered "the reviewrequested signal" on the board.
+        let s = "**Headline:** The review_requested signal names PR #25.";
+        assert_eq!(
+            headline_from(Some(s)).as_deref(),
+            Some("The review_requested signal names PR #25."),
+        );
+    }
+
+    #[test]
+    fn a_long_headline_is_cut_on_a_word() {
+        let long = format!("**Headline:** {}", "alpha ".repeat(60));
+        let got = headline_from(Some(&long)).expect("headline");
+        assert!(got.chars().count() <= HEADLINE_MAX + 1, "{got:?}");
+        assert!(got.ends_with('…'), "{got:?}");
+        assert!(!got.contains("alph…"), "cut mid-word: {got:?}");
+    }
+
+    #[test]
+    fn no_summary_means_no_headline() {
+        assert_eq!(headline_from(None), None);
+        assert_eq!(headline_from(Some("   ")), None);
     }
 
     #[test]

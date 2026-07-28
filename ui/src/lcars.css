@@ -1,35 +1,56 @@
-/* LCARS styling — USS Titan-A (Picard S3). A cool, refined take on LCARS: a deep
-   blue-black bridge, azure primary panels with a soft teal glow, muted gold and
-   soft periwinkle accents, red reserved for alerts. Lots of negative space, thin
-   hairlines, pill-shaped controls. Variable names are generic so the component
-   styles stay palette-agnostic. */
+/* LCARS styling — USS Titan-A (Picard S3), as chrome rather than as content.
+   A cool blue-black bridge, azure accent, thin hairlines. The LCARS grammar
+   (elbows, pill plaques, tracked uppercase) is kept for the frame and kept *out*
+   of the working surfaces, because the board is read, not admired.
+
+   Two rules hold this file together:
+
+   1. **One meaning per hue.** Azure is interactive and identity; amber is warning;
+      red is critical and alert; green is healthy. Amber previously also meant
+      "tag", "cloud model" and "stale" at once, which made none of them legible.
+   2. **One type scale.** Six sizes, all px. There were 35 distinct `font-size`
+      values here in a mix of px and rem, which is not a scale — it's a spread. */
 
 :root {
-  --bg: #050811; /* deep cool near-black */
-  --surface: #0e1826; /* raised panels & cards */
-  --surface-2: #0a1220; /* inset: inputs, code, wells */
-  --line: #1d2c40; /* hairline borders */
-  --line-strong: #2b3f59;
+  --bg: #0b1016; /* deep cool near-black */
+  --surface: #141c25; /* raised panels, row hover */
+  --surface-2: #0e1620; /* inset: inputs, code, wells */
+  --line: #23303d; /* hairline borders and row rules */
+  --line-strong: #33455a;
 
-  --panel: #4d86c6; /* Titan azure — primary panels / elbow / pills */
-  --amber: #d9a94e; /* muted gold */
-  --lilac: #9585cf; /* soft periwinkle — identity / title */
-  --blue: #57b7e0; /* bright teal-azure — accent, online, links */
+  --panel: #4d86c6; /* Titan azure — elbow / active nav */
+  --amber: #e0913c; /* warning, and only warning */
+  --lilac: #9585cf; /* soft periwinkle — identity / live */
+  --blue: #5aa9e6; /* the one accent: links, focus, active */
   --ink: #05080f; /* near-black text on bright panels */
-  --text: #d8e6f5; /* cool pale */
-  --dim: #7d90ab; /* secondary text */
+  --text: #dde5ec; /* cool pale */
+  --dim: #8195a8; /* secondary text — carries most of the board */
+  --faint: #62748a; /* tertiary: refs, timestamps */
   --slate: #35485f; /* muted structural */
 
-  --sev-info: #57b7e0;
-  --sev-notice: #d9a94e;
-  --sev-warning: #e08a46;
-  --sev-critical: #e05a52;
-  --ok: #56c98d;
+  --sev-info: #5aa9e6;
+  --sev-notice: #8195a8; /* the common case is not a warning: keep it neutral */
+  --sev-warning: #e0913c;
+  --sev-critical: #e0574f;
+  --ok: #5ec98d;
+
+  /* Type scale. Every size in the app is one of these six. */
+  --t-micro: 11px; /* kind, timestamps, chips */
+  --t-meta: 12px; /* actor, counts, section labels */
+  --t-body: 14px; /* row titles, headlines, prose */
+  --t-title: 16px; /* subject title in the detail view */
+  --t-head: 20px; /* panel headings */
+  --t-display: 28px; /* the wordmark */
+
+  /* Comfortable measure for anything that is prose. Summary paragraphs used to set
+     1325px wide — 204 characters a line, well past where the eye can find the
+     start of the next one. */
+  --measure: 68ch;
 
   --radius: 16px;
   --pill: 999px;
   --gap: 10px;
-  --glow: 0 0 0 1px rgba(87, 183, 224, 0.15), 0 6px 20px rgba(0, 0, 0, 0.45);
+  --glow: 0 0 0 1px rgba(90, 169, 230, 0.15), 0 6px 20px rgba(0, 0, 0, 0.45);
 }
 
 * {
@@ -54,20 +75,22 @@ body {
   -webkit-font-smoothing: antialiased;
 }
 
-/* Shared "LCARS chrome" typographic treatment: uppercase, tracked. */
+/* The LCARS chrome treatment — uppercase, tracked — kept to the frame and to
+   labels that name a region or a state.
+
+   It used to include `button` and `.card-head`, which is to say every button and
+   every card in the app. Uppercase destroys word shape and adds ~10% reading time;
+   spent on a dozen fixed labels it reads as a ship's console, spent on content it
+   just reads slowly. Titles, buttons and prose are sentence case. */
 .title,
-.pill,
 .nav-pill,
-.count-label,
 .rail-sep,
-.panel h3,
-.card-head,
+.lane-head,
+.row-kind,
 .src,
 .state,
-.live-badge,
-.hint-head,
-.edge-kind,
-button {
+.badge,
+.section-label {
   text-transform: uppercase;
   letter-spacing: 0.1em;
 }
@@ -80,57 +103,55 @@ button {
   gap: var(--gap);
 }
 
-/* ---- top bar ---- */
+/* ---- top bar ----
+   One LCARS gesture (the elbow), the wordmark, and the link state. The 56px band
+   here previously also carried a full-width gradient `.bar` — roughly 700×56px of
+   decoration in the most valuable strip on the screen — and spelled the connection
+   state out as a lozenge reading LINK ESTABLISHED. Both are gone: the elbow keeps
+   the ship, and a dot is enough for a binary. */
 .lcars-top {
   display: flex;
-  align-items: stretch;
-  gap: var(--gap);
-  height: 56px;
+  align-items: center;
+  gap: 14px;
+  height: 34px;
+  flex: 0 0 auto;
 }
 
 .elbow {
-  width: 130px;
+  width: 68px;
+  align-self: stretch;
+  flex: 0 0 auto;
   background: var(--panel);
-  border-radius: var(--radius) var(--radius) 4px 46px;
+  border-radius: var(--radius) 4px 4px 24px;
 }
 
 .title {
   flex: 0 0 auto;
   display: flex;
-  align-items: center;
-  padding: 0 26px;
-  background: var(--lilac);
-  color: var(--ink);
-  border-radius: var(--radius);
-  font-size: 24px;
+  align-items: baseline;
+  color: var(--lilac);
+  font-size: var(--t-display);
   font-weight: 700;
+  line-height: 1;
+  letter-spacing: 0.06em;
+}
+
+/* The link state, as a dot with its detail on hover. */
+.status {
+  flex: 0 0 auto;
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: var(--sev-critical);
+  box-shadow: 0 0 8px rgba(224, 87, 79, 0.55);
+}
+.status.online {
+  background: var(--ok);
+  box-shadow: 0 0 8px rgba(94, 201, 141, 0.55);
 }
 
 .bar {
   flex: 1;
-  background: linear-gradient(90deg, var(--slate), var(--panel));
-  border-radius: var(--radius);
-  opacity: 0.5;
-}
-
-.status {
-  flex: 0 0 auto;
-  display: flex;
-  align-items: center;
-  padding: 0 22px;
-  background: var(--surface);
-  border: 1px solid var(--line-strong);
-  color: var(--dim);
-  border-radius: var(--pill);
-  font-size: 12px;
-  font-weight: 700;
-  letter-spacing: 0.08em;
-}
-.status.online {
-  color: var(--ink);
-  background: var(--blue);
-  border-color: var(--blue);
-  box-shadow: 0 0 16px rgba(87, 183, 224, 0.4);
 }
 
 /* ---- body ---- */
@@ -154,7 +175,7 @@ button {
   border-radius: var(--pill);
   padding: 12px 18px;
   font-weight: 700;
-  font-size: 13px;
+  font-size: var(--t-body);
 }
 
 /* ---- navigation rail ---- */
@@ -182,7 +203,7 @@ button {
 
 .rail-sep {
   color: var(--dim);
-  font-size: 10px;
+  font-size: var(--t-micro);
   padding: 12px 6px 2px;
   letter-spacing: 0.18em;
 }
@@ -213,7 +234,7 @@ button {
   border-color: var(--line-strong);
 }
 .source-row .src {
-  font-size: 10px;
+  font-size: var(--t-micro);
 }
 .dot {
   width: 9px;
@@ -237,33 +258,18 @@ button {
 .rail-spacer {
   flex: 1;
 }
-.count {
-  background: var(--surface);
-  border: 1px solid var(--line);
-  border-bottom: none;
-  color: var(--blue);
-  border-radius: var(--radius) var(--radius) 0 0;
-  padding: 10px 18px 2px;
-  font-size: 38px;
-  font-weight: 700;
-  text-align: right;
-  line-height: 1;
-}
-.count-label {
-  background: var(--surface);
-  border: 1px solid var(--line);
-  border-top: none;
-  color: var(--dim);
-  border-radius: 0 0 var(--radius) 40px;
-  padding: 0 18px 4px;
-  font-size: 11px;
-  text-align: right;
-}
+/* The rail's foot: totals, small. This used to set the thread count at 38px inside
+   a two-piece LCARS plaque. A number that large is a claim about importance, and
+   "how many rows are on the board" is not something you read from across the room —
+   the count that matters ("2 to decide") now sits in the board header, next to the
+   rows it is counting. */
 .subcount {
-  color: var(--dim);
-  font-size: 11px;
+  color: var(--faint);
+  font-size: var(--t-micro);
   text-align: right;
   padding: 8px 4px 0;
+  line-height: 1.5;
+  border-top: 1px solid var(--line);
 }
 
 /* ---- main region ---- */
@@ -290,52 +296,62 @@ button {
 
 .empty {
   color: var(--dim);
-  font-size: 18px;
+  font-size: var(--t-body);
   padding: 60px;
   text-align: center;
-  letter-spacing: 0.1em;
 }
 
-.board-toolbar {
+/* ---- board header ----
+   The counts live here rather than in the rail, because this is where they are
+   acted on: "12 open · 2 to decide" is the sentence the board exists to say. */
+.board-head {
   display: flex;
-  gap: 8px;
-  justify-content: flex-end;
+  align-items: baseline;
+  gap: 10px;
+  flex: 0 0 auto;
+  padding: 0 2px 8px;
+  border-bottom: 1px solid var(--line);
 }
-.board-toolbar button.on {
+.board-title {
+  font-size: var(--t-title);
+  font-weight: 600;
+  margin: 0;
+  letter-spacing: -0.01em;
+}
+.board-counts {
+  font-size: var(--t-meta);
+  color: var(--dim);
+  font-variant-numeric: tabular-nums;
+}
+.board-counts b {
+  color: var(--amber);
+  font-weight: 600;
+}
+.board-spacer {
+  flex: 1;
+}
+.board-head button.on {
   background: var(--blue);
   color: var(--ink);
   border-color: var(--blue);
 }
-/* RESET BOARD sits apart on the left, styled as a guarded/destructive action. */
-.board-toolbar button.reset {
-  margin-right: auto;
-}
-.board-toolbar button.danger {
+.board-head button.danger {
   color: var(--sev-critical);
+  border-color: transparent;
+}
+.board-head button.danger:hover:not(:disabled) {
   border-color: var(--sev-critical);
 }
-.board-toolbar button.danger:hover:not(:disabled) {
-  background: var(--sev-critical);
-  color: var(--ink);
-}
-.board-toolbar button.danger:disabled {
+.board-head button.danger:disabled {
   opacity: 0.6;
   cursor: default;
-}
-.board-section {
-  color: var(--dim);
-  font-size: 12px;
-  font-weight: 700;
-  letter-spacing: 0.18em;
-  padding: 4px 2px;
-  border-top: 1px solid var(--line);
-  margin-top: 6px;
 }
 
 .muted {
   color: var(--dim);
-  font-size: 12px;
+  font-size: var(--t-meta);
   line-height: 1.5;
+  max-width: var(--measure);
 }
 .linkish {
   background: none;
@@ -348,81 +364,197 @@ button {
   border-bottom: 1px dotted var(--blue);
 }
 
-/* ---- cards (board) ---- */
-.card {
-  /* Keep natural height: without this, cards are flex items in the scrolling
-     column and shrink to cram every thread into view instead of overflowing. */
+/* ---- board rows ----
+   A subject is one row: what it is, what it wants, who moved it, when. It used to
+   be a section that also rendered its summary, its tags, every member event, its
+   attempts and both explanations — 352-1162px each, so exactly one subject was on
+   screen at a time and the list could not be compared. All of that content is in
+   the click-in view; the board's job is deciding which one to open. */
+.lane {
   flex: 0 0 auto;
   display: flex;
-  background: var(--surface);
-  border-radius: var(--radius);
-  overflow: hidden;
-  border: 1px solid var(--line);
+  flex-direction: column;
+}
+.lane-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin: 0;
+  padding: 18px 2px 4px;
+  font-size: var(--t-micro);
+  font-weight: 600;
+  color: var(--faint);
+}
+/* Decide is the lane you are meant to look at first, so it is the only one that
+   gets a colour. */
+.lane-decide .lane-head {
+  color: var(--amber);
+}
+.lane-count {
+  color: var(--dim);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0;
+}
+.lane-empty {
+  margin: 0;
+  padding: 2px 2px 6px;
+  font-size: var(--t-meta);
+  color: var(--faint);
+}
+
+/* Named `.lane-row`, not `.row`: `.row` is this app's generic form-row (a flex
+   line in the chat composer and every editor panel), declared later in this file,
+   so a board row called `.row` silently lost its grid to it. */
+.lane-row {
+  display: grid;
+  /* Fixed side columns so the kind, the actor and the age line up down the page —
+     a column that re-sizes per row is a column you have to read rather than scan. */
+  grid-template-columns: 3.2rem minmax(0, 1fr) 10.5rem 3rem 8.4rem;
+  gap: 0 12px;
+  align-items: start;
+  padding: 8px 8px 8px 0;
+  border-bottom: 1px solid var(--line);
   cursor: pointer;
-  transition:
-    border-color 0.15s,
-    transform 0.1s,
-    box-shadow 0.15s;
+  text-align: left;
+  border-left: 2px solid transparent;
 }
-.card:hover {
-  border-color: var(--line-strong);
-  transform: translateY(-1px);
-  box-shadow: var(--glow);
+.lane-row:hover {
+  background: var(--surface);
 }
-.card.dim {
+.lane-row:focus-visible {
+  outline: none;
+  border-left-color: var(--blue);
+  background: var(--surface);
+}
+/* Acknowledged: triaged, still listed, visibly settled. */
+.lane-row.acked {
+  opacity: 0.62;
+}
+.lane-row.dim {
   opacity: 0.5;
 }
-/* Acknowledged: clearly triaged (desaturated + faded) but still on the board. */
-.card.acked {
-  opacity: 0.68;
-  filter: saturate(0.6);
-}
-.card.live {
-  border-color: var(--lilac);
-  box-shadow: 0 0 0 1px rgba(149, 133, 207, 0.35);
+.lane-row.live {
+  border-left-color: var(--lilac);
 }
 
-.card-bar {
-  width: 5px;
-  background: var(--sev-notice);
-  flex: 0 0 auto;
+/* Right-aligned so `PR` and `Issue` share an edge and every title starts at the
+   same x — left-aligned, the wider word pushed its row's title 20px out. */
+.row-kind {
+  font-size: var(--t-micro);
+  color: var(--faint);
+  padding-top: 3px;
+  text-align: right;
 }
-.card.sev-info .card-bar {
-  background: var(--sev-info);
-}
-.card.sev-notice .card-bar {
-  background: var(--sev-notice);
-}
-.card.sev-warning .card-bar {
-  background: var(--sev-warning);
-}
-.card.sev-critical .card-bar {
-  background: var(--sev-critical);
+.lane-row.rank-pull_request .row-kind {
+  color: var(--blue);
 }
 
-.card-main {
-  flex: 1;
-  padding: 12px 16px;
+.row-mid {
   min-width: 0;
 }
-
-.card-head {
+.row-titleline {
   display: flex;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 0;
+}
+.row-title {
+  font-size: var(--t-body);
+  line-height: 1.35;
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.lane-row:hover .row-title {
+  color: var(--blue);
+}
+/* The upstream reference, promoted out of the title string — GitHub sends it as a
+   parenthetical, which put the same fact in the row twice. */
+.row-ref {
+  flex: 0 0 auto;
+  font-size: var(--t-micro);
+  color: var(--faint);
+  font-variant-numeric: tabular-nums;
+}
+.row-headline {
+  display: block;
+  margin-top: 2px;
+  font-size: var(--t-meta);
+  line-height: 1.45;
+  color: var(--dim);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+/* No usable summary yet. Said out loud, because the alternative — truncating the
+   newest event body — reads as a conclusion the board has not actually reached. */
+.row-headline.none {
+  color: var(--faint);
+  font-style: italic;
+}
+.row-who,
+.row-when {
+  font-size: var(--t-micro);
+  color: var(--faint);
+  padding-top: 3px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  text-align: right;
+}
+
+/* Triage without travelling to a menu. The column is always reserved, so revealing
+   the buttons cannot reflow the row under the pointer. */
+.row-actions {
+  display: flex;
+  gap: 6px;
+  justify-content: flex-end;
+  visibility: hidden;
+}
+.lane-row:hover .row-actions,
+.lane-row:focus-visible .row-actions,
+.row-actions:focus-within {
+  visibility: visible;
+}
+.row-actions button {
+  padding: 2px 9px;
+  font-size: var(--t-micro);
+}
+
+/* In-flight AI work, as one glyph. The board's half of the dispatch indicator: the
+   detail view carries the full strip, and a failure the operator cannot see is
+   worse than a row that is one glyph busier. */
+.badge {
+  flex: 0 0 auto;
+  font-size: var(--t-micro);
+  font-weight: 700;
+  border-radius: var(--pill);
+  padding: 1px 7px;
+  color: var(--ink);
+}
+.badge-live {
+  background: var(--lilac);
+}
+.badge-ai {
+  background: var(--surface-2);
+  border: 1px solid var(--line-strong);
+  color: var(--blue);
+  display: inline-flex;
   align-items: center;
-  gap: 10px;
-  font-size: 11px;
-  color: var(--dim);
 }
-.kind {
-  color: var(--dim);
-}
+
+/* Source identity. Two hues and a neutral, not three colours competing with
+   severity: amber left this set when it became warning-only, and the pill spells the
+   source out anyway. */
 .src {
   color: var(--ink);
-  background: var(--amber);
+  background: var(--slate);
   border-radius: var(--pill);
   padding: 2px 9px;
   font-weight: 700;
-  font-size: 10px;
+  font-size: var(--t-micro);
 }
 .src-github {
   background: var(--blue);
@@ -431,37 +563,8 @@ button {
   background: var(--lilac);
 }
 .src-granola {
-  background: var(--amber);
-}
-.card-head time {
-  margin-left: auto;
-  letter-spacing: 0.04em;
-}
-
-.card-title {
-  margin-top: 8px;
-  font-size: 16px;
   color: var(--text);
-  line-height: 1.35;
-}
-.card-title a {
-  color: var(--blue);
-  text-decoration: none;
-}
-.card-title a:hover {
-  text-decoration: underline;
-}
-
-.card-body {
-  margin-top: 4px;
-  font-size: 13px;
-  color: var(--dim);
-}
-
-.card-actions {
-  margin-top: 12px;
-  display: flex;
-  gap: 8px;
+  background: var(--slate);
 }
 
 /* ---- chips / state / badges ---- */
@@ -477,12 +580,14 @@ button {
   border: 1px solid var(--line);
   border-radius: var(--pill);
   padding: 2px 10px;
-  font-size: 11px;
+  font-size: var(--t-micro);
 }
-/* Routing tags — gold to set them apart from entity chips. */
+/* Routing tags. Set apart by the `#` they already carry rather than by gold: a tag
+   is not a warning, and amber saying "tag" here and "warning" two rows down meant
+   neither could be read at a glance. */
 .chip.tag {
-  color: var(--amber);
-  border-color: var(--amber);
+  color: var(--dim);
+  border-color: var(--line-strong);
 }
 .chip.tag::before {
   content: "#";
@@ -510,18 +615,10 @@ button {
   gap: 10px;
   flex-wrap: wrap;
 }
-.live-badge {
-  background: var(--lilac);
-  color: var(--ink);
-  border-radius: var(--pill);
-  padding: 1px 8px;
-  font-weight: 700;
-  font-size: 10px;
-}
 .state {
   border-radius: var(--pill);
   padding: 1px 9px;
-  font-size: 10px;
+  font-size: var(--t-micro);
   background: var(--surface-2);
   border: 1px solid var(--line);
   color: var(--dim);
@@ -535,192 +632,6 @@ button {
   color: var(--dim);
 }
 
-/* ---- topics (board): a thread as a section with its events listed below ---- */
-.topic {
-  /* Natural height so sections overflow the scroll column instead of squashing. */
-  flex: 0 0 auto;
-  display: flex;
-  background: var(--surface);
-  border-radius: var(--radius);
-  overflow: hidden;
-  border: 1px solid var(--line);
-  transition:
-    border-color 0.15s,
-    box-shadow 0.15s;
-}
-.topic:hover {
-  border-color: var(--line-strong);
-}
-.topic.dim {
-  opacity: 0.5;
-}
-.topic.acked {
-  opacity: 0.72;
-  filter: saturate(0.6);
-}
-.topic.live {
-  border-color: var(--lilac);
-  box-shadow: 0 0 0 1px rgba(149, 133, 207, 0.35);
-}
-
-.topic-bar {
-  width: 5px;
-  flex: 0 0 auto;
-  background: var(--sev-notice);
-}
-.topic.sev-info .topic-bar {
-  background: var(--sev-info);
-}
-.topic.sev-notice .topic-bar {
-  background: var(--sev-notice);
-}
-.topic.sev-warning .topic-bar {
-  background: var(--sev-warning);
-}
-.topic.sev-critical .topic-bar {
-  background: var(--sev-critical);
-}
-
-.topic-main {
-  flex: 1;
-  min-width: 0;
-  padding: 12px 16px;
-}
-.topic-head {
-  display: flex;
-  align-items: baseline;
-  gap: 12px;
-  cursor: pointer;
-}
-.topic-titleline {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  min-width: 0;
-  flex: 1;
-}
-.topic-title {
-  font-size: 15px;
-  color: var(--text);
-  line-height: 1.3;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-.topic-head:hover .topic-title {
-  color: var(--blue);
-}
-.topic-meta {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  flex: 0 0 auto;
-  font-size: 11px;
-  color: var(--dim);
-}
-.topic-summary {
-  margin-top: 8px;
-  background: var(--surface-2);
-  border: 1px solid var(--line);
-  border-left: 3px solid var(--blue);
-  border-radius: 8px;
-  padding: 8px 12px;
-}
-.topic-summary-label {
-  display: block;
-  font-size: 10px;
-  letter-spacing: 0.08em;
-  color: var(--blue);
-  margin-bottom: 4px;
-}
-
-/* event rows — a meta line above the message in full */
-.events {
-  margin-top: 12px;
-  border-top: 1px solid var(--line);
-}
-.event {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-  padding: 8px 2px;
-  border-bottom: 1px solid var(--line);
-  cursor: pointer;
-}
-.event:last-child {
-  border-bottom: none;
-}
-.event:hover {
-  background: var(--surface-2);
-}
-.event.acked {
-  opacity: 0.6;
-}
-.event-meta {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  font-size: 11px;
-  color: var(--dim);
-}
-.event .dot {
-  background: var(--dim);
-  flex: 0 0 auto;
-}
-.event.sev-info .dot {
-  background: var(--sev-info);
-}
-.event.sev-notice .dot {
-  background: var(--sev-notice);
-}
-.event.sev-warning .dot {
-  background: var(--sev-warning);
-}
-.event.sev-critical .dot {
-  background: var(--sev-critical);
-}
-.event-meta .src {
-  flex: 0 0 auto;
-}
-.event-actor {
-  color: var(--dim);
-}
-/* Push the timestamp and everything after it to the right. */
-.event-meta time {
-  margin-left: auto;
-  letter-spacing: 0.04em;
-}
-.event-open {
-  color: var(--blue);
-  text-decoration: none;
-}
-.event-open:hover {
-  text-decoration: underline;
-}
-.event-line {
-  /* One-line title preview; the full body opens in a pop-out on click. */
-  display: flex;
-  align-items: baseline;
-  gap: 8px;
-  padding-left: 19px; /* align under the text, past the severity dot */
-}
-.event-title {
-  color: var(--text);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.event-details {
-  flex: 0 0 auto;
-  margin-left: auto;
-  color: var(--blue);
-  font-size: 11px;
-}
-.topic-actions {
-  margin-top: 12px;
-  display: flex;
-  gap: 8px;
-}
 
 /* ---- panels / detail ---- */
 .panel {
@@ -732,7 +643,7 @@ button {
 .panel h3 {
   margin: 0 0 12px;
   color: var(--blue);
-  font-size: 13px;
+  font-size: var(--t-body);
 }
 .detail-head {
   display: flex;
@@ -741,17 +652,31 @@ button {
 }
 .detail-head h2 {
   margin: 0;
-  font-size: 20px;
+  font-size: var(--t-head);
   color: var(--text);
   font-weight: 700;
+  letter-spacing: -0.01em;
+}
+/* The upstream reference, lifted out of the title. */
+.detail-ref {
+  font-size: var(--t-meta);
+  color: var(--faint);
+  font-variant-numeric: tabular-nums;
 }
 .detail-grid {
   display: grid;
   grid-template-columns: 1fr 1fr;
   gap: var(--gap);
+  /* The page is a reading column, so it stops where reading stops being comfortable.
+     Panels of prose used to stretch to whatever the window was. */
+  max-width: 1180px;
 }
+/* The summary panel: full width of the grid, but only as wide as its own prose needs
+   to be. Capping `.md` alone left the panel stretched with an empty right half — the
+   panel should end where the text ends. */
 .detail-grid .panel:first-child {
   grid-column: 1 / -1;
+  max-width: calc(var(--measure) + 4rem);
 }
 .timeline-panel,
 .browser-investigations {
@@ -770,7 +695,7 @@ button {
 .citation {
   margin-left: 3px;
   color: var(--dim);
-  font-size: 9px;
+  font-size: var(--t-micro);
   font-weight: 700;
   letter-spacing: 0.04em;
   line-height: 1;
@@ -803,7 +728,7 @@ button {
   display: flex;
   flex-direction: column;
   gap: 8px;
-  font-size: 12px;
+  font-size: var(--t-meta);
   border-left: 2px solid var(--line-strong);
   padding: 8px 0 10px 14px;
 }
@@ -822,7 +747,7 @@ button {
   padding: 4px 8px;
   border: 1px solid currentColor;
   border-radius: var(--pill);
-  font-size: 10px;
+  font-size: var(--t-micro);
   font-weight: 800;
   letter-spacing: 0.09em;
   text-transform: uppercase;
@@ -842,7 +767,7 @@ button {
 }
 .tl-title {
   color: var(--text);
-  font-size: 15px;
+  font-size: var(--t-body);
   line-height: 1.45;
 }
 .tl-title p {
@@ -859,14 +784,14 @@ button {
 }
 .tl-advice > span {
   color: var(--sev-warning);
-  font-size: 10px;
+  font-size: var(--t-micro);
   font-weight: 800;
   letter-spacing: 0.1em;
 }
 .tl-advice p {
   margin: 3px 0 0;
   color: var(--dim);
-  font-size: 13px;
+  font-size: var(--t-body);
   line-height: 1.45;
 }
 .tl-content {
@@ -920,7 +845,7 @@ button {
   display: flex;
   gap: 12px;
   align-items: center;
-  font-size: 12px;
+  font-size: var(--t-meta);
   color: var(--muted, #8aa);
   margin-bottom: 10px;
 }
@@ -966,10 +891,8 @@ button {
   border-radius: var(--pill);
   color: var(--blue);
   text-decoration: none;
-  font-size: 11px;
+  font-size: var(--t-micro);
   font-weight: 700;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
 }
 .browser-investigation {
   border: 1px solid var(--line);
@@ -987,7 +910,7 @@ button {
 }
 .browser-investigation-head a {
   color: var(--blue);
-  font-size: 12px;
+  font-size: var(--t-meta);
 }
 .browser-prompt {
   margin: 8px 0;
@@ -1020,7 +943,7 @@ button {
 .browser-error {
   margin: 8px 0 0;
   color: var(--sev-critical);
-  font-size: 12px;
+  font-size: var(--t-meta);
 }
 
 /* Root cause. Candidates are hypotheses: the relation pill carries the claim and
@@ -1046,7 +969,7 @@ button {
 }
 .rc-label {
   color: var(--dim);
-  font-size: 11px;
+  font-size: var(--t-micro);
   letter-spacing: 0.08em;
   text-transform: uppercase;
 }
@@ -1089,7 +1012,7 @@ button {
   border-radius: var(--pill);
   background: var(--slate);
   color: var(--text);
-  font-size: 10px;
+  font-size: var(--t-micro);
   letter-spacing: 0.08em;
   text-transform: uppercase;
 }
@@ -1108,7 +1031,7 @@ button {
 .rc-kind,
 .rc-confidence {
   color: var(--dim);
-  font-size: 11px;
+  font-size: var(--t-micro);
 }
 .rc-confidence {
   margin-left: auto;
@@ -1132,7 +1055,7 @@ button {
   align-items: center;
   gap: 8px;
   margin-top: 6px;
-  font-size: 12px;
+  font-size: var(--t-meta);
 }
 .rc-files,
 .rc-fragment {
@@ -1164,7 +1087,7 @@ button {
   border-left: 3px solid var(--blue);
   border-radius: 0 8px 8px 0;
   background: var(--surface-2);
-  font-size: 15px;
+  font-size: var(--t-body);
   line-height: 1.55;
 }
 .triage-analysis {
@@ -1172,12 +1095,13 @@ button {
   color: var(--text);
 }
 .triage-heading {
+  /* A heading, not a label: it carries a count and a caveat, so it is sentence case
+     and neutral. Amber left it when amber became warning-only — "3 possible
+     approaches" is not a warning. */
   margin: 16px 0 8px;
-  color: var(--amber);
-  font-size: 12px;
+  color: var(--text);
+  font-size: var(--t-body);
   font-weight: 600;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
 }
 .triage-heading .muted {
   text-transform: none;
@@ -1206,7 +1130,7 @@ button {
   border-radius: var(--pill);
   background: var(--panel);
   color: var(--ink);
-  font-size: 11px;
+  font-size: var(--t-micro);
   font-weight: 700;
 }
 .patch-title {
@@ -1218,7 +1142,7 @@ button {
 }
 .patch-risk {
   margin-top: 6px;
-  font-size: 13px;
+  font-size: var(--t-body);
   color: var(--dim);
 }
 .chip.effort-small {
@@ -1235,7 +1159,7 @@ button {
   margin-top: 12px;
   padding-top: 10px;
   border-top: 1px solid var(--line);
-  font-size: 12px;
+  font-size: var(--t-meta);
   color: var(--dim);
 }
 .triage-provenance code {
@@ -1276,7 +1200,7 @@ button {
 .hint-head {
   display: flex;
   justify-content: space-between;
-  font-size: 10px;
+  font-size: var(--t-micro);
   color: var(--dim);
   margin-bottom: 4px;
 }
@@ -1284,7 +1208,7 @@ button {
   color: var(--blue);
 }
 .cites {
-  font-size: 11px;
+  font-size: var(--t-micro);
   color: var(--dim);
   margin-top: 4px;
   font-family: ui-monospace, "SF Mono", Menlo, monospace;
@@ -1311,7 +1235,7 @@ button {
   border-radius: 10px;
   background: rgba(87, 183, 224, 0.1);
   color: var(--blue);
-  font-size: 12px;
+  font-size: var(--t-meta);
   font-weight: 600;
   letter-spacing: 0.04em;
 }
@@ -1358,17 +1282,146 @@ button {
   margin-bottom: 8px;
   background: var(--surface-2);
 }
+.edge-line {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  flex-wrap: wrap;
+}
 .edge-kind {
   font-weight: 700;
-  color: var(--blue);
-  margin-right: 8px;
-  font-size: 11px;
+  color: var(--dim);
+  font-size: var(--t-micro);
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  flex: 0 0 auto;
 }
+/* `same` is the only edge kind that changes what you do — it says these are one
+   piece of work. `related` is context, and colouring it made ten guesses look like
+   ten findings. */
 .edge-same .edge-kind {
-  color: var(--sev-critical);
+  color: var(--blue);
 }
-.edge-related .edge-kind {
-  color: var(--sev-notice);
+/* The relation card's target title. It used to be uppercase, centred and underlined
+   at once — three emphasis mechanisms fighting over four words. */
+.edge .linkish {
+  font-size: var(--t-body);
+  text-align: left;
+  border-bottom: none;
+  text-decoration: underline;
+  text-decoration-color: var(--line-strong);
+  text-underline-offset: 2px;
+}
+.edge .linkish:hover {
+  text-decoration-color: var(--blue);
+}
+
+/* ---- an analysis that hasn't run ----
+   One line, not a panel. Root cause and issue triage each used to render a full
+   panel — heading, explanatory paragraph, status pill, button — while holding no
+   content at all, between the diff and the relations. */
+.not-run {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  flex: 0 0 auto;
+  padding: 8px 14px;
+  border: 1px dashed var(--line);
+  border-radius: 12px;
+}
+.not-run .muted {
+  flex: 1;
+  min-width: 16rem;
+  margin: 0;
+}
+
+/* ---- the analysis menu ----
+   Native disclosure: keyboard-operable and closed by default, so the actions are
+   one click away instead of nine buttons wide. */
+.menu {
+  position: relative;
+}
+.menu > summary {
+  list-style: none;
+  cursor: pointer;
+  display: inline-block;
+  color: var(--blue);
+  border: 1px solid var(--line-strong);
+  border-radius: var(--pill);
+  padding: 6px 15px;
+  font-weight: 700;
+  font-size: var(--t-micro);
+}
+.menu > summary::-webkit-details-marker {
+  display: none;
+}
+.menu > summary:hover,
+.menu[open] > summary {
+  background: var(--blue);
+  color: var(--ink);
+  border-color: var(--blue);
+}
+.menu > summary:focus-visible {
+  outline: 2px solid var(--blue);
+  outline-offset: 2px;
+}
+.menu-body {
+  position: absolute;
+  z-index: 20;
+  top: calc(100% + 6px);
+  left: 0;
+  min-width: 17rem;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 8px;
+  background: var(--surface);
+  border: 1px solid var(--line-strong);
+  border-radius: 12px;
+  box-shadow: var(--glow);
+}
+.menu-body button {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  width: 100%;
+  border-color: transparent;
+  border-radius: 8px;
+  text-align: left;
+}
+.menu-body button:hover:not(:disabled) .cost {
+  color: var(--ink);
+}
+/* Where the work runs, on the control that starts it. "Melted my macbook" and "cost
+   me money" are different prices and the operator was being asked to guess. */
+.cost {
+  font-weight: 400;
+  font-size: var(--t-micro);
+  color: var(--faint);
+  white-space: nowrap;
+}
+.cost-metered {
+  color: var(--amber);
+}
+.menu-sep {
+  margin-top: 6px;
+  padding: 8px 4px 2px;
+  border-top: 1px solid var(--line);
+  font-size: var(--t-micro);
+  color: var(--faint);
+}
+.menu-body .model-bar {
+  display: flex;
+  gap: 6px;
+  padding: 0 2px 4px;
+}
+.menu-body .model-bar select {
+  flex: 1;
+  min-width: 0;
+  font-size: var(--t-micro);
+  padding: 5px 8px;
 }
 
 /* ---- forms & controls ---- */
@@ -1379,7 +1432,7 @@ button {
   margin-top: 10px;
 }
 .form label {
-  font-size: 10px;
+  font-size: var(--t-micro);
   color: var(--dim);
   letter-spacing: 0.12em;
   text-transform: uppercase;
@@ -1402,7 +1455,7 @@ select {
   border-radius: 10px;
   padding: 8px 11px;
   font-family: inherit;
-  font-size: 13px;
+  font-size: var(--t-body);
   outline: none;
   transition:
     border-color 0.15s,
@@ -1429,7 +1482,7 @@ button {
   padding: 6px 15px;
   font-family: inherit;
   font-weight: 700;
-  font-size: 11px;
+  font-size: var(--t-micro);
   cursor: pointer;
   transition:
     background 0.12s,
@@ -1444,6 +1497,20 @@ button:hover:not(:disabled) {
 button:disabled {
   opacity: 0.4;
   cursor: default;
+}
+button:focus-visible {
+  outline: 2px solid var(--blue);
+  outline-offset: 2px;
+}
+/* The one action a screen wants. Every button used to look like this one, which is
+   the same as none of them doing. */
+button.primary {
+  background: var(--blue);
+  color: var(--ink);
+  border-color: var(--blue);
+}
+button.primary:hover:not(:disabled) {
+  filter: brightness(1.12);
 }
 .back {
   color: var(--lilac);
@@ -1460,7 +1527,7 @@ button:disabled {
   border-radius: var(--pill);
   padding: 6px 12px;
   cursor: pointer;
-  font-size: 15px;
+  font-size: var(--t-body);
 }
 .attach-btn:hover {
   border-color: var(--blue);
@@ -1496,7 +1563,7 @@ button:disabled {
   border: 1px solid var(--line);
   border-radius: 10px;
   padding: 12px;
-  font-size: 12px;
+  font-size: var(--t-meta);
   overflow-x: auto;
   color: var(--blue);
   max-height: 60vh;
@@ -1505,7 +1572,7 @@ button:disabled {
   width: 100%;
   min-height: 44vh;
   font-family: ui-monospace, "SF Mono", Menlo, monospace;
-  font-size: 12.5px;
+  font-size: var(--t-meta);
   line-height: 1.55;
   tab-size: 2;
   color: var(--text);
@@ -1554,7 +1621,7 @@ code {
 }
 .chat-list-empty {
   color: var(--dim);
-  font-size: 12px;
+  font-size: var(--t-meta);
   padding: 8px 4px;
 }
 .chat-list-item {
@@ -1579,13 +1646,13 @@ code {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  font-size: 12.5px;
+  font-size: var(--t-meta);
   color: var(--text);
 }
 .chat-del {
   flex-shrink: 0;
   padding: 2px 6px;
-  font-size: 11px;
+  font-size: var(--t-micro);
   border: none;
   color: var(--dim);
   opacity: 0.7;
@@ -1665,7 +1732,7 @@ code {
   flex: 1;
   min-width: 0;
   padding: 6px 9px;
-  font-size: 12px;
+  font-size: var(--t-meta);
 }
 
 /* chat context-tag chooser: toggleable tag chips that attach grounding */
@@ -1678,7 +1745,7 @@ code {
 }
 .tag-bar-label {
   color: var(--dim);
-  font-size: 10px;
+  font-size: var(--t-micro);
   letter-spacing: 0.18em;
 }
 .tag-toggle {
@@ -1706,7 +1773,7 @@ code {
   border-radius: 10px;
   background: rgba(217, 169, 78, 0.1);
   color: var(--text);
-  font-size: 12.5px;
+  font-size: var(--t-meta);
   line-height: 1.5;
 }
 
@@ -1732,7 +1799,7 @@ code {
 }
 .icon-btn {
   padding: 4px 10px;
-  font-size: 11px;
+  font-size: var(--t-micro);
   text-transform: none;
   letter-spacing: normal;
 }
@@ -1744,9 +1811,18 @@ code {
 /* ---- rendered markdown (chat replies, postmortem drafts) ---- */
 .md {
   color: var(--text);
-  font-size: 13px;
+  font-size: var(--t-body);
   line-height: 1.6;
   word-break: break-word;
+  /* The single largest readability change in this file. Summary paragraphs used to
+     set the full panel width — 1325px, about 204 characters a line — where the eye
+     loses its place on the return sweep. Tables, code and diffs opt back out below,
+     since those are read by scanning columns rather than by line. */
+  max-width: var(--measure);
+}
+.md table,
+.md pre {
+  max-width: none;
 }
 .md > :first-child {
   margin-top: 0;
@@ -1779,18 +1855,18 @@ code {
   line-height: 1.3;
 }
 .md h1 {
-  font-size: 17px;
+  font-size: var(--t-title);
 }
 .md h2 {
-  font-size: 15px;
+  font-size: var(--t-body);
 }
 .md h3 {
-  font-size: 13.5px;
+  font-size: var(--t-body);
 }
 .md h4,
 .md h5,
 .md h6 {
-  font-size: 12.5px;
+  font-size: var(--t-meta);
 }
 .md ul,
 .md ol {
@@ -1810,7 +1886,7 @@ code {
   border-radius: 5px;
   padding: 1px 5px;
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-size: 12px;
+  font-size: var(--t-meta);
 }
 .md pre {
   background: var(--bg);
@@ -1941,7 +2017,7 @@ code {
 }
 .pr-tier {
   margin-top: 6px;
-  font-size: 11px;
+  font-size: var(--t-micro);
 }
 .pr-also {
   margin-top: 6px;
@@ -1950,7 +2026,7 @@ code {
   margin-top: 3px;
   padding-left: 10px;
   border-left: 2px solid var(--line-strong);
-  font-size: 13px;
+  font-size: var(--t-body);
   line-height: 1.45;
 }
 
@@ -1968,7 +2044,7 @@ code {
 .att {
   padding: 2px 10px;
   border-radius: var(--pill);
-  font-size: 10px;
+  font-size: var(--t-micro);
   font-weight: 700;
   letter-spacing: 0.1em;
 }
@@ -1983,7 +2059,7 @@ code {
 }
 .att-reason {
   color: var(--dim);
-  font-size: 12px;
+  font-size: var(--t-meta);
 }
 
 /* Facet strip: filled = the AI produced this, hollow = it hasn't. A row of hollow
@@ -2038,7 +2114,7 @@ code {
 }
 .patch-mechanism {
   margin-top: 4px;
-  font-size: 13px;
+  font-size: var(--t-body);
   color: var(--blue);
 }
 /* A new dependency is a real cost of an approach, so it's called out rather than
@@ -2050,7 +2126,7 @@ code {
   border-radius: 6px;
   background: color-mix(in srgb, var(--sev-warning) 14%, transparent);
   color: var(--sev-warning);
-  font-size: 12px;
+  font-size: var(--t-meta);
 }
 
 /* ---- Nested attempts and explanations ---------------------------------------
@@ -2068,7 +2144,7 @@ code {
 
 .attempts-label,
 .explain-label {
-  font-size: 0.62rem;
+  font-size: var(--t-micro);
   letter-spacing: 0.14em;
   color: var(--lcars-tan, #d69a78);
   margin-bottom: 0.3rem;
@@ -2106,7 +2182,7 @@ code {
 }
 
 .verdict {
-  font-size: 0.6rem;
+  font-size: var(--t-micro);
   letter-spacing: 0.1em;
   padding: 0.05rem 0.35rem;
   border-radius: 0.5rem;
@@ -2124,33 +2200,33 @@ code {
 }
 
 .attempt-conf {
-  font-size: 0.66rem;
+  font-size: var(--t-micro);
   opacity: 0.75;
 }
 .attempt-ref {
-  font-size: 0.7rem;
+  font-size: var(--t-micro);
   font-weight: 600;
 }
 .attempt-title {
   flex: 1 1 12rem;
-  font-size: 0.78rem;
+  font-size: var(--t-meta);
 }
 .attempt-author {
-  font-size: 0.68rem;
+  font-size: var(--t-micro);
   opacity: 0.7;
 }
 
 .attempt-row {
   display: flex;
   gap: 0.5rem;
-  font-size: 0.74rem;
+  font-size: var(--t-meta);
   line-height: 1.35;
   margin-top: 0.15rem;
 }
 
 .attempt-key {
   flex: 0 0 5.2rem;
-  font-size: 0.6rem;
+  font-size: var(--t-micro);
   letter-spacing: 0.1em;
   opacity: 0.65;
   padding-top: 0.12rem;
@@ -2166,7 +2242,7 @@ code {
 }
 
 .attempt-foot {
-  font-size: 0.62rem;
+  font-size: var(--t-micro);
   opacity: 0.5;
   margin-top: 0.25rem;
 }
@@ -2193,7 +2269,7 @@ code {
 }
 
 .explain-btn {
-  font-size: 0.6rem;
+  font-size: var(--t-micro);
   padding: 0.1rem 0.4rem;
 }
 
@@ -2221,7 +2297,7 @@ code {
   margin-top: 0.4rem;
   padding-top: 0.35rem;
   border-top: 1px dashed rgba(255, 255, 255, 0.14);
-  font-size: 0.66rem;
+  font-size: var(--t-micro);
   color: #f0c674;
   opacity: 0.85;
 }
@@ -2239,7 +2315,7 @@ code {
 }
 
 .board-note {
-  font-size: 0.7rem;
+  font-size: var(--t-micro);
 }
 
 /* ---- Issue scoring ----------------------------------------------------------
@@ -2272,14 +2348,14 @@ code {
 
 .score-pct {
   flex: 0 0 3rem;
-  font-size: 0.86rem;
+  font-size: var(--t-body);
   font-weight: 600;
   text-align: right;
   color: var(--lcars-tan, #d69a78);
 }
 
 .score-target {
-  font-size: 0.8rem;
+  font-size: var(--t-body);
 }
 .score-component {
   color: #ffd9a0;
@@ -2287,7 +2363,7 @@ code {
 }
 .score-commit {
   opacity: 0.7;
-  font-size: 0.72rem;
+  font-size: var(--t-micro);
 }
 
 .score-evidence {
@@ -2295,7 +2371,7 @@ code {
   gap: 0.4rem;
   align-items: baseline;
   margin: 0.12rem 0 0 3.5rem;
-  font-size: 0.72rem;
+  font-size: var(--t-micro);
   opacity: 0.85;
 }
 
@@ -2315,7 +2391,7 @@ code {
 }
 
 .score-caveat {
-  font-size: 0.68rem;
+  font-size: var(--t-micro);
   margin-top: 0.3rem;
 }
 
@@ -2331,12 +2407,12 @@ code {
   background: rgba(255, 255, 255, 0.04);
   border-left: 3px solid var(--lcars-tan, #d69a78);
   border-radius: 0 0.6rem 0.6rem 0;
-  font-size: 0.74rem;
+  font-size: var(--t-meta);
 }
 
 .index-totals b {
   color: var(--lcars-tan, #d69a78);
-  font-size: 0.9rem;
+  font-size: var(--t-body);
 }
 
 /* The Restate half. Kept visually separate from the totals because it answers a different
@@ -2350,7 +2426,7 @@ code {
   background: rgba(138, 180, 248, 0.07);
   border-left: 3px solid #8ab4f8;
   border-radius: 0 0.6rem 0.6rem 0;
-  font-size: 0.72rem;
+  font-size: var(--t-micro);
 }
 
 .inv-row {
@@ -2394,7 +2470,7 @@ code {
 .repo-line {
   padding: 0.35rem 0.6rem;
   cursor: pointer;
-  font-size: 0.74rem;
+  font-size: var(--t-meta);
 }
 
 .repo-line:hover {
@@ -2467,7 +2543,7 @@ code {
 
 .rd-name {
   margin: 0;
-  font-size: 0.95rem;
+  font-size: var(--t-body);
   font-weight: 700;
   color: var(--text);
 }
@@ -2487,12 +2563,12 @@ code {
   background: rgba(255, 255, 255, 0.04);
   border-left: 3px solid var(--lcars-tan, #d69a78);
   border-radius: 0 0.6rem 0.6rem 0;
-  font-size: 0.72rem;
+  font-size: var(--t-micro);
 }
 
 .rd-facts b {
   color: var(--lcars-tan, #d69a78);
-  font-size: 0.85rem;
+  font-size: var(--t-body);
 }
 
 .rd-tabs {
@@ -2507,7 +2583,7 @@ code {
   border-bottom: 2px solid transparent;
   color: #9aa0a6;
   font-family: inherit;
-  font-size: 0.64rem;
+  font-size: var(--t-micro);
   letter-spacing: 0.12em;
   padding: 0.35rem 0.7rem;
   cursor: pointer;
@@ -2536,7 +2612,7 @@ code {
 }
 
 .rd-card {
-  font-size: 0.76rem;
+  font-size: var(--t-meta);
   line-height: 1.5;
   color: #c8ccd0;
   max-width: 62rem;
@@ -2544,7 +2620,7 @@ code {
 
 .rd-desc {
   margin: 0;
-  font-size: 0.72rem;
+  font-size: var(--t-micro);
   color: #9aa0a6;
   max-width: 62rem;
 }
@@ -2552,7 +2628,7 @@ code {
 /* Section headings inside a tab. Quiet — they separate, they don't announce. */
 .rd-section-label {
   margin-top: 0.5rem;
-  font-size: 0.6rem;
+  font-size: var(--t-micro);
   letter-spacing: 0.14em;
   color: #9aa0a6;
 }
@@ -2573,7 +2649,7 @@ code {
   gap: 0.6rem;
   align-items: baseline;
   padding: 0.2rem 0;
-  font-size: 0.72rem;
+  font-size: var(--t-micro);
   cursor: pointer;
 }
 
@@ -2598,17 +2674,17 @@ code {
 
 .comp-path {
   font-weight: 600;
-  font-size: 0.74rem;
+  font-size: var(--t-meta);
 }
 
 .comp-purpose {
-  font-size: 0.72rem;
+  font-size: var(--t-micro);
   color: #c8ccd0;
 }
 
 /* The routing key: what an incident's words are actually matched against. */
 .comp-symptoms {
-  font-size: 0.7rem;
+  font-size: var(--t-micro);
   color: var(--lcars-tan, #d69a78);
 }
 
@@ -2617,7 +2693,7 @@ code {
   flex-wrap: wrap;
   gap: 0.4rem;
   align-items: baseline;
-  font-size: 0.72rem;
+  font-size: var(--t-micro);
 }
 
 /* One line per commit, the summary behind a click. A hundred paragraphs is not a list: the
@@ -2639,7 +2715,7 @@ code {
   gap: 0.5rem;
   align-items: baseline;
   padding: 0.3rem 0.4rem;
-  font-size: 0.72rem;
+  font-size: var(--t-micro);
   cursor: pointer;
   white-space: nowrap;
   overflow: hidden;
@@ -2652,7 +2728,7 @@ code {
 .rd-caret {
   flex: 0 0 0.7rem;
   color: #9aa0a6;
-  font-size: 0.6rem;
+  font-size: var(--t-micro);
 }
 
 .rd-date {
@@ -2699,7 +2775,7 @@ code {
 }
 
 .commit-summary {
-  font-size: 0.72rem;
+  font-size: var(--t-micro);
   line-height: 1.5;
   color: #c8ccd0;
   margin-top: 0.15rem;
@@ -2725,7 +2801,7 @@ code {
 
 .repo-head {
   padding: 0.3rem 0.6rem;
-  font-size: 0.6rem;
+  font-size: var(--t-micro);
   letter-spacing: 0.1em;
   color: #9aa0a6;
   border-bottom: 1px solid rgba(255, 255, 255, 0.12);
@@ -2784,7 +2860,7 @@ code {
    competing with the rows in it. */
 .kind-head {
   padding: 0.5rem 0.6rem 0.2rem;
-  font-size: 0.6rem;
+  font-size: var(--t-micro);
   letter-spacing: 0.14em;
   color: var(--lcars-tan, #d69a78);
 }
@@ -2806,7 +2882,7 @@ code {
   color: #9aa0a6;
   border: 1px solid rgba(255, 255, 255, 0.14);
   border-radius: 0.3rem;
-  font-size: 0.62rem;
+  font-size: var(--t-micro);
   padding: 0.1rem 0.2rem;
   font-family: inherit;
 }
@@ -2836,7 +2912,7 @@ code {
 
 .agent-repo {
   font-weight: 600;
-  font-size: 0.74rem;
+  font-size: var(--t-meta);
 }
 
 /* Capped and scrolled: an agent can emit hundreds of lines, and a panel that grows without
@@ -2845,7 +2921,7 @@ code {
   max-height: 26rem;
   overflow-y: auto;
   padding: 0.4rem 0.7rem 0.6rem;
-  font-size: 0.72rem;
+  font-size: var(--t-micro);
 }
 
 .ac {
@@ -2857,7 +2933,7 @@ code {
 
 .ac-label {
   flex: 0 0 4.5rem;
-  font-size: 0.58rem;
+  font-size: var(--t-micro);
   letter-spacing: 0.1em;
   color: #9aa0a6;
   text-align: right;
@@ -2907,7 +2983,7 @@ code {
   flex-wrap: wrap;
   gap: 0.4rem;
   align-items: center;
-  font-size: 0.66rem;
+  font-size: var(--t-micro);
 }
 
 .diff-block {
@@ -2921,7 +2997,7 @@ code {
   padding: 0.35rem 0.5rem;
   background: rgba(255, 255, 255, 0.04);
   border-left: 2px solid var(--lcars-tan, #d69a78);
-  font-size: 0.72rem;
+  font-size: var(--t-micro);
   color: #c8ccd0;
 }
 
@@ -2941,7 +3017,7 @@ code {
 
 .diff-error {
   color: #f28b82;
-  font-size: 0.68rem;
+  font-size: var(--t-micro);
 }
 
 .diff-file-head {
@@ -2950,7 +3026,7 @@ code {
   align-items: baseline;
   padding: 0.12rem 0;
   cursor: pointer;
-  font-size: 0.68rem;
+  font-size: var(--t-micro);
 }
 
 .diff-file-head:hover {
@@ -2974,7 +3050,7 @@ code {
   background: rgba(0, 0, 0, 0.25);
   border-radius: 0.3rem;
   padding: 0.3rem 0.4rem;
-  font-size: 0.64rem;
+  font-size: var(--t-micro);
   line-height: 1.35;
 }
 
@@ -3031,7 +3107,7 @@ code {
   border-left-width: 3px;
   border-radius: 12px;
   background: var(--surface-2);
-  font-size: 12px;
+  font-size: var(--t-meta);
 }
 /* In-flight rows read as live; finished ones recede rather than disappear, so a
    failure or a duplicate is still legible after the fact. */
@@ -3053,7 +3129,7 @@ code {
 .dispatch-state {
   font-weight: 700;
   letter-spacing: 0.06em;
-  font-size: 11px;
+  font-size: var(--t-micro);
   min-width: 92px;
 }
 .ds-queued {
@@ -3104,7 +3180,7 @@ code {
   gap: 6px;
   padding: 1px 8px;
   border-radius: var(--pill);
-  font-size: 10px;
+  font-size: var(--t-micro);
   font-weight: 700;
   letter-spacing: 0.08em;
 }
@@ -3138,49 +3214,49 @@ code {
   margin-bottom: 0.8rem;
 }
 .attempts-panel .attempt-title {
-  font-size: 1rem;
+  font-size: var(--t-title);
 }
 .attempts-panel .attempt-ref {
-  font-size: 0.9rem;
+  font-size: var(--t-body);
 }
 .attempts-panel .verdict,
 .attempts-panel .attempt-conf,
 .attempts-panel .attempt-author {
-  font-size: 0.8rem;
+  font-size: var(--t-body);
 }
 .attempts-panel .attempt-row {
-  font-size: 0.92rem;
+  font-size: var(--t-body);
   line-height: 1.5;
   margin-top: 0.45rem;
 }
 .attempts-panel .attempt-key {
   flex: 0 0 6.5rem;
-  font-size: 0.72rem;
+  font-size: var(--t-micro);
   padding-top: 0.2rem;
 }
 .attempts-panel .attempt-foot {
-  font-size: 0.75rem;
+  font-size: var(--t-meta);
   margin-top: 0.5rem;
 }
 .attempts-panel .explain-label,
 .attempts-panel .diff-head {
-  font-size: 0.8rem;
+  font-size: var(--t-body);
 }
 .attempts-panel .diff-summary {
-  font-size: 0.92rem;
+  font-size: var(--t-body);
   line-height: 1.55;
   padding: 0.55rem 0.7rem;
   margin: 0.45rem 0 0.6rem;
 }
 .attempts-panel .diff-file-head {
-  font-size: 0.85rem;
+  font-size: var(--t-body);
   padding: 0.2rem 0;
 }
 /* The patch is the thing being read, and it is monospace: below ~0.8rem a unified diff
    stops being legible and becomes a texture. Taller too — an unfolded patch that scrolls
    inside 22rem defeats the point of unfolding it. */
 .attempts-panel .diff-patch {
-  font-size: 0.82rem;
+  font-size: var(--t-body);
   line-height: 1.5;
   max-height: 46rem;
   padding: 0.5rem 0.7rem;
@@ -3261,7 +3337,7 @@ select[data-tip],
 .rec {
   padding: 0.05rem 0.4rem;
   border-radius: 0.5rem;
-  font-size: 0.6rem;
+  font-size: var(--t-micro);
   font-weight: 700;
   letter-spacing: 0.08em;
   color: #10100f;
@@ -3284,7 +3360,7 @@ select[data-tip],
   background: rgba(255, 255, 255, 0.035);
   border-left: 3px solid var(--line-strong);
   border-radius: 0 0.5rem 0.5rem 0;
-  font-size: 0.75rem;
+  font-size: var(--t-meta);
   line-height: 1.45;
 }
 .rec-border-approve {
@@ -3306,7 +3382,7 @@ select[data-tip],
   border-left: 2px solid var(--line-strong);
   border-radius: 0 0.4rem 0.4rem 0;
   background: rgba(255, 255, 255, 0.04);
-  font-size: 0.72rem;
+  font-size: var(--t-micro);
   line-height: 1.45;
 }
 /* Inline notes sit inside the monospace patch box, so they have to opt back out of `pre`
@@ -3320,7 +3396,7 @@ select[data-tip],
 }
 .note-sev {
   flex: 0 0 auto;
-  font-size: 0.58rem;
+  font-size: var(--t-micro);
   font-weight: 700;
   letter-spacing: 0.08em;
 }
@@ -3354,17 +3430,17 @@ select[data-tip],
 
 /* Click-in view: the review is prose to read, at the same size as the rest of it. */
 .attempts-panel .review-rationale {
-  font-size: 0.92rem;
+  font-size: var(--t-body);
   line-height: 1.55;
   padding: 0.55rem 0.7rem;
 }
 .attempts-panel .review-note {
-  font-size: 0.88rem;
+  font-size: var(--t-body);
   padding: 0.4rem 0.6rem;
 }
 .attempts-panel .note-sev {
-  font-size: 0.68rem;
+  font-size: var(--t-micro);
 }
 .attempts-panel .rec {
-  font-size: 0.72rem;
+  font-size: var(--t-micro);
 }

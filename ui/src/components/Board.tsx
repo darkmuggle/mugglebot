@@ -1,290 +1,193 @@
 import { createMemo, createSignal, For, type JSX, Show } from "solid-js";
 import { api } from "../api";
-import { entityHref } from "../entities";
-import { AttentionBadge } from "./Attention";
-import { renderMarkdown } from "../markdown";
-import Attempt, { prKey } from "./Attempt";
-import { dispatchesFor, isBusy, patchHandled, subjects } from "../state";
-import {
-  SEVERITY_RANK,
-  type Explanation,
-  type PrFix,
-  type Signal,
-  type SubjectView,
-} from "../types";
-import { SignalModal } from "./SignalModal";
+import { isBusy, patchHandled, subjects } from "../state";
+import type { Signal, SubjectView } from "../types";
 
-function sources(t: SubjectView): string[] {
-  return [...new Set(t.signals.map((s) => s.source))];
+/// The three lanes, in the order an operator works them.
+///
+/// This replaces sorting by a numeric attention score. The score was the right idea
+/// with the wrong output: on a real board every subject scores identically — same
+/// severity, same `needed`, same reason — so the resulting order is one the operator
+/// cannot account for. A lane is a claim you can check instead: *something is asking
+/// me now*, *this is mine to schedule*, *nothing here wants me*.
+type Lane = "decide" | "mine" | "clear";
+
+const LANES: { id: Lane; label: string; empty: string }[] = [
+  { id: "decide", label: "Decide", empty: "Nothing is waiting on you." },
+  { id: "mine", label: "On your plate", empty: "Nothing assigned to you." },
+  { id: "clear", label: "Nothing to do", empty: "" },
+];
+
+/// Signals still standing. `upstream_gone` is the reconciler reporting that the
+/// notification cleared upstream, so a review that has since been answered must not
+/// hold a subject in Decide for ever.
+function standing(t: SubjectView): Signal[] {
+  return t.signals.filter((s) => !s.upstream_gone);
 }
 
-/// Member signals newest-first — the topic section lists them as event rows.
-function events(t: SubjectView): Signal[] {
-  return [...t.signals].sort((a, b) =>
-    b.occurred_at.localeCompare(a.occurred_at),
+/// Which lane a subject belongs in, ranked by who is blocked.
+///
+/// A flag or a failure is asking right now; a review request or a mention is asking
+/// *you* specifically; an assignment is yours to schedule. Acknowledging something
+/// is a statement that it no longer needs deciding, so it leaves Decide — that is
+/// what the operator meant by pressing the button.
+function lane(t: SubjectView): Lane {
+  if (t.handled === "acknowledged" || !t.attention.needed) return "clear";
+  if (t.severity === "critical" || t.severity === "warning") return "decide";
+  const kinds = new Set(standing(t).map((s) => s.kind));
+  if (
+    kinds.has("review_requested") ||
+    kinds.has("mention") ||
+    kinds.has("ci_failure")
+  ) {
+    return "decide";
+  }
+  if (kinds.has("assigned")) return "mine";
+  return "clear";
+}
+
+const KIND_LABEL: Record<SubjectView["rank"], string> = {
+  issue: "Issue",
+  pull_request: "PR",
+  slack_thread: "Slack",
+};
+
+/// The title with what the row already says stripped out of it.
+///
+/// GitHub notification titles arrive as `PR: Restate-cloud image bump to PR1200
+/// (restatedev/nuon-byoc#140)` — a kind the kind column now shows, and a reference
+/// the ref chip now shows. Printing all three was three copies of the same fact.
+export function displayTitle(t: SubjectView): string {
+  let title = t.title.replace(/^(pull request|issue|pr)\s*:\s*/i, "");
+  const num = t.key.match(/[#!~](\d+)$/)?.[1];
+  if (num) {
+    // Only a parenthetical naming *this* subject; one naming a different issue is
+    // information the operator wants.
+    title = title.replace(
+      new RegExp(`\\s*\\([^()]*[#!~]${num}\\)\\s*$`, "i"),
+      "",
+    );
+  }
+  return title.trim() || t.title;
+}
+
+/// The compact upstream reference: `nuon-byoc#140`. The key's `!` and `~` encode
+/// rank for the router's benefit; a human reads every GitHub artifact as `#`.
+export function ref(t: SubjectView): string {
+  const m = t.key.match(/^(?:[^/]+)\/([^/#!~]+)[#!~](\d+)$/);
+  return m ? `${m[1]}#${m[2]}` : t.key;
+}
+
+/// Who last moved this, and how much there is of it.
+function provenance(t: SubjectView): string {
+  const actor = [...t.signals]
+    .sort((a, b) => b.occurred_at.localeCompare(a.occurred_at))
+    .find((s) => s.actor)?.actor;
+  const n = t.signals.length;
+  const events = `${n} event${n === 1 ? "" : "s"}`;
+  return actor ? `${actor} · ${events}` : events;
+}
+
+/// Coarse relative time. On a row the question is "is this today's problem", not
+/// which second it landed — the exact timestamp is one hover away.
+function ago(iso: string): string {
+  const mins = Math.round((Date.now() - new Date(iso).getTime()) / 60000);
+  if (mins < 1) return "now";
+  if (mins < 60) return `${mins}m`;
+  const hours = Math.round(mins / 60);
+  if (hours < 24) return `${hours}h`;
+  const days = Math.round(hours / 24);
+  return days < 7 ? `${days}d` : `${Math.round(days / 7)}w`;
+}
+
+/// One subject as one row: what it is, what it wants, who moved it, when.
+///
+/// Everything this used to also render — the summary, every member event, the tags,
+/// the attempts, both explanations, the AI facet strip — is in the click-in view
+/// already. Printing it here as well cost 533px a subject and put one card on the
+/// screen at a time, which is not a board.
+function Row(props: {
+  t: SubjectView;
+  onOpen: (key: string) => void;
+  /// Triage the focused row from the keyboard. Working a lane shouldn't mean
+  /// travelling to a button on every row.
+  onKey?: (t: SubjectView, key: string) => void;
+  actions: (t: SubjectView) => JSX.Element;
+}) {
+  const t = () => props.t;
+  const open = () => props.onOpen(t().key);
+  return (
+    <div
+      class={`lane-row rank-${t().rank}`}
+      classList={{
+        acked: t().handled === "acknowledged",
+        dim: t().handled === "resolved" || t().handled === "snoozed",
+        live: t().live,
+      }}
+      role="button"
+      tabindex="0"
+      onClick={open}
+      onKeyDown={(e) => {
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          open();
+          return;
+        }
+        props.onKey?.(t(), e.key);
+      }}
+    >
+      <span class="row-kind">{KIND_LABEL[t().rank]}</span>
+      <span class="row-mid">
+        <span class="row-titleline">
+          <span class="row-title">{displayTitle(t())}</span>
+          <span class="row-ref">{ref(t())}</span>
+          <Show when={t().live}>
+            <span class="badge badge-live">live</span>
+          </Show>
+          <Show when={isBusy(t().key)}>
+            <span class="badge badge-ai" data-tip="an AI pass is running or queued">
+              <span class="thinking-dots">
+                <i />
+                <i />
+                <i />
+              </span>
+            </span>
+          </Show>
+        </span>
+        {/* The one line the board is for. A subject with no usable summary says so
+            rather than showing a truncated event body dressed as a conclusion. */}
+        <Show
+          when={t().headline}
+          fallback={<span class="row-headline none">Not summarised yet</span>}
+        >
+          <span class="row-headline">{t().headline}</span>
+        </Show>
+      </span>
+      <span class="row-who">{provenance(t())}</span>
+      <time class="row-when" data-tip={new Date(t().updated_at).toLocaleString()}>
+        {ago(t().updated_at)}
+      </time>
+      <span class="row-actions" onClick={(e) => e.stopPropagation()}>
+        {props.actions(t())}
+      </span>
+    </div>
   );
 }
 
-/// True when an event carries content beyond its title, so a pop-out is useful.
-function hasDetails(s: Signal): boolean {
-  const body = (s.body ?? "").trim();
-  return !!body && body !== (s.title ?? "").trim();
-}
-
-/// Higher = more deserving of attention now: severity, lifted a little when live,
-/// pushed down once triaged (acknowledged) or snoozed.
-function attention(t: SubjectView): number {
-  let score = SEVERITY_RANK[t.severity];
-  if (t.live) score += 0.5;
-  if (t.handled === "acknowledged") score -= 1.5;
-  if (t.handled === "snoozed") score -= 3;
-  return score;
-}
-
-/// Triage is one call on the subject now. Each of these used to loop over every
-/// member signal, because handled-ness was per signal and a thread was only as
-/// handled as its least-handled member.
+/// Triage is one call on the subject: patch the store the board renders so it feels
+/// instant, then tell the backend, which rebroadcasts the authoritative board.
 async function triage(t: SubjectView, handled: "acknowledged" | "snoozed") {
-  patchHandled(t.key, handled); // instant, in the store the board renders
+  patchHandled(t.key, handled);
   await api.setHandled(t.key, handled).catch(() => {});
 }
 
 /// Bring handled work back onto the board, fully open.
 ///
-/// This used to set `acknowledged`, which is *still handled* — so un-snoozing something left it
-/// muted and there was no way back to open at all. Un-handling means un-handled; if the operator
-/// wants it sunk in the ranking again, ACK is right there.
-///
-/// The backend rebroadcasts the active board, so it reappears in the live store on its own.
+/// Un-handling means un-handled. This used to set `acknowledged`, which is *still
+/// handled*, so un-snoozing left the subject muted with no way back to open at all.
 async function reopen(t: SubjectView) {
   patchHandled(t.key, "open");
   await api.setHandled(t.key, "open").catch(() => {});
-}
-
-/// A single event within a topic: a compact meta line (source, actor, time,
-/// state, link-out) and a one-line title. The full body stays behind a pop-out
-/// so a busy card doesn't unfurl hundreds of lines of alert text. Clicking the
-/// row opens that pop-out; clicking a link does not.
-function EventRow(props: { s: Signal; onDetails: () => void }) {
-  const s = () => props.s;
-  return (
-    <div
-      class={`event sev-${s().severity}`}
-      classList={{ acked: s().upstream_gone }}
-      onClick={props.onDetails}
-    >
-      <div class="event-meta">
-        <span class="dot" />
-        <span class={`src src-${s().source}`}>{s().source.toUpperCase()}</span>
-        <Show when={s().actor}>
-          <span class="event-actor">{s().actor}</span>
-        </Show>
-        <time>{new Date(s().occurred_at).toLocaleString()}</time>
-        <Show when={s().upstream_gone}>
-          <span class="state state-resolved">GONE</span>
-        </Show>
-        <Show when={s().url}>
-          <a
-            class="event-open"
-            href={s().url!}
-            target="_blank"
-            rel="noreferrer"
-            onClick={(ev) => ev.stopPropagation()}
-          >
-            open ↗
-          </a>
-        </Show>
-      </div>
-      <div class="event-line">
-        <span class="event-title">{s().title}</span>
-        <Show when={hasDetails(s())}>
-          <span class="event-details">details →</span>
-        </Show>
-      </div>
-    </div>
-  );
-}
-
-/// Has activity landed since this explanation was written?
-function staleExplanation(t: SubjectView, x: Explanation): boolean {
-  if (!t.signals.length) return false;
-  return t.signals[t.signals.length - 1].id !== x.watermark;
-}
-
-function Topic(props: {
-  t: SubjectView;
-  onOpen: (key: string) => void;
-  onDetails: (s: Signal) => void;
-  onExplain: (key: string) => void;
-  actions: (t: SubjectView) => JSX.Element;
-}) {
-  const t = () => props.t;
-  return (
-    <section
-      class={`topic sev-${t().severity}`}
-      classList={{
-        dim: t().handled === "resolved" || t().handled === "snoozed",
-        acked: t().handled === "acknowledged",
-        live: t().live,
-      }}
-    >
-      <div class="topic-bar" />
-      <div class="topic-main">
-        <header class="topic-head" onClick={() => props.onOpen(t().key)}>
-          <div class="topic-titleline">
-            <For each={sources(t())}>
-              {(src) => (
-                <span class={`src src-${src}`}>{src.toUpperCase()}</span>
-              )}
-            </For>
-            <span class="topic-title">{t().title}</span>
-            <Show when={t().live}>
-              <span class="live-badge">LIVE</span>
-            </Show>
-            {/* The board's half of the dispatch indicator: which cards have AI work in
-                flight, and which had one fail. The detail view carries the full strip —
-                here it is one badge, because a card is a list row and a failure the
-                operator can't see is worse than a card that is one glyph busier. */}
-            <Show when={isBusy(t().key)}>
-              <span
-                class="ai-badge ai-working"
-                data-tip="an AI pass is running or queued"
-              >
-                <span class="thinking-dots">
-                  <i />
-                  <i />
-                  <i />
-                </span>
-                AI
-              </span>
-            </Show>
-            <Show when={!isBusy(t().key) && lastFailure(t().key)}>
-              <span class="ai-badge ai-failed" data-tip={lastFailure(t().key)!}>
-                AI FAILED
-              </span>
-            </Show>
-          </div>
-          <div class="topic-meta">
-            <span class="kind">
-              {t().signals.length} EVENT{t().signals.length === 1 ? "" : "S"}
-            </span>
-            <time>{new Date(t().updated_at).toLocaleTimeString()}</time>
-          </div>
-          <AttentionBadge attention={t().attention} />
-        </header>
-
-        <Show when={t().summary}>
-          <div class="topic-summary">
-            <span class="topic-summary-label">SUMMARY</span>
-            <div class="md" innerHTML={renderMarkdown(t().summary!)} />
-          </div>
-        </Show>
-
-        <Show when={t().tags.length || t().keys.length}>
-          <div class="chips">
-            <For each={t().tags}>
-              {(tag) => <span class="chip tag">{tag}</span>}
-            </For>
-            <For each={t().keys.slice(0, 6)}>
-              {(e) => {
-                const href = entityHref(e);
-                return href ? (
-                  <a
-                    class="chip chip-link"
-                    href={href}
-                    target="_blank"
-                    rel="noreferrer"
-                    onClick={(ev) => ev.stopPropagation()}
-                  >
-                    {e.kind}:{e.value}
-                  </a>
-                ) : (
-                  <span class="chip">
-                    {e.kind}:{e.value}
-                  </span>
-                );
-              }}
-            </For>
-          </div>
-        </Show>
-
-        {/* Both explanations, each labelled by who wrote it. Local first — that one cost
-            nothing and is what MuggleBot actually concluded; a second opinion is only here
-            because someone asked for it, and reading it without knowing which is which
-            would defeat the purpose of having asked. */}
-        <For each={t().explanations}>
-          {(x) => (
-            <div
-              class="explain-panel"
-              classList={{ "explain-cloud": x.produced_by === "cloud" }}
-              onClick={(e) => e.stopPropagation()}
-            >
-              <div class="explain-head">
-                <span class="explain-label">
-                  {x.produced_by === "cloud" ? "2ND OPINION" : "EXPLANATION"}
-                </span>
-                <span class="chip model-chip" data-tip="which model wrote this">
-                  {x.produced_by === "cloud" ? "CLOUD" : "LOCAL"}
-                </span>
-                <For each={x.sources}>
-                  {(src) => (
-                    <span class="chip src-chip">{src.replace(/_/g, " ")}</span>
-                  )}
-                </For>
-                {/* An explanation built from an older watermark still describes what it
-                    described; saying so beats presenting it as current. */}
-                <Show when={staleExplanation(t(), x)}>
-                  <span
-                    class="chip chip-stale"
-                    data-tip="new activity has landed since this was written"
-                  >
-                    STALE
-                  </span>
-                </Show>
-              </div>
-              <div class="md" innerHTML={renderMarkdown(x.markdown)} />
-              {/* What the dossier check took out. Shown rather than swallowed: an
-                  explanation that had claims removed is one to read more carefully. */}
-              <Show when={x.removed.length}>
-                <div
-                  class="explain-removed"
-                  data-tip="removed because the dossier could not support it"
-                >
-                  <For each={x.removed}>{(r) => <div>— {r}</div>}</For>
-                </div>
-              </Show>
-            </div>
-          )}
-        </For>
-
-        {/* The attempts, nested under the problem. An issue whose PRs you have to click
-            through to see reads as an issue nobody is working on. */}
-        <Show when={t().pull_requests.length}>
-          <div class="attempts" onClick={(e) => e.stopPropagation()}>
-            <div class="attempts-label">
-              {t().pull_requests.length} ATTEMPT
-              {t().pull_requests.length === 1 ? "" : "S"}
-            </div>
-            <For each={t().pull_requests}>
-              {(pr) => (
-                <Attempt pr={pr} onExplain={() => props.onExplain(prKey(pr))} />
-              )}
-            </For>
-          </div>
-        </Show>
-
-        <div class="events">
-          <For each={events(t())}>
-            {(s) => <EventRow s={s} onDetails={() => props.onDetails(s)} />}
-          </For>
-        </div>
-
-        <div class="topic-actions" onClick={(e) => e.stopPropagation()}>
-          {props.actions(t())}
-        </div>
-      </div>
-    </section>
-  );
 }
 
 export default function Board(props: {
@@ -292,49 +195,32 @@ export default function Board(props: {
   // When set, show only threads carrying a signal from this source.
   sourceFilter?: string | null;
 }) {
-  // Resolved and snoozed subjects are handled — keep them off the main board (the
-  // backend already excludes them; this makes triage feel instant). A subject merged
-  // away forwards its activity to the canonical one, so it isn't a card either.
-  const ranked = createMemo(() =>
+  // Resolved and snoozed subjects are handled — off the main board (the backend
+  // already excludes them; doing it here too makes triage feel instant). A subject
+  // merged away forwards its activity to the canonical one, so it isn't a row either.
+  const active = createMemo(() =>
     Object.values(subjects)
       .filter(
         (t) =>
           t.handled !== "resolved" && t.handled !== "snoozed" && !t.same_as,
       )
       .filter(
-        (t) => !props.sourceFilter || sources(t).includes(props.sourceFilter),
-      )
-      .sort((a, b) => {
-        const att = attention(b) - attention(a);
-        if (att !== 0) return att;
-        return b.updated_at.localeCompare(a.updated_at);
-      }),
+        (t) =>
+          !props.sourceFilter ||
+          t.signals.some((s) => s.source === props.sourceFilter),
+      ),
   );
 
-  // Which subject is currently being explained, so the button can say so. The result
-  // arrives over the WebSocket when the workflow writes it, so there is nothing to
-  // await here beyond the submission.
-  const [explaining, setExplaining] = createSignal<string | null>(null);
-  const [explainNote, setExplainNote] = createSignal("");
+  // Within a lane, newest activity first. Predictable beats clever: the lane already
+  // carries the judgement, so the sort only has to be one the operator can predict.
+  const inLane = (id: Lane) =>
+    active()
+      .filter((t) => lane(t) === id)
+      .sort((a, b) => b.updated_at.localeCompare(a.updated_at));
 
-  const explain = async (key: string, secondOpinion = false) => {
-    setExplaining(key);
-    setExplainNote("");
-    try {
-      const r = await api.explain(key, secondOpinion);
-      const what = secondOpinion
-        ? "asking the cloud model about"
-        : "explaining";
-      // `submitted: false` means the key collided — nothing has changed since the last
-      // explanation, so the one already on the card *is* the answer. That is a success,
-      // and saying "already current" beats a spinner that never resolves.
-      setExplainNote(r.submitted ? `${what} ${key}…` : `${key}: ${r.note}`);
-    } catch (e) {
-      setExplainNote(`${key}: ${e}`);
-    } finally {
-      setExplaining(null);
-    }
-  };
+  const decideCount = createMemo(
+    () => active().filter((t) => lane(t) === "decide").length,
+  );
 
   // Handled subjects live outside the reconciled live store (the WS `board` event
   // would otherwise wipe them). Fetched on demand when the user reveals them.
@@ -357,11 +243,8 @@ export default function Board(props: {
     else setHandled([]);
   }
 
-  // The signal popped out in the detail modal (null = closed).
-  const [detail, setDetail] = createSignal<Signal | null>(null);
-
-  // Reset the board: delete persisted events and their derived board analysis.
-  // The authoritative `board` WS event reconciles the store on its own.
+  // Reset the board: delete persisted events and their derived analysis. The
+  // authoritative `board` WS event reconciles the store on its own.
   const [resetting, setResetting] = createSignal(false);
   async function resetBoard() {
     if (
@@ -381,99 +264,127 @@ export default function Board(props: {
     }
   }
 
+  const rowKey = (t: SubjectView, key: string) => {
+    if (key === "e") triage(t, "acknowledged");
+    if (key === "s") triage(t, "snoozed");
+  };
+
   return (
     <div class="board">
-      <div class="board-toolbar" onClick={(e) => e.stopPropagation()}>
-        <button
-          class="danger reset"
-          disabled={resetting()}
-          onClick={resetBoard}
-        >
-          {resetting() ? "RESETTING…" : "RESET BOARD"}
-        </button>
+      <div class="board-head">
+        <h1 class="board-title">Board</h1>
+        <span class="board-counts">
+          {active().length} open
+          <Show when={decideCount()}>
+            {" · "}
+            <b>{decideCount()} to decide</b>
+          </Show>
+          <Show when={props.sourceFilter}>
+            {" · "}
+            {props.sourceFilter}
+          </Show>
+        </span>
+        <span class="board-spacer" />
         <button classList={{ on: showHandled() }} onClick={toggleHandled}>
-          {showHandled() ? "HIDE HANDLED" : "SHOW HANDLED"}
+          {showHandled() ? "Hide handled" : "Show handled"}
         </button>
-        <Show when={explainNote()}>
-          <span class="muted board-note">{explainNote()}</span>
-        </Show>
         <Show when={showHandled()}>
-          <button onClick={loadHandled}>REFRESH</button>
+          <button onClick={loadHandled}>Refresh</button>
         </Show>
+        <button class="danger" disabled={resetting()} onClick={resetBoard}>
+          {resetting() ? "Resetting…" : "Reset board"}
+        </button>
       </div>
 
       <Show
-        when={ranked().length}
+        when={active().length}
         fallback={
           <div class="empty">
             {props.sourceFilter
-              ? `NO ${props.sourceFilter.toUpperCase()} THREADS`
-              : "AWAITING SIGNALS…"}
+              ? `Nothing from ${props.sourceFilter}.`
+              : "Awaiting signals…"}
           </div>
         }
       >
-        <For each={ranked()}>
-          {(t) => (
-            <Topic
-              t={t}
-              onOpen={props.onOpen}
-              onDetails={setDetail}
-              onExplain={explain}
-              actions={(t) => (
-                <>
-                  <button onClick={() => props.onOpen(t.key)}>OPEN</button>
-                  {/* On an issue this explains the whole situation — its events, every
-                      PR attempting it with the critiques and review conversations, the
-                      proposed causes, the triage. On a PR, just that change. */}
-                  <button
-                    disabled={explaining() === t.key}
-                    data-tip="Distil this and everything under it, on the local model"
-                    onClick={() => explain(t.key)}
-                  >
-                    {explaining() === t.key ? "EXPLAINING…" : "EXPLAIN"}
-                  </button>
-                  {/* An acked card is still on the board, so it needs the way back — before
-                      this, ACK on an already-acked card did nothing and there was no un-ack. */}
+        <For each={LANES}>
+          {(l) => {
+            const rows = createMemo(() => inLane(l.id));
+            return (
+              // A lane with nothing in it is worth one line — "nothing is waiting on
+              // you" is the answer to the question the board was opened to ask.
+              <Show when={rows().length || l.empty}>
+                <section class={`lane lane-${l.id}`}>
+                  <h2 class="lane-head">
+                    {l.label}
+                    <Show when={rows().length}>
+                      <span class="lane-count">{rows().length}</span>
+                    </Show>
+                  </h2>
                   <Show
-                    when={t.handled === "acknowledged"}
-                    fallback={
-                      <button onClick={() => triage(t, "acknowledged")}>
-                        ACK
-                      </button>
-                    }
+                    when={rows().length}
+                    fallback={<p class="lane-empty">{l.empty}</p>}
                   >
-                    <button class="cloud-btn" onClick={() => reopen(t)}>
-                      UN-ACK
-                    </button>
+                    <For each={rows()}>
+                      {(t) => (
+                        <Row
+                          t={t}
+                          onOpen={props.onOpen}
+                          onKey={rowKey}
+                          actions={(t) => (
+                            <>
+                              <Show
+                                when={t.handled === "acknowledged"}
+                                fallback={
+                                  <button
+                                    data-tip="Acknowledge — keeps it on the board, out of Decide (e)"
+                                    onClick={() => triage(t, "acknowledged")}
+                                  >
+                                    Ack
+                                  </button>
+                                }
+                              >
+                                <button onClick={() => reopen(t)}>Un-ack</button>
+                              </Show>
+                              <button
+                                data-tip="Snooze — off the board until it moves (s)"
+                                onClick={() => triage(t, "snoozed")}
+                              >
+                                Snooze
+                              </button>
+                            </>
+                          )}
+                        />
+                      )}
+                    </For>
                   </Show>
-                  <button onClick={() => triage(t, "snoozed")}>SNOOZE</button>
-                </>
-              )}
-            />
-          )}
+                </section>
+              </Show>
+            );
+          }}
         </For>
       </Show>
 
       <Show when={showHandled()}>
-        <div class="board-section">HANDLED</div>
-        <Show
-          when={handled().length}
-          fallback={<div class="empty">NO HANDLED THREADS</div>}
-        >
-          <For each={handled()}>
-            {(t) => (
-              <Topic
-                t={t}
-                onOpen={props.onOpen}
-                onDetails={setDetail}
-                onExplain={explain}
-                actions={(t) => (
-                  <>
-                    <button onClick={() => props.onOpen(t.key)}>OPEN</button>
-                    {/* Named for what it undoes, so the operator can see which state they are
-                        leaving rather than reading "REOPEN" against three different ones. */}
+        <section class="lane">
+          <h2 class="lane-head">
+            Handled
+            <Show when={handled().length}>
+              <span class="lane-count">{handled().length}</span>
+            </Show>
+          </h2>
+          <Show
+            when={handled().length}
+            fallback={<p class="lane-empty">Nothing handled yet.</p>}
+          >
+            <For each={handled()}>
+              {(t) => (
+                <Row
+                  t={t}
+                  onOpen={props.onOpen}
+                  actions={(t) => (
+                    // Named for what it undoes, so the operator can see which state
+                    // they are leaving rather than reading "Reopen" against three.
                     <button
-                      class="cloud-btn"
                       onClick={async () => {
                         await reopen(t);
                         setHandled((prev) =>
@@ -481,35 +392,15 @@ export default function Board(props: {
                         );
                       }}
                     >
-                      {t.handled === "snoozed"
-                        ? "UN-SNOOZE"
-                        : t.handled === "resolved"
-                          ? "UN-RESOLVE"
-                          : "REOPEN"}
+                      {t.handled === "snoozed" ? "Un-snooze" : "Un-resolve"}
                     </button>
-                  </>
-                )}
-              />
-            )}
-          </For>
-        </Show>
-      </Show>
-
-      <Show when={detail()}>
-        {(s) => <SignalModal signal={s()} onClose={() => setDetail(null)} />}
+                  )}
+                />
+              )}
+            </For>
+          </Show>
+        </section>
       </Show>
     </div>
   );
-}
-
-/// The most recent failed dispatch's message for a subject, if the last thing that
-/// happened was a failure.
-///
-/// Only the *latest* row counts: a failure that has since been retried successfully is
-/// history, and a card that keeps flagging it would train the operator to ignore the
-/// badge.
-function lastFailure(key: string): string | null {
-  const latest = dispatchesFor(key)[0];
-  if (!latest || latest.state !== "failed") return null;
-  return latest.detail ?? "an AI pass failed";
 }

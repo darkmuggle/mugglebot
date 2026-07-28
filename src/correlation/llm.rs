@@ -145,9 +145,19 @@ impl Analyst {
             .summarize_thread(&view, &grounding, reasoner, is_override)
             .await
         {
-            Ok(summary) if !summary.trim().is_empty() => {
+            // A summary that echoed its own instructions back, or pasted the evidence it
+            // was given, is a failed pass — not content. Storing it means the board prints
+            // the prompt template at the operator and `last_reasoned_at` claims the subject
+            // has been summarized, so nothing ever retries it.
+            Ok(summary) if crate::subject::is_usable_summary(&summary) => {
                 self.store
                     .set_subject_summary(subject_key, summary.trim(), Utc::now())?;
+            }
+            Ok(summary) if !summary.trim().is_empty() => {
+                warn!(
+                    "subject {subject_key}: summary rejected (echoed the prompt or the evidence): {}",
+                    summary.chars().take(120).collect::<String>()
+                );
             }
             Ok(_) => {}
             Err(e) if is_override => {
@@ -634,10 +644,15 @@ impl Analyst {
         };
         let system = "You are MuggleBot, an ops-awareness assistant. Summarize a correlated subject \
              for an on-call engineer as concise, readable Markdown — never a single dense paragraph. \
-             Use exactly these three short labeled sections, each 1-2 sentences and separated by blank \
+             Open with **Headline:** — ONE sentence, at most 120 characters, plain prose with no \
+             citations, saying what the state is and what it wants from the reader. The board shows \
+             only this line, so it must stand alone. Then use exactly these three short labeled \
+             sections, each 1-2 sentences and separated by blank \
              lines: **Status:** (current outcome, including whether a later success cleared a failure), \
              **Impact:** (blast radius), and **Next:** (what to do now, or explicitly say no action is \
-             needed). Cite the evidence you use inline by id in brackets — signals as [sig:ID], grounding \
+             needed). Write the sections out — never repeat these instructions or the parenthesised \
+             descriptions of them back, and never copy the evidence lines verbatim. \
+             Cite the evidence you use inline by id in brackets — signals as [sig:ID], grounding \
              as [mem:ID] or [ctx:ID], dashboard readings as [browser:ID], and suspected causes as \
              [cause:REF]. A suspected cause is a hypothesis with a confidence, not a fact: report it as \
              one (\"likely\", \"possibly\") and never state it as the confirmed cause. Do not invent \

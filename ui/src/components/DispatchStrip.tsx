@@ -5,7 +5,7 @@ import type { Dispatch, DispatchState } from "../types";
 /// What the AI is doing for one subject, right now.
 ///
 /// Every expensive pass is submitted and returns immediately, so pressing INVESTIGATE or
-/// 2ND OPINION used to do nothing visible: the work was queued behind a concurrency
+/// Second opinion used to do nothing visible: the work was queued behind a concurrency
 /// limit, or refused as a duplicate because the same key already ran, or it failed inside
 /// the handler — and all three looked like a button that flashed.
 ///

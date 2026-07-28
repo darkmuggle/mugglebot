@@ -29,6 +29,7 @@ import type {
 } from "../types";
 import { AttentionBadge } from "./Attention";
 import Attempt, { prKey } from "./Attempt";
+import { displayTitle, ref } from "./Board";
 import DiffPane from "./DiffPane";
 import DispatchStrip from "./DispatchStrip";
 import { SignalModal, signalHref } from "./SignalModal";
@@ -388,17 +389,53 @@ export default function SubjectDetail(props: {
   const other = (e: Edge) =>
     e.subject_a === props.id ? e.subject_b : e.subject_a;
 
+  const [allRelations, setAllRelations] = createSignal(false);
+
+  /// Which related subjects are worth the reader's attention, and which are behind
+  /// "N more".
+  ///
+  /// This panel used to render every non-distinct edge — ten of them on a normal
+  /// subject, each an LLM guess at 80-95% confidence with a rationale along the lines
+  /// of "both deal with Restate Cloud", several pointing at subjects that are off the
+  /// board anyway. Ten equally-weighted maybes is not a graph, it's a haystack.
+  ///
+  /// Ranked by how much the link is worth acting on: a human pin beats a machine
+  /// guess, `same` beats `related`, and a target you can actually open beats one that
+  /// has been resolved or merged away.
+  const relations = createMemo(() => {
+    const t = thread();
+    const edges = (t?.edges ?? [])
+      .filter((e) => e.kind !== "distinct")
+      .sort((a, b) => rank(b) - rank(a));
+    return allRelations()
+      ? { shown: edges, hidden: [] as Edge[] }
+      : { shown: edges.slice(0, 3), hidden: edges.slice(3) };
+  });
+
+  function rank(e: Edge): number {
+    let score = e.confidence;
+    if (e.provenance === "user") score += 10; // a decision, not a guess
+    if (e.kind === "same") score += 2;
+    if (subjects[other(e)]) score += 1; // still on the board, so still actionable
+    return score;
+  }
+
   return (
     <div class="detail">
       <div class="detail-head">
         <button class="back" onClick={props.onBack}>
-          ‹ BOARD
+          ‹ Board
         </button>
         <Show
           when={thread()}
           fallback={<span class="muted">thread not found (merged?)</span>}
         >
-          <h2 class={`sev-text-${thread()!.severity}`}>{thread()!.title}</h2>
+          {/* Same treatment as a board row: the kind and the reference come out of the
+              title string, where GitHub sends them as a prefix and a parenthetical. */}
+          <h2 class={`sev-text-${thread()!.severity}`}>
+            {displayTitle(thread()!)}
+          </h2>
+          <span class="detail-ref">{ref(thread()!)}</span>
           <AttentionBadge attention={thread()!.attention} />
         </Show>
       </div>
@@ -412,7 +449,7 @@ export default function SubjectDetail(props: {
         {(t) => (
           <div class="detail-grid">
             <section class="panel">
-              <h3>SUMMARY</h3>
+              <h3>Summary</h3>
               <Show when={reconsidering()}>
                 <div class="reconsidering">
                   <span class="thinking-dots">
@@ -439,7 +476,7 @@ export default function SubjectDetail(props: {
               <Show when={awaitingSecond()}>
                 <div class="explain-panel explain-cloud">
                   <div class="explain-head">
-                    <span class="explain-label">2ND OPINION</span>
+                    <span class="explain-label">Second opinion</span>
                     <span class="chip model-chip">CLOUD</span>
                     <span class="muted">
                       reading the same dossier — this takes tens of seconds and
@@ -457,8 +494,8 @@ export default function SubjectDetail(props: {
                     <div class="explain-head">
                       <span class="explain-label">
                         {x.produced_by === "cloud"
-                          ? "2ND OPINION"
-                          : "EXPLANATION"}
+                          ? "Second opinion"
+                          : "Explanation"}
                       </span>
                       <span
                         class="chip model-chip"
@@ -508,7 +545,7 @@ export default function SubjectDetail(props: {
                 {(report) => (
                   <div class="scores">
                     <div class="explain-head">
-                      <span class="explain-label">LIKELY LOCATION</span>
+                      <span class="explain-label">Likely location</span>
                       <Show when={report().origin_repo}>
                         <span class="chip">
                           filed in {report().origin_repo}
@@ -649,197 +686,227 @@ export default function SubjectDetail(props: {
                       : "tags (auto)"}
                 </button>
               </div>
-              <div class="model-bar">
-                <select
-                  value={provider()}
-                  onChange={(e) => setProvider(e.currentTarget.value)}
-                >
-                  <For each={PROVIDERS}>
-                    {(p) => <option value={p.id}>{p.label}</option>}
-                  </For>
-                </select>
-                <select
-                  value={model()}
-                  // Only truly disabled when we have no list at all. A refetch
-                  // (see onFocus) sets `models.loading` while keeping the prior
-                  // value, so we stay enabled and don't collapse the open dropdown.
-                  disabled={!models()?.length}
-                  onFocus={() => refetchModels()}
-                  onChange={(e) => setModel(e.currentTarget.value)}
-                >
-                  <Show
-                    when={models()?.length}
-                    fallback={
-                      <option>
-                        {models.loading
-                          ? "loading…"
-                          : models.error
-                            ? "unavailable"
-                            : "no models"}
-                      </option>
-                    }
-                  >
-                    <For each={models()}>
-                      {(m) => <option value={m}>{m}</option>}
-                    </For>
-                  </Show>
-                </select>
-              </div>
+              {/* Triage first and on its own, then everything the AI can be asked to
+                  do, behind one disclosure.
+
+                  This was eleven identically-weighted buttons and two model selects in
+                  a single wrapped row: ACK SNOOZE RECONSIDER WHERE? EXPLAIN Second opinion
+                  DRAFT POSTMORTEM SAVE AS MEMORY OPEN IN CHAT. Nothing said which one
+                  the operator wanted, which cost money, or which two did nearly the
+                  same thing. Triage is the decision this screen exists to support, so
+                  it gets the primary button; the analyses are a menu that names its own
+                  cost. */}
               <div class="thread-actions">
-                {/* Triage lives here as well as on the board. Deciding to ack or snooze is
-                    usually what you do *after* reading the detail, and having to go back to the
-                    board to do it meant leaving the thing you were judging. */}
                 <Show
                   when={isHandled()}
                   fallback={
                     <>
                       <button
+                        class="primary"
                         disabled={busy() !== ""}
                         onClick={() => setHandled("acknowledged")}
                       >
-                        ACK
+                        Ack
                       </button>
                       <button
                         disabled={busy() !== ""}
                         onClick={() => setHandled("snoozed")}
                       >
-                        SNOOZE
+                        Snooze
                       </button>
                     </>
                   }
                 >
-                  {/* Named for what it undoes, as on the board — "REOPEN" against three
-                      different states tells you nothing about which one you are leaving. */}
+                  {/* Named for what it undoes — "Reopen" against three different states
+                      tells you nothing about which one you are leaving. */}
                   <button
-                    class="cloud-btn"
+                    class="primary"
                     disabled={busy() !== ""}
                     onClick={() => setHandled("open")}
                   >
                     {thread()?.handled === "snoozed"
-                      ? "UN-SNOOZE"
+                      ? "Un-snooze"
                       : thread()?.handled === "resolved"
-                        ? "UN-RESOLVE"
-                        : "UN-ACK"}
+                        ? "Un-resolve"
+                        : "Un-ack"}
                   </button>
                 </Show>
-                <button
-                  disabled={busy() !== ""}
-                  data-tip="Re-run the LLM analysis on the selected model"
-                  onClick={() =>
-                    run(
-                      "reanalyze",
-                      () =>
-                        api.tool("reanalyze", {
-                          subject_key: props.id,
-                          provider: provider(),
-                          model: model() || undefined,
-                        }),
-                      true,
-                    )
-                  }
-                >
-                  {busy() === "reanalyze" ? "RECONSIDERING…" : "RECONSIDER"}
-                </button>
-                {/* One pass over everything under this subject: its events, every PR
-                    attempting it with the critique and what reviewers said, the
-                    proposed causes, the triage, the attached context. On a PR it
-                    explains just that change (plus the problem it attempts). Free when
-                    nothing has changed since the last one — the workflow key collides
-                    and the explanation already shown is the answer. */}
-                {/* Where should I even start? Ranks repo / component / commit over the
-                    code index — the question asked long before "why did this break",
-                    and the one a 147-repo org can't answer by searching. */}
-                <button
-                  disabled={busy() !== ""}
-                  data-tip="Rank which repo, component and change this is likely about"
-                  onClick={() =>
-                    run("score", async () => {
-                      setScores(await api.scoreIssue(props.id));
-                    })
-                  }
-                >
-                  {busy() === "score" ? "SCORING…" : "WHERE?"}
-                </button>
-                <button
-                  disabled={busy() !== ""}
-                  data-tip="Distil this subject and everything under it, on the local model"
-                  onClick={() =>
-                    run("explain", async () => {
-                      const r = await api.explain(props.id);
-                      if (!r.submitted) setExplainNote(r.note);
-                    })
-                  }
-                >
-                  {busy() === "explain" ? "EXPLAINING…" : "EXPLAIN"}
-                </button>
-                {/* The only button here that reaches a cloud model, which is why it is
-                    marked. Same dossier, same rules, different model — so the difference
-                    between the two answers is the model and nothing else. */}
-                <button
-                  class="cloud-btn"
-                  disabled={busy() !== "" || awaitingSecond()}
-                  data-tip={
-                    cloudOpinion()
-                      ? "A cloud second opinion is already below; asking again re-reads the same dossier"
-                      : "Ask the cloud model for its own read of the same dossier"
-                  }
-                  onClick={() =>
-                    run("second", async () => {
-                      const r = await api.explain(props.id, true);
-                      // `submitted: false` means the key collided — nothing has changed, so the
-                      // answer already on screen *is* the answer. Saying so beats a spinner that
-                      // never resolves, which is what this looked like before.
-                      if (r.submitted) setAwaitingSecond(true);
-                      else setExplainNote(r.note);
-                    })
-                  }
-                >
-                  {awaitingSecond()
-                    ? "ASKING CLAUDE…"
-                    : cloudOpinion()
-                      ? "2ND OPINION ✓"
-                      : "2ND OPINION ↗"}
-                </button>
-                {/* Not on a pull request. A postmortem is written about something that
-                    went wrong; a PR is the attempt to put it right, and drafting one from
-                    a change's timeline produces a postmortem of the fix. The incident is
-                    the issue this PR is filed under, and that is where the button is. */}
-                <Show when={t().rank !== "pull_request"}>
-                  <button
-                    disabled={busy() !== ""}
-                    onClick={() =>
-                      run("postmortem", async () => {
-                        // Save on generate: a drafted postmortem is persisted to
-                        // memory (linked to the thread) as soon as it's produced.
-                        const r = await api.tool<{
-                          draft: string;
-                          saved_memory: unknown;
-                        }>("draft_postmortem", {
-                          subject_key: props.id,
-                          save: true,
-                        });
-                        setPostmortem(r.draft);
-                        setPmSaved(!!r.saved_memory);
-                      })
-                    }
-                  >
-                    {busy() === "postmortem" ? "DRAFTING…" : "DRAFT POSTMORTEM"}
-                  </button>
-                </Show>
-                <button
-                  disabled={busy() !== ""}
-                  data-tip="Distill this thread into a one-sentence memory"
-                  onClick={() =>
-                    run("distill", async () => {
-                      const m = await api.tool<Memory>("distill_memory", {
-                        subject_key: props.id,
-                      });
-                      setSavedMemory(m.summary);
-                    })
-                  }
-                >
-                  {busy() === "distill" ? "SAVING…" : "SAVE AS MEMORY"}
-                </button>
+
+                <details class="menu">
+                  <summary>Analyse ▾</summary>
+                  <div class="menu-body">
+                    {/* One pass over everything under this subject: its events, every PR
+                        attempting it with the critique and what reviewers said, the
+                        proposed causes, the triage, the attached context. On a PR it
+                        explains just that change. Free when nothing has changed since the
+                        last one — the workflow key collides and the explanation already
+                        on screen is the answer. */}
+                    <button
+                      disabled={busy() !== ""}
+                      onClick={() =>
+                        run("explain", async () => {
+                          const r = await api.explain(props.id);
+                          if (!r.submitted) setExplainNote(r.note);
+                        })
+                      }
+                    >
+                      {busy() === "explain" ? "Explaining…" : "Explain"}
+                      <span class="cost">on this machine</span>
+                    </button>
+                    {/* The only action here that reaches a cloud model, which is why it
+                        says so. Same dossier, same rules, different model — so the
+                        difference between the two answers is the model and nothing else. */}
+                    <button
+                      class="cloud-btn"
+                      disabled={busy() !== "" || awaitingSecond()}
+                      data-tip={
+                        cloudOpinion()
+                          ? "A cloud second opinion is already below; asking again re-reads the same dossier"
+                          : "Ask the cloud model for its own read of the same dossier"
+                      }
+                      onClick={() =>
+                        run("second", async () => {
+                          const r = await api.explain(props.id, true);
+                          // `submitted: false` means the key collided — nothing has changed,
+                          // so the answer already on screen *is* the answer. Saying so beats
+                          // a spinner that never resolves.
+                          if (r.submitted) setAwaitingSecond(true);
+                          else setExplainNote(r.note);
+                        })
+                      }
+                    >
+                      {awaitingSecond()
+                        ? "Asking Claude…"
+                        : cloudOpinion()
+                          ? "Second opinion ✓"
+                          : "Second opinion"}
+                      <span class="cost cost-metered">metered call</span>
+                    </button>
+                    {/* Where should I even start? Ranks repo / component / commit over
+                        the code index — the question asked long before "why did this
+                        break", and the one a 147-repo org can't answer by searching.
+                        Named for the question now; it used to be labelled "WHERE?". */}
+                    <button
+                      disabled={busy() !== ""}
+                      data-tip="Rank which repo, component and change this is likely about"
+                      onClick={() =>
+                        run("score", async () => {
+                          setScores(await api.scoreIssue(props.id));
+                        })
+                      }
+                    >
+                      {busy() === "score"
+                        ? "Locating…"
+                        : "Find the likely code"}
+                      <span class="cost">on this machine</span>
+                    </button>
+                    {/* Not on a pull request. A postmortem is written about something
+                        that went wrong; a PR is the attempt to put it right, and drafting
+                        one from a change's timeline produces a postmortem of the fix. */}
+                    <Show when={t().rank !== "pull_request"}>
+                      <button
+                        disabled={busy() !== ""}
+                        onClick={() =>
+                          run("postmortem", async () => {
+                            // Save on generate: a drafted postmortem is persisted to
+                            // memory (linked to the thread) as soon as it's produced.
+                            const r = await api.tool<{
+                              draft: string;
+                              saved_memory: unknown;
+                            }>("draft_postmortem", {
+                              subject_key: props.id,
+                              save: true,
+                            });
+                            setPostmortem(r.draft);
+                            setPmSaved(!!r.saved_memory);
+                          })
+                        }
+                      >
+                        {busy() === "postmortem"
+                          ? "Drafting…"
+                          : "Draft postmortem"}
+                        <span class="cost">on this machine</span>
+                      </button>
+                    </Show>
+                    <button
+                      disabled={busy() !== ""}
+                      data-tip="Distill this thread into a one-sentence memory"
+                      onClick={() =>
+                        run("distill", async () => {
+                          const m = await api.tool<Memory>("distill_memory", {
+                            subject_key: props.id,
+                          });
+                          setSavedMemory(m.summary);
+                        })
+                      }
+                    >
+                      {busy() === "distill" ? "Saving…" : "Save as memory"}
+                      <span class="cost">on this machine</span>
+                    </button>
+
+                    {/* Re-run on a model you pick. The two selects live here because
+                        this is the only action they configure — at the top of the panel
+                        they read as a global setting for the whole screen. */}
+                    <div class="menu-sep">Re-run on a specific model</div>
+                    <div class="model-bar">
+                      <select
+                        value={provider()}
+                        onChange={(e) => setProvider(e.currentTarget.value)}
+                      >
+                        <For each={PROVIDERS}>
+                          {(p) => <option value={p.id}>{p.label}</option>}
+                        </For>
+                      </select>
+                      <select
+                        value={model()}
+                        // Only truly disabled when we have no list at all. A refetch
+                        // (see onFocus) sets `models.loading` while keeping the prior
+                        // value, so we stay enabled and don't collapse the open dropdown.
+                        disabled={!models()?.length}
+                        onFocus={() => refetchModels()}
+                        onChange={(e) => setModel(e.currentTarget.value)}
+                      >
+                        <Show
+                          when={models()?.length}
+                          fallback={
+                            <option>
+                              {models.loading
+                                ? "loading…"
+                                : models.error
+                                  ? "unavailable"
+                                  : "no models"}
+                            </option>
+                          }
+                        >
+                          <For each={models()}>
+                            {(m) => <option value={m}>{m}</option>}
+                          </For>
+                        </Show>
+                      </select>
+                    </div>
+                    <button
+                      disabled={busy() !== ""}
+                      data-tip="Re-run the whole analysis on the model selected above"
+                      onClick={() =>
+                        run(
+                          "reanalyze",
+                          () =>
+                            api.tool("reanalyze", {
+                              subject_key: props.id,
+                              provider: provider(),
+                              model: model() || undefined,
+                            }),
+                          true,
+                        )
+                      }
+                    >
+                      {busy() === "reanalyze"
+                        ? "Re-analysing…"
+                        : "Re-analyse from scratch"}
+                    </button>
+                  </div>
+                </details>
+
                 <button
                   disabled={busy() !== ""}
                   data-tip="Start a chat seeded with this thread"
@@ -851,7 +918,7 @@ export default function SubjectDetail(props: {
                     props.onOpenChat();
                   }}
                 >
-                  OPEN IN CHAT
+                  Open in chat
                 </button>
               </div>
               <Show when={savedMemory()}>
@@ -890,7 +957,7 @@ export default function SubjectDetail(props: {
             </section>
 
             <section class="panel timeline-panel">
-              <h3>TIMELINE</h3>
+              <h3>Timeline</h3>
               <ol class="timeline">
                 <For each={t().signals}>
                   {(s) => (
@@ -940,7 +1007,7 @@ export default function SubjectDetail(props: {
                         <Show when={failureSuggestion(s)}>
                           {(advice) => (
                             <div class="tl-advice">
-                              <span>MUGGLEBOT SUGGESTION</span>
+                              <span>MuggleBot suggestion</span>
                               <p>{advice()}</p>
                             </div>
                           )}
@@ -958,7 +1025,10 @@ export default function SubjectDetail(props: {
                               target="_blank"
                               rel="noreferrer"
                             >
-                              open source ↗
+                              {/* "Open source" set in caps read as open-source
+                                  software rather than "open the source of this
+                                  event", which is what it does. */}
+                              Open where it happened ↗
                             </a>
                           </Show>
                           {/* Full alert content (Value/Labels/annotations) lives
@@ -998,7 +1068,7 @@ export default function SubjectDetail(props: {
                     )
                   }
                 >
-                  SPLIT SELECTED ({selected().size})
+                  Split selected ({selected().size})
                 </button>
               </div>
             </section>
@@ -1008,7 +1078,7 @@ export default function SubjectDetail(props: {
                 the fallback for when it can't reach it. */}
             <Show when={browserInvestigations()?.length}>
               <section class="panel browser-investigations">
-                <h3>DASHBOARD READINGS</h3>
+                <h3>Dashboard readings</h3>
                 <For each={browserInvestigations()}>
                   {(inv) => (
                     <div class="browser-investigation">
@@ -1100,7 +1170,7 @@ export default function SubjectDetail(props: {
             <Show when={t().rank === "pull_request"}>
               <section class="panel attempts-panel">
                 <h3>
-                  THE CHANGE
+                  The change
                   <span class="muted">
                     {" "}
                     — this pull request's diff and review
@@ -1124,8 +1194,8 @@ export default function SubjectDetail(props: {
             <Show when={attempts().length}>
               <section class="panel attempts-panel">
                 <h3>
-                  {attempts().length} ATTEMPT
-                  {attempts().length === 1 ? "" : "S"}
+                  {attempts().length} attempt
+                  {attempts().length === 1 ? "" : "s"}
                   <span class="muted"> — pull requests on this work</span>
                 </h3>
                 <For each={attempts()}>
@@ -1148,19 +1218,30 @@ export default function SubjectDetail(props: {
                 Patch options are proposals — nothing here has been applied. */}
             <For each={triage()}>
               {(t) => (
+                // Queued or running, this is one line: there is nothing to read yet,
+                // and a panel that says "queued" in a heading, a status pill and a
+                // paragraph says it three times.
+                <Show
+                  when={t.status !== "pending" && t.status !== "running"}
+                  fallback={
+                    <div class="not-run">
+                      <span class="muted" classList={{ thinking: t.status === "running" }}>
+                        {t.status === "running"
+                          ? "Reading the code for this issue…"
+                          : "Queued for code triage — one issue is read at a time."}
+                      </span>
+                    </div>
+                  }
+                >
                 <section class="panel issue-triage">
                   <div class="panel-head">
-                    <h3>ASSIGNED · {t.issue_key}</h3>
+                    <h3>Assigned · {t.issue_key}</h3>
                     <div class="row">
                       <span class={`state state-${TRIAGE_STATE[t.status]}`}>
                         {t.status}
                       </span>
                       <button
-                        disabled={
-                          busy() !== "" ||
-                          t.status === "running" ||
-                          t.status === "pending"
-                        }
+                        disabled={busy() !== ""}
                         onClick={() =>
                           run("re-triage", async () => {
                             await api.tool("retriage_issue", {
@@ -1170,21 +1251,11 @@ export default function SubjectDetail(props: {
                           })
                         }
                       >
-                        RE-TRIAGE
+                        Re-triage
                       </button>
                     </div>
                   </div>
 
-                  <Show when={t.status === "pending"}>
-                    <p class="muted">
-                      Queued — the code is read one issue at a time.
-                    </p>
-                  </Show>
-                  <Show when={t.status === "running"}>
-                    <p class="muted thinking">
-                      Pulling the code and reading it…
-                    </p>
-                  </Show>
                   <Show when={t.error}>
                     <p class="browser-error">{t.error}</p>
                   </Show>
@@ -1203,8 +1274,8 @@ export default function SubjectDetail(props: {
 
                   <Show when={t.patches.length}>
                     <h4 class="triage-heading">
-                      {t.patches.length} POSSIBLE APPROACH
-                      {t.patches.length === 1 ? "" : "ES"}
+                      {t.patches.length} possible approach
+                      {t.patches.length === 1 ? "" : "es"}
                       <span class="muted"> — proposals, nothing applied</span>
                     </h4>
                     <For each={t.patches}>
@@ -1260,11 +1331,11 @@ export default function SubjectDetail(props: {
                       PR's own claim to close the issue. */}
                   <Show when={prFixes()?.[t.issue_key]?.length}>
                     <h4 class="triage-heading">
-                      ALREADY BEING FIXED?
+                      Already being fixed?
                       <span class="muted">
                         {" "}
                         — open pull requests that may cover this; the diff and
-                        review for each are in ATTEMPTS above
+                        review for each are under Attempts above
                       </span>
                     </h4>
                     <For each={prFixes()![t.issue_key]}>
@@ -1374,39 +1445,60 @@ export default function SubjectDetail(props: {
                     </div>
                   </Show>
                 </section>
+                </Show>
               )}
             </For>
 
-            {/* Root cause: hypotheses with citations, never conclusions. */}
-            <section class="panel root-cause">
-              <div class="panel-head">
-                <h3>ROOT CAUSE</h3>
-                <button
-                  disabled={busy() !== "" || rootCause()?.status === "running"}
-                  onClick={() =>
-                    run("investigate", async () => {
-                      await api.tool("investigate_root_cause", {
-                        subject_key: props.id,
-                      });
-                      await refetchRootCause();
-                    })
-                  }
-                >
-                  {rootCause() ? "RE-INVESTIGATE" : "INVESTIGATE"}
-                </button>
-              </div>
-              <Show
-                when={rootCause()}
-                fallback={
-                  <p class="muted">
-                    Search the indexed repositories for the issue, PR, or commit
-                    behind this — and for the code responsible when nothing has
-                    been filed yet.
-                  </p>
-                }
-              >
-                {(report) => (
-                  <>
+            {/* Root cause: hypotheses with citations, never conclusions.
+
+                Un-run, this is one line rather than a panel. A heading, a paragraph
+                explaining what the feature would do and a button is a full panel's
+                worth of chrome around no content — and it sat between the diff and
+                the relations, pushing what the subject actually says off screen. */}
+            <Show
+              when={rootCause()}
+              fallback={
+                <div class="not-run">
+                  <span class="muted">
+                    No root-cause search yet — look for the issue, PR, or commit
+                    behind this across the indexed repositories.
+                  </span>
+                  <button
+                    disabled={busy() !== ""}
+                    onClick={() =>
+                      run("investigate", async () => {
+                        await api.tool("investigate_root_cause", {
+                          subject_key: props.id,
+                        });
+                        await refetchRootCause();
+                      })
+                    }
+                  >
+                    Investigate
+                  </button>
+                </div>
+              }
+            >
+              <section class="panel root-cause">
+                <div class="panel-head">
+                  <h3>Root cause</h3>
+                  <button
+                    disabled={busy() !== "" || rootCause()?.status === "running"}
+                    onClick={() =>
+                      run("investigate", async () => {
+                        await api.tool("investigate_root_cause", {
+                          subject_key: props.id,
+                        });
+                        await refetchRootCause();
+                      })
+                    }
+                  >
+                    Re-investigate
+                  </button>
+                </div>
+                <Show when={rootCause()}>
+                  {(report) => (
+                    <>
                     <Show when={report().status === "running"}>
                       <p class="muted thinking">Investigating…</p>
                     </Show>
@@ -1519,15 +1611,16 @@ export default function SubjectDetail(props: {
                         Nothing in the searched repositories explains this — it
                         looks unreported.
                       </p>
-                    </Show>
-                  </>
-                )}
-              </Show>
-            </section>
+                      </Show>
+                    </>
+                  )}
+                </Show>
+              </section>
+            </Show>
 
             <Show when={threadHints().length}>
               <section class="panel">
-                <h3>LIVE ASSIST</h3>
+                <h3>Live assist</h3>
                 <For each={threadHints()}>
                   {(h) => (
                     <div
@@ -1582,12 +1675,22 @@ export default function SubjectDetail(props: {
               </section>
             </Show>
 
-            <Show when={t().edges.some((e) => e.kind !== "distinct")}>
+            <Show when={relations().shown.length || relations().hidden.length}>
               <section class="panel">
-                <h3>RELATION GRAPH</h3>
-                {/* `distinct` edges say "these are NOT related" — noise to the
-                    reader, so only same/related links are surfaced here. */}
-                <For each={t().edges.filter((e) => e.kind !== "distinct")}>
+                <div class="panel-head">
+                  <h3>Related</h3>
+                  <Show when={relations().hidden.length}>
+                    <button
+                      class="linkish"
+                      onClick={() => setAllRelations((v) => !v)}
+                    >
+                      {allRelations()
+                        ? "show fewer"
+                        : `${relations().hidden.length} more`}
+                    </button>
+                  </Show>
+                </div>
+                <For each={relations().shown}>
                   {(e) => {
                     // The edge can point at a thread that's off the active board
                     // (resolved/snoozed) or merged away — only offer navigation
@@ -1595,26 +1698,30 @@ export default function SubjectDetail(props: {
                     const target = () => subjects[other(e)];
                     return (
                       <div class={`edge edge-${e.kind}`}>
-                        <span class="edge-kind">{e.kind}</span>
-                        <Show
-                          when={target()}
-                          fallback={
-                            <span class="muted" data-tip={other(e)}>
-                              {other(e)} (off board — resolved, snoozed, or
-                              merged)
-                            </span>
-                          }
-                        >
-                          <button
-                            class="linkish"
-                            onClick={() => props.onOpen(other(e))}
+                        <div class="edge-line">
+                          <span class="edge-kind">{e.kind}</span>
+                          <Show
+                            when={target()}
+                            fallback={
+                              <span class="muted" data-tip={other(e)}>
+                                {other(e)} · off board
+                              </span>
+                            }
                           >
-                            {target()!.title}
-                          </button>
-                        </Show>
-                        <span class="muted">
-                          {e.provenance} · {Math.round(e.confidence * 100)}%
-                        </span>
+                            <button
+                              class="linkish"
+                              onClick={() => props.onOpen(other(e))}
+                            >
+                              {target()!.title}
+                            </button>
+                          </Show>
+                          {/* Only a human pin is worth labelling. Every LLM edge here
+                              scores 80-95%, so printing the number ranked nothing and
+                              lent a guess the authority of a measurement. */}
+                          <Show when={e.provenance === "user"}>
+                            <span class="chip">pinned</span>
+                          </Show>
+                        </div>
                         <div class="muted">{e.rationale}</div>
                       </div>
                     );
@@ -1625,7 +1732,7 @@ export default function SubjectDetail(props: {
 
             <Show when={t().context.length}>
               <section class="panel">
-                <h3>ATTACHED CONTEXT</h3>
+                <h3>Attached context</h3>
                 <For each={t().context}>
                   {(c) => (
                     <div class="ctx-item">
@@ -1638,7 +1745,7 @@ export default function SubjectDetail(props: {
             </Show>
 
             <section class="panel">
-              <h3>ACTIONS</h3>
+              <h3>Actions</h3>
               <div class="form">
                 <label>Attach context</label>
                 <textarea

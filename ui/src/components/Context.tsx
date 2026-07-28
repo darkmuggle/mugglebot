@@ -66,7 +66,7 @@ export default function ContextLibrary() {
   return (
     <div class="page">
       <section class="panel">
-        <h3>ADD CONTEXT SOURCE</h3>
+        <h3>Add context source</h3>
         <div class="form">
           <div class="row">
             <select value={kind()} onChange={(e) => setKind(e.currentTarget.value as "url" | "file")}>
@@ -95,7 +95,7 @@ export default function ContextLibrary() {
             />
           </div>
           <button disabled={busy() === "add"} onClick={add}>
-            {busy() === "add" ? "FETCHING…" : "ADD & INGEST"}
+            {busy() === "add" ? "Fetching…" : "Add & ingest"}
           </button>
         </div>
       </section>

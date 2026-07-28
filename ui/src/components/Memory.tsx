@@ -65,21 +65,21 @@ export default function MemoryEditor() {
   return (
     <div class="page">
       <section class="panel">
-        <h3>ADD MEMORY</h3>
+        <h3>Add memory</h3>
         <div class="form">
           <textarea placeholder="A fact, lesson, or confirmed approach…" value={text()} onInput={(e) => setText(e.currentTarget.value)} />
           <input placeholder="one-line summary (optional)" value={summary()} onInput={(e) => setSummary(e.currentTarget.value)} />
           <input placeholder="links: signal/thread ids, comma-separated" value={links()} onInput={(e) => setLinks(e.currentTarget.value)} />
           <input placeholder="tags, comma-separated (optional — auto-suggested if blank)" value={tags()} onInput={(e) => setTags(e.currentTarget.value)} />
-          <button onClick={add}>SAVE</button>
+          <button onClick={add}>Save</button>
         </div>
       </section>
 
       <section class="panel">
-        <h3>SEARCH</h3>
+        <h3>Search</h3>
         <div class="row">
           <input placeholder="semantic recall…" value={query()} onInput={(e) => setQuery(e.currentTarget.value)} onKeyDown={(e) => e.key === "Enter" && search()} />
-          <button onClick={search}>RECALL</button>
+          <button onClick={search}>Recall</button>
           <Show when={results()}>
             <button onClick={() => { setQuery(""); setResults(null); }}>CLEAR</button>
           </Show>

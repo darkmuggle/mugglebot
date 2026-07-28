@@ -165,7 +165,7 @@ export default function RepoDetailView(props: {
                   <p class="rd-desc">{d().entry!.description}</p>
                 </Show>
 
-                <div class="rd-section-label">DEPENDENCIES</div>
+                <div class="rd-section-label">Dependencies</div>
                 <Show
                   when={d().depends_on.length || d().depended_on_by.length}
                   fallback={
@@ -205,7 +205,7 @@ export default function RepoDetailView(props: {
                 {/* A glance at what has moved, without the summaries. Enough to tell whether
                     the repo is alive; the commits tab is where you read why. */}
                 <Show when={d().commit_summaries.length}>
-                  <div class="rd-section-label">RECENT</div>
+                  <div class="rd-section-label">Recent</div>
                   <div class="rd-recent">
                     <For each={d().commit_summaries.slice(0, 5)}>
                       {(c) => (

@@ -1063,6 +1063,7 @@ mod tests {
                 parent: None,
                 merge_key: None,
             },
+            headline: None,
             signals: vec![],
             keys,
             severity: Severity::Warning,
