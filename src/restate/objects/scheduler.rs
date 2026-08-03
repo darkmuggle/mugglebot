@@ -34,6 +34,14 @@ pub const TRIAGE_QUEUE: &str = "triage-queue";
 /// Arms a `RepoIndexer` per repo. A task rather than a boot-time loop because the org's
 /// repo list grows: a repo added after boot has to get an indexer without a restart.
 pub const CODE_INDEX: &str = "code-index";
+/// Asks the org which repositories have been pushed to, and pokes those repos' indexers.
+///
+/// Separate from [`REPO_INDEX`] because the two have opposite cost profiles and so want
+/// opposite cadences. A full crawl reads READMEs, clones trees and cards repos with a model
+/// call each — daily is right for that. This is one page of the org listing, so it can run
+/// every five minutes, which is the difference between noticing a commit within minutes and
+/// within an hour.
+pub const COMMIT_POLL: &str = "commit-poll";
 
 pub struct Scheduler {
     ops: Arc<IngestOps>,
@@ -54,6 +62,9 @@ fn cadence(task: &str) -> Duration {
         // per repo and is the one that gets interrupted.
         REPO_INDEX => Duration::from_secs(86_400),
         CONTEXT_REFRESH => Duration::from_secs(300),
+        // The whole point: a push is visible within five minutes. Affordable because a sweep
+        // is a single API call unless something actually moved — see `RepoIndex::poll_pushed`.
+        COMMIT_POLL => Duration::from_secs(300),
         // Files change under you while you edit them; this is the one that wants to
         // be tight.
         CONTEXTS_DIR => Duration::from_secs(15),
@@ -219,6 +230,37 @@ async fn dispatch(ops: &IngestOps, task: &str) -> u64 {
         BROWSER_QUEUE => {
             for id in ops.pending_browser_investigations() {
                 started += submit(ops, "BrowserRead", &id, scopes::BROWSER).await;
+            }
+        }
+        COMMIT_POLL => {
+            // The sweep decides *which* repos moved; the per-repo indexer does the fetching
+            // and summarizing. Poking its tick rather than reaching into the indexer directly
+            // keeps one path to that work — the same one the hourly timer uses — so a push
+            // arriving mid-backfill queues behind that repo's own work instead of racing it.
+            match ops.poll_pushed_repos().await {
+                Ok(moved) if !moved.is_empty() => {
+                    tracing::info!(
+                        "commit poll: {} repo(s) pushed since the last sweep: {}",
+                        moved.len(),
+                        moved.join(", ")
+                    );
+                    for repo in moved {
+                        match ops.ingress.poke_repo_indexer(&repo).await {
+                            Ok(()) => started += 1,
+                            Err(e) => tracing::debug!("commit poll: {repo} not poked ({e:#})"),
+                        }
+                        // A push to a repo is also a push to any of its open pull requests,
+                        // and a re-pushed PR needs its diff and review done again. This is
+                        // the only thing that notices: the PR's own freshness used to be the
+                        // newest notification on it, and a push to your own branch notifies
+                        // nobody — so the first evaluation was the only one it ever got.
+                        started += ops.restale_pull_requests(&repo).await;
+                    }
+                }
+                Ok(_) => {}
+                // A rate limit or a flaky page is transient and the next sweep is five
+                // minutes away — a warning, not a failure of the whole task.
+                Err(e) => tracing::warn!("commit poll failed: {e:#}"),
             }
         }
         CODE_INDEX => {

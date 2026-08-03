@@ -270,7 +270,7 @@ mod tests {
             investigator,
             repos,
             browser,
-            diffs: Arc::new(crate::prdiff::DiffReader::new(None, reasoner.clone()).unwrap()),
+            diffs: Arc::new(crate::prdiff::DiffReader::new(None, reasoner.clone(), "local").unwrap()),
         })))
     }
 

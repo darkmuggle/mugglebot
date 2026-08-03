@@ -100,6 +100,7 @@ pub async fn serve(addr: String, mut state: AppState) -> anyhow::Result<()> {
         .route("/api/signals", get(list_signals))
         .route("/api/subjects/{key}/handled", post(set_handled))
         .route("/api/subjects", get(list_subjects))
+        .route("/api/incidents", get(list_incidents))
         .route("/api/board/reset", post(reset_board))
         .route("/api/subjects/{key}", get(get_subject))
         .route("/api/config", get(get_config))
@@ -246,10 +247,27 @@ async fn set_handled(
     if let Ok(Some(view)) = st.tools.attributor.subject_view(&key) {
         let _ = st.events.send(Event::Subject(Box::new(view)));
     }
-    if let Ok(views) = st.tools.attributor.subject_views(true) {
+    if let Ok(views) = st.tools.attributor.board_views(true) {
         let _ = st.events.send(Event::Board(views));
     }
     StatusCode::NO_CONTENT.into_response()
+}
+
+/// The incidents board. Separate from `/api/subjects` for the same reason the read is split:
+/// two boards, two questions.
+async fn list_incidents(
+    AxumState(st): AxumState<AppState>,
+    Query(q): Query<BTreeMap<String, String>>,
+) -> impl IntoResponse {
+    let active_only = q.get("active_only").map(|v| v != "false").unwrap_or(true);
+    match st
+        .tools
+        .call("list_incidents", &json!({ "active_only": active_only }))
+        .await
+    {
+        Ok(v) => Json(v).into_response(),
+        Err(e) => err_response(e),
+    }
 }
 
 /// Board reset: delete all persisted board events and their derived subject analysis.
@@ -283,7 +301,7 @@ async fn reset_board(AxumState(st): AxumState<AppState>) -> impl IntoResponse {
     }
     // Push the authoritative active board so resolved subjects drop out for every
     // connected client (reconcile removes anything no longer in the active set).
-    if let Ok(views) = st.tools.attributor.subject_views(true) {
+    if let Ok(views) = st.tools.attributor.board_views(true) {
         let _ = st.events.send(Event::Board(views));
     }
     Json(json!({ "cleared": cleared })).into_response()
@@ -320,7 +338,7 @@ async fn broadcast_after(st: &AppState, tool: &str) {
             | "investigate_root_cause"
     );
     if touches_threads {
-        if let Ok(views) = st.tools.attributor.subject_views(true) {
+        if let Ok(views) = st.tools.attributor.board_views(true) {
             let _ = st.events.send(Event::Board(views));
         }
     }
@@ -526,7 +544,7 @@ async fn ws_loop(mut socket: WebSocket, st: AppState) {
 async fn build_snapshot(st: &AppState) -> Option<Snapshot> {
     Some(Snapshot {
         signals: st.tools.store.recent(200).ok()?,
-        subjects: st.tools.attributor.subject_views(true).ok()?,
+        subjects: st.tools.attributor.board_views(true).ok()?,
         hints: st.tools.store.list_hints(None).ok()?,
         health: st.tools.store.source_health().ok()?,
         dispatches: crate::dispatch::all(),

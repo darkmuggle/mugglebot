@@ -47,8 +47,40 @@ impl Attributor {
         }
     }
 
+    /// Every subject, incidents included. The tool/MCP surface, where a caller asking for
+    /// "subjects" means all of them.
     pub fn subject_views(&self, active_only: bool) -> Result<Vec<super::SubjectView>> {
         self.board.views(active_only)
+    }
+
+    /// The **main board**: everything except incidents.
+    ///
+    /// Split here rather than in the UI because the two boards are two answers to two
+    /// questions — "what does my work need from me" and "what is on fire" — and a reader who
+    /// went looking for an incident on the main board would be reading a list that silently
+    /// omits them. Filtering in the component instead would leave incidents inside the
+    /// board's own counts while rendering in none of its groups.
+    pub fn board_views(&self, active_only: bool) -> Result<Vec<super::SubjectView>> {
+        Ok(self
+            .board
+            .views(active_only)?
+            .into_iter()
+            .filter(|v| v.subject.rank != super::SubjectRank::Incident)
+            .collect())
+    }
+
+    /// The **incidents board**: only incidents.
+    ///
+    /// `active_only` means what incident.io says, not what the operator has read — see
+    /// `projection::upstream_finished`. A closed incident leaves here without anyone
+    /// acknowledging it.
+    pub fn incident_views(&self, active_only: bool) -> Result<Vec<super::SubjectView>> {
+        Ok(self
+            .board
+            .views(active_only)?
+            .into_iter()
+            .filter(|v| v.subject.rank == super::SubjectRank::Incident)
+            .collect())
     }
 
     pub fn refresh_subject_metadata(&self, key: &str) -> Result<()> {

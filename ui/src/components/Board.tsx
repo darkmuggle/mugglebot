@@ -46,11 +46,32 @@ function lane(t: SubjectView): Lane {
   return "clear";
 }
 
-const KIND_LABEL: Record<SubjectView["rank"], string> = {
-  issue: "Issue",
-  pull_request: "PR",
+/// The kind column, source first.
+///
+/// `Issue` and `PR` alone said what a row *was* but not where it lived, which is the half
+/// that decides where you go to act on it — and on a board that also carries Slack threads,
+/// an unqualified "Issue" reads as though the source is the one thing not worth stating.
+/// Slack was already source-qualified; these two now match it.
+export const KIND_LABEL: Record<SubjectView["rank"], string> = {
+  issue: "GitHub Issue",
+  pull_request: "GitHub PR",
   slack_thread: "Slack",
+  // Present for completeness, not because this board renders one: the main board's read
+  // excludes incidents server-side (`board_views`). It is here so the map stays exhaustive
+  // — the compiler asked for it, which is the point of typing it as a `Record`.
+  incident: "Incident",
 };
+
+/// Types in the order a lane presents them, and what the group is called.
+///
+/// Pull requests lead: a review request is someone else blocked on you, where an
+/// issue is usually yours to schedule. Mixing the two in one recency-ordered list
+/// meant the reader had to re-establish "what kind of thing is this" on every row.
+const TYPES: { rank: SubjectView["rank"]; label: string }[] = [
+  { rank: "pull_request", label: "Pull requests" },
+  { rank: "issue", label: "Issues" },
+  { rank: "slack_thread", label: "Slack threads" },
+];
 
 /// The title with what the row already says stripped out of it.
 ///
@@ -141,6 +162,33 @@ function Row(props: {
         <span class="row-titleline">
           <span class="row-title">{displayTitle(t())}</span>
           <span class="row-ref">{ref(t())}</span>
+          {/* Signed off, or blocked. On the board this replaces asking for attention:
+              once a human has said yes, the answer to "does this need me" has been
+              given, and the row should say so rather than sit in Decide.
+
+              Two states, not one. `gates_passed` is the stronger claim — approved *and*
+              nothing still failing — and it is the one an operator can act on by not
+              acting. A bare "approved" on a PR with red CI would read as finished when
+              it isn't, so the badge only makes the stronger claim when it's true. */}
+          <Show when={t().gates_passed}>
+            <span
+              class="badge badge-cleared"
+              data-tip="Approved, and nothing failing — nothing to do"
+            >
+              nothing to do
+            </span>
+          </Show>
+          <Show when={t().review_state === "approved" && !t().gates_passed}>
+            <span
+              class="badge badge-approved"
+              data-tip="Approved, but something is still failing"
+            >
+              approved
+            </span>
+          </Show>
+          <Show when={t().review_state === "changes_requested"}>
+            <span class="badge badge-blocked">changes requested</span>
+          </Show>
           <Show when={t().live}>
             <span class="badge badge-live">live</span>
           </Show>
@@ -211,12 +259,24 @@ export default function Board(props: {
       ),
   );
 
-  // Within a lane, newest activity first. Predictable beats clever: the lane already
-  // carries the judgement, so the sort only has to be one the operator can predict.
-  const inLane = (id: Lane) =>
-    active()
-      .filter((t) => lane(t) === id)
-      .sort((a, b) => b.updated_at.localeCompare(a.updated_at));
+  // A lane, split by type and newest-first within each.
+  //
+  // Type is the outer key because reviewing a pull request and scheduling an issue are
+  // different kinds of work: batching them means one pass over the PRs and one over the
+  // issues, rather than switching mode on every row. The lane still decides *whether*
+  // the work is urgent; type decides what doing it involves.
+  const inLane = (id: Lane) => {
+    const rows = active().filter((t) => lane(t) === id);
+    return TYPES.map((ty) => ({
+      ...ty,
+      rows: rows
+        .filter((t) => t.rank === ty.rank)
+        .sort((a, b) => b.updated_at.localeCompare(a.updated_at)),
+    })).filter((g) => g.rows.length);
+  };
+
+  const laneCount = (id: Lane) =>
+    active().filter((t) => lane(t) === id).length;
 
   const decideCount = createMemo(
     () => active().filter((t) => lane(t) === "decide").length,
@@ -308,52 +368,72 @@ export default function Board(props: {
       >
         <For each={LANES}>
           {(l) => {
-            const rows = createMemo(() => inLane(l.id));
+            const groups = createMemo(() => inLane(l.id));
+            const count = createMemo(() => laneCount(l.id));
             return (
               // A lane with nothing in it is worth one line — "nothing is waiting on
               // you" is the answer to the question the board was opened to ask.
-              <Show when={rows().length || l.empty}>
+              <Show when={count() || l.empty}>
                 <section class={`lane lane-${l.id}`}>
                   <h2 class="lane-head">
                     {l.label}
-                    <Show when={rows().length}>
-                      <span class="lane-count">{rows().length}</span>
+                    <Show when={count()}>
+                      <span class="lane-count">{count()}</span>
                     </Show>
                   </h2>
                   <Show
-                    when={rows().length}
+                    when={count()}
                     fallback={<p class="lane-empty">{l.empty}</p>}
                   >
-                    <For each={rows()}>
-                      {(t) => (
-                        <Row
-                          t={t}
-                          onOpen={props.onOpen}
-                          onKey={rowKey}
-                          actions={(t) => (
-                            <>
-                              <Show
-                                when={t.handled === "acknowledged"}
-                                fallback={
-                                  <button
-                                    data-tip="Acknowledge — keeps it on the board, out of Decide (e)"
-                                    onClick={() => triage(t, "acknowledged")}
-                                  >
-                                    Ack
-                                  </button>
-                                }
-                              >
-                                <button onClick={() => reopen(t)}>Un-ack</button>
-                              </Show>
-                              <button
-                                data-tip="Snooze — off the board until it moves (s)"
-                                onClick={() => triage(t, "snoozed")}
-                              >
-                                Snooze
-                              </button>
-                            </>
-                          )}
-                        />
+                    <For each={groups()}>
+                      {(g) => (
+                        <>
+                          {/* Only worth a heading when the lane actually holds more
+                              than one type — a lone "Issues" label over every row in
+                              an issues-only lane is a label with no alternative. */}
+                          <Show when={groups().length > 1}>
+                            <h3 class="type-head">
+                              {g.label}
+                              <span class="lane-count">{g.rows.length}</span>
+                            </h3>
+                          </Show>
+                          <For each={g.rows}>
+                            {(t) => (
+                              <Row
+                                t={t}
+                                onOpen={props.onOpen}
+                                onKey={rowKey}
+                                actions={(t) => (
+                                  <>
+                                    <Show
+                                      when={t.handled === "acknowledged"}
+                                      fallback={
+                                        <button
+                                          data-tip="Acknowledge — keeps it on the board, out of Decide (e)"
+                                          onClick={() =>
+                                            triage(t, "acknowledged")
+                                          }
+                                        >
+                                          Ack
+                                        </button>
+                                      }
+                                    >
+                                      <button onClick={() => reopen(t)}>
+                                        Un-ack
+                                      </button>
+                                    </Show>
+                                    <button
+                                      data-tip="Snooze — off the board until it moves (s)"
+                                      onClick={() => triage(t, "snoozed")}
+                                    >
+                                      Snooze
+                                    </button>
+                                  </>
+                                )}
+                              />
+                            )}
+                          </For>
+                        </>
                       )}
                     </For>
                   </Show>

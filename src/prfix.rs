@@ -17,13 +17,17 @@
 //! 3. **What else does it resolve?** — a patch that touches the mechanism behind
 //!    several issues closes more than the one it names.
 //!
-//! # Escalation
+//! # Which model, and retries
 //!
-//! The analysis runs on the **local** coder model, which is the right tool for
-//! reading a diff. If it fails, or returns something unusable, the same question
-//! goes to the small cloud model, then to the routed tier. Escalation is on
-//! *failure*, not on preference — and whichever tier answered is recorded on the
-//! result, so a verdict can always be attributed.
+//! The finder judges on whichever reasoner it was handed, and it says which on the
+//! result (`analyzed_by`) so a verdict can always be attributed. Assigned-issue triage
+//! hands it the `[reasoner] triage` tier; the root-cause investigator hands it the local
+//! model.
+//!
+//! A first attempt, then one retry at a higher temperature on the **same** model. This
+//! used to be an escalation ladder to a cloud tier, and what it was actually recovering
+//! from was a model that had answered in prose instead of JSON — which a retry fixes as
+//! well as a metered call did.
 //!
 //! Nothing here comments on, approves, or merges a pull request.
 
@@ -76,6 +80,11 @@ impl From<&IssueTriage> for Subject {
 struct Discussion {
     /// The meritorious reviews and comments, rendered.
     reviews: String,
+    /// The reviewers' verdict, reduced from the reviews just fetched. Recorded here so
+    /// the board can say "approved" without re-fetching, and — unlike a notification's
+    /// copy of the same fact — it lands for pull requests that were reviewed before
+    /// MuggleBot started recording it.
+    review_state: Option<String>,
     /// Commits the discussion said the fix lives in, read out of the code index. `None` when
     /// nobody pointed anywhere.
     referenced: Option<String>,
@@ -95,7 +104,7 @@ const REVIEW_CHARS: usize = 4_000;
 
 pub struct PrFixFinder {
     store: Arc<Store>,
-    /// Local coder model — reads diffs. The only model that judges a PR.
+    /// Reads diffs. The only model that judges a PR.
     coder: Arc<dyn Reasoner>,
     /// A second attempt when the first returns nothing parseable, at a higher
     /// temperature. Same model: this used to be an escalation ladder to a cloud tier, and
@@ -106,16 +115,30 @@ pub struct PrFixFinder {
     comments: CommentJudge,
     /// Used to lump issues that one PR resolves into a single subject.
     analyst: Option<Arc<Analyst>>,
+    /// What to record in `analyzed_by`, and what the board shows as the judging tier.
+    ///
+    /// Carried rather than assumed: this used to be hardcoded `"local"`, which stopped
+    /// being true the moment triage moved to its own tier — and the board went on
+    /// reporting a Sonnet verdict as a local one.
+    tier: String,
 }
 
 impl PrFixFinder {
-    pub fn new(store: Arc<Store>, coder: Arc<dyn Reasoner>, retry: Arc<dyn Reasoner>) -> Self {
+    /// `tier` names the reasoner being handed in — it is what the board reports as having
+    /// judged the PR, so it has to match reality rather than a historical default.
+    pub fn new(
+        store: Arc<Store>,
+        coder: Arc<dyn Reasoner>,
+        retry: Arc<dyn Reasoner>,
+        tier: impl Into<String>,
+    ) -> Self {
         Self {
             store,
             comments: CommentJudge::new(coder.clone()),
             coder,
             retry,
             analyst: None,
+            tier: tier.into(),
         }
     }
 
@@ -364,6 +387,7 @@ impl PrFixFinder {
 
         Discussion {
             reviews,
+            review_state: crate::github::review_decision_of(&all).map(str::to_string),
             referenced: self.follow_references(subject, pr, &pointing),
         }
     }
@@ -569,10 +593,14 @@ impl PrFixFinder {
             issue.number,
         );
 
-        // One local attempt, then one retry — both on the local model. What the old
-        // three-rung cloud ladder recovered from was an answer in prose rather than JSON,
-        // and a second ask fixes that.
-        for (tier, reasoner) in [("local", &self.coder), ("local-retry", &self.retry)] {
+        // One attempt, then one retry — both on the same tier. What the old three-rung
+        // cloud ladder recovered from was an answer in prose rather than JSON, and a second
+        // ask fixes that.
+        let retry_tier = format!("{}-retry", self.tier);
+        for (tier, reasoner) in [
+            (self.tier.as_str(), &self.coder),
+            (retry_tier.as_str(), &self.retry),
+        ] {
             let mut req = CompletionRequest::single(prompt.clone())
                 .with_system(system)
                 .max_tokens(900);
@@ -587,10 +615,14 @@ impl PrFixFinder {
                     continue;
                 }
             };
-            if let Some(fix) = self.parse(issue, pr, files, other_open_issues, tier, &raw) {
-                if tier != "local" {
+            if let Some(mut fix) = self.parse(issue, pr, files, other_open_issues, tier, &raw) {
+                // The humans' verdict, from the reviews this pass already fetched. Set
+                // here rather than in `parse`, which reads the model's JSON: this is a
+                // fact about the pull request, not something the model gets a say in.
+                fix.review_state = discussion.review_state.clone();
+                if tier != self.tier {
                     debug!(
-                        "pr-fix: {}#{} analyzed by {tier} after local came up short",
+                        "pr-fix: {}#{} analyzed by {tier} after the first pass came up short",
                         issue.repo, pr.number
                     );
                 }
@@ -669,6 +701,9 @@ impl PrFixFinder {
             implementation,
             critique: Some(critique),
             conversation,
+            // Filled by the caller from the fetched reviews — see `analyze`. Not from
+            // the model's JSON: whether a human approved is not a judgment call.
+            review_state: None,
             also_fixes,
             analyzed_by: Some(tier.to_string()),
             created_at: now.clone(),
@@ -799,6 +834,7 @@ mod tests {
             draft: false,
             body: Some(body.into()),
             labels: vec![],
+            head_sha: Some("abc1234".into()),
             head_ref: Some("octocat:fix-pool".into()),
             updated_at: None,
             merged_at: None,

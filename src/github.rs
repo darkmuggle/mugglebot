@@ -117,7 +117,14 @@ fn until_reset() -> Duration {
 ///
 /// Read from every response rather than polled from `/rate_limit`, because asking costs a
 /// request and every answer is already carrying the number.
-fn observe(headers: &HeaderMap) {
+///
+/// `pub(crate)` because the *notifications watcher* has to call it too. It holds its own
+/// `reqwest::Client` rather than a [`GithubClient`], so for a long time its polls and
+/// per-notification enrichment spent budget without ever reporting it — the process
+/// believed it had more headroom than it did, and the reserve that background work is
+/// paced against was quietly thinner than 1000. The budget is per *token*, so every
+/// caller on that token has to contribute its readings.
+pub(crate) fn observe(headers: &HeaderMap) {
     let get = |name: &str| -> Option<i64> {
         headers.get(name)?.to_str().ok()?.trim().parse::<i64>().ok()
     };
@@ -234,6 +241,13 @@ pub struct PullRequest {
     pub body: Option<String>,
     pub labels: Vec<String>,
     pub head_ref: Option<String>,
+    /// The head commit sha.
+    ///
+    /// The only honest freshness token for a diff: a pull request's diff is a function of
+    /// its head commit and nothing else. Notification activity is a *proxy* for that, and a
+    /// leaky one — a push to your own branch notifies nobody, so a diff keyed on activity
+    /// goes stale silently while looking current.
+    pub head_sha: Option<String>,
     pub updated_at: Option<String>,
     /// When it was merged, if it was.
     ///
@@ -262,6 +276,12 @@ pub struct Comment {
     pub path: Option<String>,
     /// For a review: `APPROVED`, `CHANGES_REQUESTED`, `COMMENTED`.
     pub state: Option<String>,
+    /// GitHub's browser link to this individual comment, anchored so it lands on the
+    /// comment rather than the top of a fifty-comment thread.
+    ///
+    /// Carried so a summary reporting what somebody asked for can link to them saying
+    /// it: "pcholakov wants X" is a claim, and this is its citation.
+    pub url: Option<String>,
 }
 
 impl Comment {
@@ -292,8 +312,74 @@ impl Comment {
         if !when.is_empty() {
             head.push_str(&format!(" {when}"));
         }
+        // The link to this exact comment, on the header line so a summariser reporting
+        // what somebody asked for can cite them saying it. Named `<url>` rather than
+        // left bare so the model has an unambiguous thing to copy.
+        if let Some(url) = &self.url {
+            head.push_str(&format!(" <{url}>"));
+        }
         format!("{head}:\n{}\n", self.body.trim())
     }
+}
+
+/// Reduce a pull request's reviews to the one decision that describes it.
+///
+/// Takes `(reviewer, state)` in the order the reviews were submitted, because two
+/// callers get them from different shapes: the watcher from the reviews endpoint, the
+/// PR-fix pass from the [`Comment`]s it already fetched.
+///
+/// GitHub's API hands back every review ever submitted, so this has to do what the
+/// merge button does:
+///
+/// - **Only a reviewer's latest review counts.** Someone who requested changes and
+///   later approved has approved; taking the first, or any, would leave the PR looking
+///   blocked for ever.
+/// - **`COMMENTED` does not replace a verdict.** GitHub does not let a comment-only
+///   review clear an approval or a block, and neither does this: a reviewer who
+///   approves and then adds a remark has still approved.
+/// - **`DISMISSED` is a withdrawn review**, so it counts as no review from that person.
+/// - **One block outranks any number of approvals.** Somebody is still saying no.
+pub fn review_decision<'a>(
+    reviews: impl Iterator<Item = (&'a str, &'a str)>,
+) -> Option<&'static str> {
+    use std::collections::HashMap;
+    let mut verdict: HashMap<&str, &str> = HashMap::new();
+    for (who, state) in reviews {
+        match state.to_ascii_uppercase().as_str() {
+            "APPROVED" => {
+                verdict.insert(who, "approved");
+            }
+            "CHANGES_REQUESTED" => {
+                verdict.insert(who, "changes_requested");
+            }
+            "DISMISSED" => {
+                verdict.remove(who);
+            }
+            // COMMENTED and PENDING leave an existing verdict alone, and on their own
+            // mean the PR has been looked at without a call either way.
+            _ => {
+                verdict.entry(who).or_insert("commented");
+            }
+        }
+    }
+    if verdict.values().any(|v| *v == "changes_requested") {
+        return Some("changes_requested");
+    }
+    if verdict.values().any(|v| *v == "approved") {
+        return Some("approved");
+    }
+    verdict.values().next().map(|_| "commented")
+}
+
+/// The review decision carried by a set of fetched comments, ignoring the ones that
+/// are discussion rather than review.
+pub fn review_decision_of(comments: &[Comment]) -> Option<&'static str> {
+    review_decision(
+        comments
+            .iter()
+            .filter(|c| c.kind == "review")
+            .filter_map(|c| Some((c.author.as_deref()?, c.state.as_deref()?))),
+    )
 }
 
 /// One file a pull request touches, with its diff.
@@ -393,9 +479,9 @@ impl GithubClient {
     pub async fn list_org_repos(&self, org: &str) -> Result<Vec<RepoMeta>> {
         let mut out = Vec::new();
         for page in 1..=MAX_REPO_PAGES {
-            let url =
-                format!("{API}/orgs/{org}/repos?per_page={PAGE_SIZE}&page={page}&sort=pushed");
-            let batch: Vec<RepoMeta> = self.get_json(&url).await?;
+            let batch = self.org_repos_page(org, page).await?;
+            // Counted *before* filtering: a full page of which half are forks is still a full
+            // page, and stopping on the filtered count would silently truncate the org.
             let n = batch.len();
             out.extend(batch.into_iter().filter(|r| !r.fork));
             if n < PAGE_SIZE {
@@ -403,6 +489,20 @@ impl GithubClient {
             }
         }
         Ok(out)
+    }
+
+    /// One page of the org's repositories, **newest push first**.
+    ///
+    /// Exposed on its own so a caller that only wants to know *what moved* can read one page
+    /// and stop — see [`crate::repos::RepoIndex::poll_pushed`].
+    ///
+    /// Returns the page **unfiltered**, forks included. Filtering here would break every
+    /// caller's end-of-listing test: a full page of which half are forks is still a full page,
+    /// and a caller comparing the returned length against `PAGE_SIZE` would stop early and
+    /// silently miss the rest of the org.
+    pub async fn org_repos_page(&self, org: &str, page: usize) -> Result<Vec<RepoMeta>> {
+        let url = format!("{API}/orgs/{org}/repos?per_page={PAGE_SIZE}&page={page}&sort=pushed");
+        self.get_json(&url).await
     }
 
     /// A repository's README as raw text. Returns `Ok(None)` when the ETag still
@@ -587,12 +687,13 @@ impl GithubClient {
         Ok(raw
             .into_iter()
             .map(|c| Comment {
-                author: c.user.map(|u| u.login),
+                author: c.user.and_then(|u| u.login),
                 created_at: c.created_at,
                 body: truncate(c.body.unwrap_or_default().trim(), COMMENT_CHARS),
                 kind: "discussion".into(),
                 path: None,
                 state: None,
+                url: c.html_url,
             })
             .filter(|c| !c.body.is_empty())
             .collect())
@@ -621,12 +722,13 @@ impl GithubClient {
                 continue;
             }
             out.push(Comment {
-                author: r.user.map(|u| u.login),
+                author: r.user.and_then(|u| u.login),
                 created_at: r.submitted_at,
                 body,
                 kind: "review".into(),
                 path: None,
                 state,
+                url: r.html_url,
             });
         }
         let inline: Vec<GhReviewComment> = self
@@ -641,12 +743,13 @@ impl GithubClient {
                 continue;
             }
             out.push(Comment {
-                author: c.user.map(|u| u.login),
+                author: c.user.and_then(|u| u.login),
                 created_at: c.created_at,
                 body,
                 kind: "review_comment".into(),
                 path: c.path,
                 state: None,
+                url: c.html_url,
             });
         }
         Ok(out)
@@ -666,6 +769,17 @@ impl GithubClient {
             .into_iter()
             .map(|p| PullRequest::from_wire(p, full_name))
             .collect())
+    }
+
+    /// One pull request's head commit sha.
+    ///
+    /// Its own method because this is the freshness question and callers ask it on its own:
+    /// "is the diff I stored still the diff?" Reading the whole pull request to answer it
+    /// would work, and costs the same call — this just names the intent.
+    pub async fn pull_head_sha(&self, full_name: &str, number: u64) -> Result<Option<String>> {
+        let url = format!("{API}/repos/{full_name}/pulls/{number}");
+        let pull: GhPull = self.get_json(&url).await?;
+        Ok(pull.head.and_then(|h| h.sha))
     }
 
     /// The files a pull request touches, with their diffs.
@@ -824,6 +938,8 @@ struct GhIssueComment {
     user: Option<GhUser>,
     #[serde(default)]
     created_at: Option<String>,
+    #[serde(default)]
+    html_url: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -836,6 +952,8 @@ struct GhReview {
     state: Option<String>,
     #[serde(default)]
     submitted_at: Option<String>,
+    #[serde(default)]
+    html_url: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -848,6 +966,8 @@ struct GhReviewComment {
     path: Option<String>,
     #[serde(default)]
     created_at: Option<String>,
+    #[serde(default)]
+    html_url: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -874,11 +994,12 @@ impl PullRequest {
             number: p.number,
             title: p.title,
             url: p.html_url,
-            author: p.user.map(|u| u.login),
+            author: p.user.and_then(|u| u.login),
             state: p.state,
             draft: p.draft,
             body: p.body.map(|b| truncate(&b, 1_500)),
             labels: p.labels.into_iter().map(|l| l.name).collect(),
+            head_sha: p.head.as_ref().and_then(|h| h.sha.clone()),
             head_ref: p.head.map(|h| h.label),
             updated_at: p.updated_at,
             merged_at: p.merged_at,
@@ -891,6 +1012,10 @@ impl PullRequest {
 struct GhRef {
     #[serde(default)]
     label: String,
+    /// The head commit. This is what a diff is actually *of* — see
+    /// [`PullRequest::head_sha`].
+    #[serde(default)]
+    sha: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -936,9 +1061,21 @@ struct GhCommitAuthor {
     date: Option<String>,
 }
 
+/// A GitHub account, as it appears attached to a commit, issue, comment or review.
+///
+/// `login` is **optional**, and that is not defensive typing — GitHub returns an *empty
+/// object* (`"author": {}`), not `null`, when it cannot resolve a commit's author to an
+/// account. `Option<GhUser>` accepted the `null` case and still required `login` inside an
+/// object, so one such commit failed the deserialization of the entire 100-commit page.
+///
+/// The cost of that was total rather than partial: `restatedev/homebrew-tap` has 14 of them
+/// on its first page, so every attempt to walk its history died on the same page and the repo
+/// sat at **zero** commits indexed indefinitely — no error surfaced anywhere a reader would
+/// look, just a repo that never progressed.
 #[derive(Deserialize)]
 struct GhUser {
-    login: String,
+    #[serde(default)]
+    login: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -983,9 +1120,13 @@ impl GhCommit {
             .unwrap_or_else(Utc::now);
         CommitEntry {
             full_name: full_name.to_string(),
+            // The GitHub account if it resolved, else the git author's name from the commit
+            // itself. `and_then`, not `map`: an unresolvable author arrives as `{}`, so the
+            // account is present-but-empty and has to fall through to the git name — which
+            // is the more useful answer anyway, since it is what the commit actually says.
             author: self
                 .author
-                .map(|a| a.login)
+                .and_then(|a| a.login)
                 .or_else(|| self.commit.author.and_then(|a| a.name)),
             committed_at,
             message: truncate(&self.commit.message, 1_000),
@@ -1052,6 +1193,190 @@ fn first_line(body: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A commits page containing a commit GitHub could not attribute to an account.
+    ///
+    /// Verbatim in shape from `restatedev/homebrew-tap`, which has 14 of these on its first
+    /// page: the author is an **empty object**, not `null`. That distinction cost the repo its
+    /// entire index — `Option<GhUser>` handled `null` and still demanded `login` inside an
+    /// object, so one such commit failed the whole 100-commit page and the walk never advanced
+    /// past it.
+    ///
+    /// Asserted on the decode of a *page*, not of one commit, because the loss was
+    /// all-or-nothing: the point is that the good commits alongside it survive.
+    #[test]
+    fn a_commit_with_an_unattributable_author_does_not_fail_its_page() {
+        let page = serde_json::json!([
+            {
+                "sha": "5a3d328e",
+                "html_url": "https://github.com/o/r/commit/5a3d328e",
+                "author": {},
+                "committer": {},
+                "commit": {
+                    "message": "Brew formula update for restate-server version v1.5.1",
+                    "author": { "name": "BrewTestBot", "date": "2026-06-01T10:00:00Z" }
+                }
+            },
+            {
+                "sha": "deadbeef",
+                "html_url": "https://github.com/o/r/commit/deadbeef",
+                "author": { "login": "lukebond" },
+                "commit": {
+                    "message": "a normal commit",
+                    "author": { "name": "Luke Bond", "date": "2026-06-02T10:00:00Z" }
+                }
+            },
+            {
+                "sha": "cafef00d",
+                "author": null,
+                "commit": {
+                    "message": "author genuinely absent",
+                    "author": { "name": "Someone", "date": "2026-06-03T10:00:00Z" }
+                }
+            }
+        ]);
+        let decoded: Vec<GhCommit> =
+            serde_json::from_value(page).expect("an empty author object must not fail the page");
+        assert_eq!(decoded.len(), 3);
+
+        let entries: Vec<CommitEntry> = decoded
+            .into_iter()
+            .map(|c| c.into_entry("restatedev/homebrew-tap"))
+            .collect();
+        // No account, so the git author's own name is the answer — which is what the commit
+        // actually says, and more useful than nothing.
+        assert_eq!(entries[0].author.as_deref(), Some("BrewTestBot"));
+        // A resolved account still wins over the git name.
+        assert_eq!(entries[1].author.as_deref(), Some("lukebond"));
+        // `null` behaves the same as `{}` — both mean "no account".
+        assert_eq!(entries[2].author.as_deref(), Some("Someone"));
+    }
+
+    fn decide(reviews: &[(&str, &str)]) -> Option<&'static str> {
+        review_decision(reviews.iter().map(|(w, s)| (*w, *s)))
+    }
+
+    #[test]
+    fn a_rendered_comment_carries_its_link() {
+        // The summariser is told to link each participant to the comment where they said
+        // it, and this header line is where it gets the URL from.
+        let c = Comment {
+            author: Some("pcholakov".into()),
+            created_at: Some("2026-07-27T10:00:00Z".into()),
+            body: "drop that change, it is redundant".into(),
+            kind: "review".into(),
+            path: None,
+            state: Some("APPROVED".into()),
+            url: Some("https://github.com/o/r/pull/1#pullrequestreview-9".into()),
+        };
+        let rendered = c.render();
+        assert!(
+            rendered.starts_with(
+                "[review] pcholakov (APPROVED) 2026-07-27 \
+                 <https://github.com/o/r/pull/1#pullrequestreview-9>:"
+            ),
+            "{rendered}"
+        );
+        // No URL: no angle brackets to copy, so the prompt falls back to plain text.
+        let bare = Comment { url: None, ..c };
+        assert!(!bare.render().contains('<'), "{}", bare.render());
+    }
+
+    #[test]
+    fn no_reviews_is_no_decision() {
+        assert_eq!(decide(&[]), None);
+    }
+
+    #[test]
+    fn an_approval_is_an_approval() {
+        assert_eq!(decide(&[("alice", "APPROVED")]), Some("approved"));
+    }
+
+    #[test]
+    fn only_a_reviewers_latest_review_counts() {
+        // Requested changes, then approved once they were made. Taking any review but
+        // the last would leave this PR looking blocked for ever.
+        assert_eq!(
+            decide(&[("alice", "CHANGES_REQUESTED"), ("alice", "APPROVED")]),
+            Some("approved")
+        );
+    }
+
+    #[test]
+    fn a_later_comment_does_not_clear_an_approval() {
+        // GitHub does not let a comment-only review withdraw a verdict, and neither do
+        // we: a reviewer who approves and then adds a remark has still approved.
+        assert_eq!(
+            decide(&[("alice", "APPROVED"), ("alice", "COMMENTED")]),
+            Some("approved")
+        );
+    }
+
+    #[test]
+    fn one_block_outranks_any_number_of_approvals() {
+        assert_eq!(
+            decide(&[
+                ("alice", "APPROVED"),
+                ("bob", "APPROVED"),
+                ("carol", "CHANGES_REQUESTED"),
+            ]),
+            Some("changes_requested")
+        );
+    }
+
+    #[test]
+    fn a_dismissed_review_is_a_withdrawn_one() {
+        assert_eq!(
+            decide(&[("alice", "CHANGES_REQUESTED"), ("alice", "DISMISSED")]),
+            None
+        );
+        // Dismissing one person's block leaves someone else's approval standing.
+        assert_eq!(
+            decide(&[
+                ("alice", "CHANGES_REQUESTED"),
+                ("bob", "APPROVED"),
+                ("alice", "DISMISSED"),
+            ]),
+            Some("approved")
+        );
+    }
+
+    #[test]
+    fn comments_alone_are_a_look_not_a_verdict() {
+        assert_eq!(
+            decide(&[("alice", "COMMENTED"), ("bob", "COMMENTED")]),
+            Some("commented")
+        );
+    }
+
+    #[test]
+    fn discussion_comments_carry_no_verdict() {
+        // `review_decision_of` must ignore the issue-conversation half of the feed: a
+        // discussion comment has no state, and one that happens to say "approved" in
+        // prose is not a review.
+        let comments = vec![
+            Comment {
+                author: Some("alice".into()),
+                created_at: None,
+                body: "looks approved to me".into(),
+                kind: "discussion".into(),
+                path: None,
+                state: None,
+                url: Some("https://github.com/o/r/pull/1#issuecomment-1".into()),
+            },
+            Comment {
+                author: Some("bob".into()),
+                created_at: None,
+                body: String::new(),
+                kind: "review".into(),
+                path: None,
+                state: Some("APPROVED".into()),
+                url: Some("https://github.com/o/r/pull/1#pullrequestreview-2".into()),
+            },
+        ];
+        assert_eq!(review_decision_of(&comments), Some("approved"));
+        assert_eq!(review_decision_of(&comments[..1]), None);
+    }
 
     #[test]
     fn repo_parsed_from_either_url_shape() {

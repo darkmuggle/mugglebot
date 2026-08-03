@@ -29,7 +29,7 @@ import type {
 } from "../types";
 import { AttentionBadge } from "./Attention";
 import Attempt, { prKey } from "./Attempt";
-import { displayTitle, ref } from "./Board";
+import { displayTitle, KIND_LABEL, ref } from "./Board";
 import DiffPane from "./DiffPane";
 import DispatchStrip from "./DispatchStrip";
 import { SignalModal, signalHref } from "./SignalModal";
@@ -142,10 +142,19 @@ const CITE_LABEL: Record<string, string> = {
   browser: "dashboard",
 };
 
+/// Drop the `**Headline:**` section. It exists so the board row has one line to show;
+/// on this page the title is at the top and the sections below say it at length, so
+/// rendering it here is the same fact a third time.
+function withoutHeadline(src: string): string {
+  return src
+    .replace(/^\s*(?:#+\s*)?\*{0,2}headline\*{0,2}\s*:.*$/im, "")
+    .trimStart();
+}
+
 function renderSummary(src: string): string {
   // Citations are evidence metadata, not prose. Collapse adjacent citations so
   // one well-supported sentence does not turn into a row of equal-weight pills.
-  return renderMarkdown(src).replace(
+  return renderMarkdown(withoutHeadline(src)).replace(
     new RegExp(`(?:\\[(${CITE_KINDS}):([^\\]\\s]+)\\])+`, "g"),
     (group) => {
       const entries = [
@@ -391,6 +400,16 @@ export default function SubjectDetail(props: {
 
   const [allRelations, setAllRelations] = createSignal(false);
 
+  /// A reasoning pass ran and stored something the backend then judged unusable.
+  ///
+  /// `decorated.summary` is the backend's own verdict on the stored text, so this reads
+  /// its judgement rather than re-implementing it here — a second copy of that rule in
+  /// TypeScript would drift from the Rust one.
+  const summaryFailed = createMemo(() => {
+    const t = thread();
+    return !!t?.last_reasoned_at && !t.attention.decorated.summary;
+  });
+
   /// Which related subjects are worth the reader's attention, and which are behind
   /// "N more".
   ///
@@ -613,9 +632,25 @@ export default function SubjectDetail(props: {
                   </div>
                 )}
               </Show>
+              {/* A stored summary the backend has judged unusable — it recited the
+                  prompt, pasted the evidence, or copied the discussion — must not be
+                  rendered as if it were content. `last_reasoned_at` set with
+                  `decorated.summary` false is exactly that case, and the board row
+                  already says "not summarised": this is what stops the two disagreeing. */}
               <Show
-                when={t().summary}
-                fallback={<p class="summary muted">No summary yet.</p>}
+                when={t().summary && !summaryFailed()}
+                fallback={
+                  <p class="summary muted">
+                    <Show
+                      when={summaryFailed()}
+                      fallback={<>No summary yet.</>}
+                    >
+                      The last summary pass produced nothing usable — it repeated its
+                      own instructions or the evidence rather than summarising. Re-run
+                      it from Analyse.
+                    </Show>
+                  </p>
+                }
               >
                 <div
                   class="summary md"
@@ -970,8 +1005,21 @@ export default function SubjectDetail(props: {
                             onChange={() => toggle(s.id)}
                           />
                         </label>
+                        {/* Source *and* kind. The pill used to say only "GITHUB", which
+                            told the reader the one thing every entry here already had in
+                            common and left out the one that varies — whether this thread is
+                            an issue or a pull request. Read from the same `KIND_LABEL` the
+                            board row uses, so the detail view cannot name a thread something
+                            the row it was opened from didn't.
+
+                            Only for GitHub signals on a GitHub subject: a Slack message
+                            attached to a PR (they get moved, see `subject::attach`) is still
+                            a Slack event, and labelling it "GitHub PR" would be a lie about
+                            where it came from. */}
                         <span class={`src src-${s.source}`}>
-                          {s.source.toUpperCase()}
+                          {s.source === "github" && t().rank !== "slack_thread"
+                            ? KIND_LABEL[t().rank].toUpperCase()
+                            : s.source.toUpperCase()}
                         </span>
                         <Show when={timelineOutcome(s)}>
                           {(outcome) => (
@@ -990,11 +1038,11 @@ export default function SubjectDetail(props: {
                           )}
                         </Show>
                         <time>{new Date(s.occurred_at).toLocaleString()}</time>
-                        <Show when={s.upstream_gone}>
-                          <span class="state state-resolved">
-                            gone upstream
-                          </span>
-                        </Show>
+                        {/* No "gone upstream" pill. It is bookkeeping about the
+                            notification rather than about the work — every superseded
+                            entry in a five-event timeline carries it, so it marked
+                            almost everything and distinguished nothing. The reconciler
+                            still uses the flag; it just isn't news to the reader. */}
                       </div>
                       <div class="tl-content">
                         {/* Titles originate upstream and can contain Markdown. Render

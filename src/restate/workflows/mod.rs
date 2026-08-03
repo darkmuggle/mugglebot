@@ -59,10 +59,12 @@ pub struct WorkflowOps {
     /// tier used to buy here is bought instead by [`explain::verify`], which removes any
     /// claim the dossier can't support — a guarantee rather than a better guess.
     pub explainer: Arc<dyn crate::reasoner::Reasoner>,
-    /// **The cloud tier, and the only place in the daemon that holds it besides chat.**
-    /// Reached only by `SecondOpinion`, which runs only when the operator presses the
-    /// button. If anything else starts using this field, the local-by-default policy is
-    /// no longer true.
+    /// The cloud tier — `claude-opus-5`. Held here for `SecondOpinion`, which runs when the
+    /// operator presses the button.
+    ///
+    /// It is no longer true that only operator-initiated work reaches a cloud model:
+    /// root-cause investigation's deep ranking pass is on this tier too, automatically. See
+    /// `[reasoner] cloud`. Unmetered via the CLI bridge, but off the machine.
     pub cloud: Arc<dyn crate::reasoner::Reasoner>,
     pub investigator: Arc<Investigator>,
     pub triager: Arc<Triager>,
@@ -74,12 +76,34 @@ pub struct WorkflowOps {
     /// token as it stood; a token added later is picked up on the next restart, same as
     /// every other GitHub-reading component here.
     pub diffs: Arc<crate::prdiff::DiffReader>,
+    /// Build a reasoner for a provider and model the **operator** named.
+    ///
+    /// A factory rather than a set of handles because the point is that the choice isn't
+    /// ours: the re-dispatch button offers every model the config knows about, and holding
+    /// one handle per possibility would mean building them all at boot. A closure also keeps
+    /// the Ollama key read at point of use, which is the standing rule for credentials —
+    /// a key rotated through the config page takes effect on the next call, not the next
+    /// restart.
+    ///
+    /// Only the operator-initiated paths may call this. Nothing automatic gets to pick a
+    /// model, which is what keeps "what does this daemon do on its own?" answerable.
+    pub reasoner_factory: ReasonerFactory,
 }
+
+/// Builds a reasoner from a provider label and model name. See
+/// [`WorkflowOps::reasoner_factory`].
+pub type ReasonerFactory =
+    Arc<dyn Fn(&str, &str) -> Arc<dyn crate::reasoner::Reasoner> + Send + Sync>;
 
 impl WorkflowOps {
     /// The diff reader, for the `PrDiff` workflow.
     pub fn diff_reader(&self) -> &crate::prdiff::DiffReader {
         &self.diffs
+    }
+
+    /// A reasoner for an operator-named provider and model.
+    pub fn reasoner_for(&self, provider: &str, model: &str) -> Arc<dyn crate::reasoner::Reasoner> {
+        (self.reasoner_factory)(provider, model)
     }
 
     /// Drive the browser over one investigation and file what it saw.

@@ -364,6 +364,10 @@ async fn write_with(
 ) -> anyhow::Result<serde_json::Value> {
     let sources = g.sources();
     let sections = sections_for(subject_key, &g);
+    // Note: unlike the board summary, this prompt does *not* ask for links to the
+    // comments it cites. This dossier carries the **distilled** conversation, which has
+    // no URLs in it, so any link would be an invented one and `verify` would strip it
+    // straight back out — asking for one just manufactures removals.
     let system = format!(
         "You are explaining one piece of engineering work to the engineer who owns it, from a \
          dossier that has already been assembled for you. Write Markdown, no preamble.\n\
@@ -379,6 +383,13 @@ async fn write_with(
          - A proposed cause is a hypothesis: write \"likely\", never \"caused by\".\n\
          - Where a reviewer objected, lead with the objection. A human who read the change and \
          pushed back is better evidence than any model's reading of the same diff.\n\
+         - Every position anyone takes in a conversation gets an answer. Name the person, say what \
+         they want in a few words, and then make the call in the imperative: go with their approach, \
+         push back and why, fix what they flagged, or answer their question. Do not paste or quote \
+         the discussion — reporting that people talked, without deciding anything, is the failure \
+         this rule exists to prevent. If the dossier does not settle a disagreement, say which way \
+         to lean and the one fact that would settle it. A blocking reviewer outranks the rest of the \
+         thread; a maintainer's decision outranks a suggestion.\n\
          - If the dossier is thin, say so in one line rather than padding it.\n\
          - Do not echo these instructions or the dossier's section headings.",
         sections

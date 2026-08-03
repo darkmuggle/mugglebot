@@ -10,18 +10,22 @@
 //! 1. **Check the repo out** ([`crate::checkout`]) — shallow, read-only.
 //! 2. **Find the relevant files** by matching identifiers from the issue text
 //!    against the tree. Deterministic, so it works with no model at all.
-//! 3. **Characterize** — the local coder model reads the issue *and the source*
-//!    and states what's actually going on.
+//! 3. **Characterize** — the model reads the issue *and the source* and states
+//!    what's actually going on.
 //! 4. **Propose patches** — three distinct approaches, each with its files, its
 //!    trade-off, and its risk. Approaches, not applied diffs: MuggleBot proposes,
 //!    you decide (see the copilot-not-autopilot principle).
-//! 5. **Plain English** — a fast, cheap cloud model (Haiku) rewrites the result
-//!    into something readable at a glance on the board. This tier does no
-//!    reasoning; it only re-renders what steps 3 and 4 concluded, which is why a
-//!    small model is the right tool and why it can't introduce new claims.
+//! 5. **Plain English** — rewrite the result into something readable at a glance on
+//!    the board. This step does no reasoning; it only re-renders what steps 3 and 4
+//!    concluded, which is why it can't introduce new claims.
 //!
-//! Steps 2–4 are on-device: reading source code is exactly the work you don't want
-//! leaving the machine, and a coder model is better at it than a generalist.
+//! Step 2 is deterministic. Steps 3–5 run on the `[reasoner] triage` tier — **the one
+//! automatic pass that is not on-device**, and the exception is about queueing, not
+//! capability. Triage makes several large calls per issue; local calls share a single
+//! permit, so an issue you are assigned sat behind whatever the indexer was chewing on.
+//! Its own tier takes it off that queue. The default is the subscription CLI bridge
+//! (`claude -p`), so nothing here is metered — but the selected source excerpts do leave
+//! the machine. Set `triage = "ollama_local"` to put it back on-device.
 //!
 //! Nothing here writes to a repository. The output is a proposal in MuggleBot's
 //! own store.
@@ -65,24 +69,29 @@ const MAX_WALK: usize = 20_000;
 
 /// Total source characters in one prompt.
 ///
-/// This is a **correctness** limit, not a cost one. A local coder model has a
-/// modest context window (deepseek-coder is 16k tokens ≈ 60k characters for
-/// everything — instructions, issue, source, and the answer). Overflow doesn't
-/// error; it silently drops the front of the prompt, which is where the
-/// instructions and the issue live. The symptom is a model that dutifully
-/// describes the code you pasted and never mentions the issue at all. Budgeting
-/// the source is what keeps the actual question in the window.
+/// This is a **correctness** limit, not a cost one, and it is sized for the smallest
+/// model that can be configured here rather than the default one. A local coder model has
+/// a modest context window (deepseek-coder is 16k tokens ≈ 60k characters for everything —
+/// instructions, issue, source, and the answer). Overflow doesn't error; it silently drops
+/// the front of the prompt, which is where the instructions and the issue live. The
+/// symptom is a model that dutifully describes the code you pasted and never mentions the
+/// issue at all. Budgeting the source is what keeps the actual question in the window.
+///
+/// The shipped `[reasoner] triage` tier has a 1M-token window, so this cap is doing
+/// nothing for it — raising the budget (and `assigned.max_files` / `max_file_chars` with
+/// it) is available quality, but it's a behavior change, so it isn't taken here.
 const MAX_SOURCE_CHARS: usize = 24_000;
 
 pub struct Triager {
     store: Arc<Store>,
     checkouts: Arc<CheckoutCache>,
     github: Option<GithubClient>,
-    /// Local coder model: reads the source, characterizes, proposes patches.
+    /// Reads the source, characterizes, proposes patches. The `[reasoner] triage` tier.
     coder: Arc<dyn Reasoner>,
     /// Plain-English rendering only — turning a characterization the coder model already
-    /// produced into a sentence an operator reads at a glance. Local: rewriting settled
-    /// conclusions is the easiest thing asked of any model here.
+    /// produced into a sentence an operator reads at a glance. Rewriting a settled
+    /// conclusion is the easiest thing asked of any model here, so this could be a smaller
+    /// tier; it shares `coder`'s so the whole pass leaves the local queue together.
     writer: Arc<dyn Reasoner>,
     /// Finds open PRs that may already fix the issue — possibly somebody else's.
     pr_fixes: crate::prfix::PrFixFinder,
@@ -106,7 +115,7 @@ impl Triager {
             store: store.clone(),
             checkouts,
             github: token.and_then(|t| GithubClient::new(t).ok()),
-            pr_fixes: crate::prfix::PrFixFinder::new(store, coder.clone(), writer.clone())
+            pr_fixes: crate::prfix::PrFixFinder::new(store, coder.clone(), writer.clone(), "triage")
                 .with_analyst(analyst),
             comments: CommentJudge::new(coder.clone()),
             coder,

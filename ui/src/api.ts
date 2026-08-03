@@ -228,6 +228,14 @@ export const api = {
     }).then(unwrap);
   },
 
+  /** The incidents board: open incidents with whatever each has been mapped to. */
+  incidents(): Promise<{ open: number; incidents: SubjectView[] }> {
+    return fetch(`${API}/api/incidents`).then((r) => {
+      if (!r.ok) throw new Error(`incidents: ${r.status}`);
+      return r.json();
+    });
+  },
+
   /** Models selectable for a provider (`anthropic` | `openai` | `ollama` | `ollama_local`). */
   models(provider: string): Promise<string[]> {
     return fetch(`${API}/api/models/${encodeURIComponent(provider)}`)

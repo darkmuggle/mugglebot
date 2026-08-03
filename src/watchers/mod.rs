@@ -10,6 +10,7 @@ use std::time::Duration;
 use crate::signal::{Signal, Source};
 
 pub mod assigned;
+pub mod incident;
 pub mod github;
 pub mod granola;
 pub mod slack;

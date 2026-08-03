@@ -10,6 +10,7 @@ import {
   Switch,
 } from "solid-js";
 import Board from "./components/Board";
+import Incidents from "./components/Incidents";
 import Chat from "./components/Chat";
 import ConfigPage from "./components/Config";
 import ContextLibrary from "./components/Context";
@@ -20,12 +21,21 @@ import SubjectDetail from "./components/SubjectDetail";
 import TooltipLayer from "./components/Tooltip";
 import { connect, connected, disconnect, health, hints, redAlert, signals, subjects } from "./state";
 
-type View = "board" | "memory" | "context" | "tags" | "index" | "chat" | "config";
+type View =
+  | "board"
+  | "incidents"
+  | "memory"
+  | "context"
+  | "tags"
+  | "index"
+  | "chat"
+  | "config";
 
-const SOURCES = ["github", "slack", "granola"] as const;
+const SOURCES = ["github", "slack", "granola", "incident"] as const;
 
 const VIEWS: View[] = [
   "board",
+  "incidents",
   "memory",
   "context",
   "tags",
@@ -101,6 +111,9 @@ export default function App() {
   // (board, chat) from the reference/knowledge views (memory, context, tags, …).
   const nav: { id: View; label: string; sep?: boolean }[] = [
     { id: "board", label: "Board" },
+    // Its own top-level view, beside Board rather than under it: "what is on fire" is a
+    // different question from "what does my work need", and the two lists are disjoint.
+    { id: "incidents", label: "Incidents" },
     { id: "chat", label: "Chat" },
     { id: "memory", label: "Memory", sep: true },
     { id: "context", label: "Context" },
@@ -207,6 +220,9 @@ export default function App() {
                   onOpenChat={openChat}
                 />
               </Show>
+            </Match>
+            <Match when={view() === "incidents"}>
+              <Incidents onOpen={openThread} />
             </Match>
             <Match when={view() === "memory"}>
               <MemoryEditor />

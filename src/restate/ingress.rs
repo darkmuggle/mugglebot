@@ -230,6 +230,34 @@ impl Ingress {
     }
 
     /// Arm one repo's indexing loop. Same idempotence as the other loops.
+    /// Run one repo's indexer tick **now**, rather than waiting for its timer.
+    ///
+    /// `start` is the wrong verb for this: it is idempotent-by-staleness and deliberately
+    /// refuses when a timer is already armed, which is every repo in steady state — so the
+    /// push sweep would poke and nothing would happen. Sent rather than called, so the sweep
+    /// does not wait on a fetch-and-summarize it only needed to trigger.
+    ///
+    /// Targets `poke`, **not** `tick`. `tick` arms the next timer as its first act, so calling
+    /// it out of band forks the loop — the poked tick schedules a successor alongside the chain
+    /// already running, and every later poke adds another. `poke` does the same work and leaves
+    /// the timer alone, which is also the right meaning: a push is a reason to index now, not a
+    /// reason to index more often from now on.
+    pub async fn poke_repo_indexer(&self, repo: &str) -> Result<()> {
+        let url = format!("{}/RepoIndexer/{}/poke/send", self.base, urlencoding(repo));
+        let resp = self
+            .client
+            .post(&url)
+            .send()
+            .await
+            .with_context(|| format!("poking the indexer for {repo}"))?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            bail!("poking the indexer for {repo} returned {status}: {body}");
+        }
+        Ok(())
+    }
+
     pub async fn start_repo_indexer(&self, repo: &str) -> Result<bool> {
         let url = format!("{}/RepoIndexer/{}/start", self.base, urlencoding(repo));
         let resp = self

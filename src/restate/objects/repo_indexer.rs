@@ -112,6 +112,32 @@ impl RepoIndexer {
     async fn tick(&self, ctx: ObjectContext<'_>) -> HandlerResult<Json<serde_json::Value>> {
         let repo = ctx.key().to_string();
 
+        // A repo that has left the index ends its own loop. `index_repo` refuses it, and that
+        // refusal is swallowed as transient — correct for a clone timeout, wrong here, because
+        // nothing a later tick does brings the repo back. Left alone the chain reschedules
+        // itself forever, warning on every tick: observed on `restatedev/wip-agent`, renamed
+        // upstream to `restatedev/agent`, whose new name the crawl picked up while the old
+        // name's timer kept running against a row that no longer exists.
+        //
+        // Checked before the reschedule below, since afterwards the next timer is already
+        // armed. Journalled so a replay takes the same branch as the original run.
+        let indexer = self.indexer.clone();
+        let known = {
+            let repo = repo.clone();
+            ctx.run(|| {
+                let indexer = indexer.clone();
+                let repo = repo.clone();
+                async move { Ok(indexer.knows_repo(&repo)) }
+            })
+            .await?
+        };
+        if !known {
+            // Info, not warn: this is the loop retiring cleanly. `start` re-arms it if the repo
+            // returns — the stale-timer check there sees a `NEXT_TICK_AT` that never advanced.
+            tracing::info!("index {repo}: no longer in the repo index, stopping this loop");
+            return Ok(Json(serde_json::json!({ "repo": repo, "stopped": true })));
+        }
+
         // Reschedule before the work, for the same reason the watcher does: every step
         // below ends in `?`, and an index that stops because one batch failed is an index
         // that silently never finishes. The send is journalled, so a retry replays it
@@ -123,7 +149,32 @@ impl RepoIndexer {
         ctx.object_client::<RepoIndexerClient>(repo.clone())
             .tick()
             .send_after(interval);
+        self.index_once(ctx).await
+    }
 
+    /// One bounded batch, and **no** rescheduling — for the push sweep.
+    ///
+    /// Separate from `tick` because `tick` unconditionally arms the next timer, so calling it
+    /// out of band forks the loop: the poked tick schedules its own successor alongside the
+    /// chain that was already running, and every later poke adds another. Measured on the live
+    /// board — one poke of `restatedev/restate` left three chains scheduled where there had
+    /// been two, and an actively-pushed repo would keep multiplying its own tick rate.
+    ///
+    /// Leaving the timer alone is also the right semantics: a push is a reason to index *now*,
+    /// not a reason to change how often this repo is indexed.
+    #[handler]
+    async fn poke(&self, ctx: ObjectContext<'_>) -> HandlerResult<Json<serde_json::Value>> {
+        self.index_once(ctx).await
+    }
+}
+
+impl RepoIndexer {
+    /// The work half of a tick: index a batch, record what it achieved, announce it.
+    async fn index_once(
+        &self,
+        ctx: ObjectContext<'_>,
+    ) -> HandlerResult<Json<serde_json::Value>> {
+        let repo = ctx.key().to_string();
         let indexer = self.indexer.clone();
         let known = (self.repos)();
         let repo_for_run = repo.clone();

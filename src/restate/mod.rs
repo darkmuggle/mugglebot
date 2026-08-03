@@ -48,6 +48,7 @@ pub async fn serve(
         .bind(objects::issue::Issue::new(ops.clone()))
         .bind(objects::pull_request::PullRequest::new(ops.clone()))
         .bind(objects::slack_thread::SlackThread::new(ops.clone()))
+        .bind(objects::incident::Incident::new(ops.clone()))
         .bind(workflows::root_cause::RootCause::new(wf.clone()))
         .bind(workflows::issue_triage::IssueTriage::new(wf.clone()))
         .bind(workflows::rest::BrowserRead::new(wf.clone()))

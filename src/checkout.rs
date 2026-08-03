@@ -6,10 +6,17 @@
 //! one. So before triaging an assigned issue, MuggleBot checks the repository out
 //! and gives the model real source to read.
 //!
-//! Checkouts are **shallow** (`--depth 1`, single branch): the triage only ever
+//! Checkouts start **shallow** (`--depth 1`, single branch): the triage only ever
 //! reads the current tree, and full history on a large repo costs minutes and
 //! gigabytes for nothing. Refreshes are `fetch --depth 1` + `reset --hard`, so a
 //! repo is cloned once and then updated cheaply.
+//!
+//! The code *index* needs one thing history can give and the tip cannot — which files
+//! each commit touched — so [`CheckoutCache::ensure_history`] deepens those clones on
+//! demand with `--filter=blob:none`. File names live in tree objects, so that fetches
+//! the shape of history without its contents: on a real repo, one commit became 173 for
+//! +0.5MB. A deepened clone is then refreshed *without* `--depth`, because `--depth 1`
+//! would move the boundary back up and discard the history on the very next tick.
 //!
 //! Nothing here writes to a repository. Clones are read-only working copies under
 //! the data dir; there is no commit, no push, and no remote mutation anywhere in
@@ -18,6 +25,7 @@
 //! `.git/config`) and never in `argv` (which would expose it to `ps`).
 
 use anyhow::{bail, Context, Result};
+use chrono::{DateTime, Utc};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
@@ -102,6 +110,25 @@ impl CheckoutCache {
         }
         let head_sha = self.head_sha(&path).await?;
         Ok(Checkout {
+            full_name: full_name.to_string(),
+            path,
+            head_sha,
+        })
+    }
+
+    /// The checkout already on disk, without touching the network.
+    ///
+    /// [`Self::ensure`] needs a branch and a size, and both come from an API call — so a
+    /// caller that has been refused by the GitHub budget cannot use it at all. This is the
+    /// escape hatch: a tree that is a few commits stale is still the right input for work
+    /// that reads history rather than the tip, and it costs nothing to answer.
+    pub async fn existing(&self, full_name: &str) -> Option<Checkout> {
+        let path = self.path_for(full_name);
+        if !path.join(".git").is_dir() {
+            return None;
+        }
+        let head_sha = self.head_sha(&path).await.ok()?;
+        Some(Checkout {
             full_name: full_name.to_string(),
             path,
             head_sha,
@@ -214,17 +241,173 @@ impl CheckoutCache {
     }
 
     async fn update(&self, path: &Path, branch: &str) -> Result<()> {
-        self.git(
-            Some(path),
-            &["fetch", "--depth", "1", "--no-tags", "origin", branch],
-        )
-        .await?;
+        // `--depth 1` moves the shallow boundary *back up* to one commit, so running it on
+        // a checkout that has been deepened for indexing would throw that history away —
+        // every tick, undoing the deepen it just paid for. A deepened clone refreshes
+        // without a depth argument, which leaves its boundary alone.
+        if self.is_deepened(path).await {
+            self.git(Some(path), &["fetch", "--no-tags", "origin", branch])
+                .await?;
+        } else {
+            self.git(
+                Some(path),
+                &["fetch", "--depth", "1", "--no-tags", "origin", branch],
+            )
+            .await?;
+        }
         // Discard anything local. This is a read cache, not a working tree — there
         // is nothing here worth preserving, and a dirty state would block updates
         // forever.
         self.git(Some(path), &["reset", "--hard", "FETCH_HEAD"])
             .await?;
         self.git(Some(path), &["clean", "-fdx"]).await?;
+        Ok(())
+    }
+
+    /// The files a commit touched, read out of the local clone.
+    ///
+    /// Matches what GitHub's commit API reports, which is the diff against the **first
+    /// parent** — so a merge is the change it brought in, not the union of both sides.
+    /// Getting that right needs the explicit two-tree form: bare `diff-tree <merge>`
+    /// prints *nothing* for a merge, and `-m --first-parent` prints the union of every
+    /// parent's diff (verified both). Recording "nothing" for a merge would be worse than
+    /// failing, because the indexer would file it as summarized-with-no-code and move on.
+    ///
+    /// `Err` means the clone cannot answer — usually the commit is outside a shallow
+    /// boundary — and the caller should fall back to the API.
+    pub async fn commit_files(&self, full_name: &str, sha: &str) -> Result<Vec<String>> {
+        let path = self.path_for(full_name);
+        if !path.join(".git").is_dir() {
+            bail!("{full_name} has no checkout");
+        }
+        // `-z` because git otherwise quotes and escapes unusual pathnames, and a quoted
+        // path would not match the ones the rest of the index stores.
+        let first_parent = format!("{sha}^1");
+        let out = match self
+            .git(
+                Some(&path),
+                &[
+                    "diff-tree",
+                    "--no-commit-id",
+                    "--name-only",
+                    "-r",
+                    "-z",
+                    &first_parent,
+                    sha,
+                ],
+            )
+            .await
+        {
+            Ok(out) => out,
+            // No first parent: either a root commit, or the commit isn't here at all. The
+            // `--root` form distinguishes them — it succeeds only for the former.
+            Err(_) => self
+                .git(
+                    Some(&path),
+                    &[
+                        "diff-tree",
+                        "--root",
+                        "--no-commit-id",
+                        "--name-only",
+                        "-r",
+                        "-z",
+                        sha,
+                    ],
+                )
+                .await
+                .with_context(|| format!("{full_name}@{sha} is not in the local clone"))?,
+        };
+        Ok(out
+            .split('\0')
+            .map(str::trim)
+            .filter(|f| !f.is_empty())
+            .map(str::to_string)
+            .collect())
+    }
+
+    /// Has this checkout been deepened for indexing? Recorded as the partial-clone filter
+    /// on the remote, which [`Self::ensure_history`] sets and nothing else does.
+    async fn is_deepened(&self, path: &Path) -> bool {
+        self.git(
+            Some(path),
+            &["config", "--get", "remote.origin.partialclonefilter"],
+        )
+        .await
+        .is_ok_and(|v| !v.trim().is_empty())
+    }
+
+    /// The oldest commit reachable from HEAD, RFC3339. `None` if git can't say.
+    async fn oldest_commit(&self, path: &Path) -> Option<DateTime<Utc>> {
+        let out = self
+            .git(Some(path), &["log", "--format=%cI", "HEAD"])
+            .await
+            .ok()?;
+        let last = out.lines().rfind(|l| !l.trim().is_empty())?;
+        DateTime::parse_from_rfc3339(last.trim())
+            .ok()
+            .map(|t| t.with_timezone(&Utc))
+    }
+
+    /// Fetch history back to `since` **without file contents**.
+    ///
+    /// The indexing pass needs one thing from history that the shallow tip cannot give it:
+    /// the list of files each commit touched. That used to cost one GitHub API call per
+    /// commit — thousands of them, against a 5000/hour budget — while the same answer is
+    /// derivable locally from the commit's tree.
+    ///
+    /// `--filter=blob:none` is what makes this affordable: file *names* live in tree
+    /// objects, so the blobs (the actual file contents, and nearly all of the bytes) are
+    /// never downloaded. On a real repo this turned one commit into 173 for +0.5MB in 0.6s.
+    /// Git protocol also doesn't spend the REST budget, so this trades a rationed resource
+    /// for an unrationed one.
+    ///
+    /// Idempotent and cheap to call repeatedly: it returns immediately once history already
+    /// reaches `since`.
+    pub async fn ensure_history(&self, full_name: &str, since: DateTime<Utc>) -> Result<()> {
+        let path = self.path_for(full_name);
+        if !path.join(".git").is_dir() {
+            bail!("{full_name} has no checkout to deepen");
+        }
+        if self
+            .oldest_commit(&path)
+            .await
+            .is_some_and(|oldest| oldest <= since)
+        {
+            return Ok(());
+        }
+        // Marking the remote a promisor is what lets a filtered fetch land on a clone that
+        // was created unfiltered; without it git refuses the filter.
+        for (k, v) in [
+            ("remote.origin.promisor", "true"),
+            ("remote.origin.partialclonefilter", "blob:none"),
+        ] {
+            self.git(Some(&path), &["config", k, v])
+                .await
+                .with_context(|| format!("configuring {k} on {full_name}"))?;
+        }
+        // Fetch further back than asked. The dates come from two clocks: the index stores
+        // GitHub's *author* date, while `--shallow-since` and `git log %cI` work in
+        // *committer* dates, and a rebase or a squash separates them — observed two days
+        // apart on a real repo, which left the boundary short of the target, so the
+        // short-circuit above never fired and every tick re-fetched. A month of slack costs
+        // almost nothing when blobs aren't coming and removes the whole class of problem.
+        let since_arg = format!(
+            "--shallow-since={}",
+            (since - chrono::Duration::days(30)).to_rfc3339()
+        );
+        debug!("checkout: deepening {full_name} back to {since}");
+        self.git(
+            Some(&path),
+            &[
+                "fetch",
+                &since_arg,
+                "--filter=blob:none",
+                "--no-tags",
+                "origin",
+            ],
+        )
+        .await
+        .with_context(|| format!("deepening {full_name}"))?;
         Ok(())
     }
 
@@ -529,5 +712,134 @@ mod tests {
             base64(b"x-access-token:ghp_abc"),
             "eC1hY2Nlc3MtdG9rZW46Z2hwX2FiYw=="
         );
+    }
+}
+
+#[cfg(test)]
+mod git_history_tests {
+    use super::*;
+
+    /// A real repository, built locally, so the git semantics are tested rather than
+    /// assumed. This is the file-list source the code index now depends on.
+    struct Repo {
+        root: PathBuf,
+        cache: CheckoutCache,
+    }
+
+    impl Drop for Repo {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.root).ok();
+        }
+    }
+
+    impl Repo {
+        async fn new(name: &str) -> Self {
+            let root = std::env::temp_dir().join(format!("mb-git-{name}-{}", std::process::id()));
+            std::fs::remove_dir_all(&root).ok();
+            // The cache expects <root>/<owner>/<name>.
+            let repo = root.join("org").join("repo");
+            std::fs::create_dir_all(&repo).unwrap();
+            let cache = CheckoutCache::new(root.clone(), None, 0, 0);
+            for args in [
+                vec!["init", "-q"],
+                vec!["config", "user.email", "t@example.com"],
+                vec!["config", "user.name", "t"],
+            ] {
+                cache.git(Some(&repo), &args).await.unwrap();
+            }
+            Self { root, cache }
+        }
+
+        fn path(&self) -> PathBuf {
+            self.root.join("org").join("repo")
+        }
+
+        async fn git(&self, args: &[&str]) -> String {
+            self.cache.git(Some(&self.path()), args).await.unwrap()
+        }
+
+        async fn commit(&self, file: &str, msg: &str) -> String {
+            std::fs::write(self.path().join(file), msg).unwrap();
+            self.git(&["add", "."]).await;
+            self.git(&["commit", "-q", "-m", msg]).await;
+            self.git(&["rev-parse", "HEAD"]).await.trim().to_string()
+        }
+
+        async fn files(&self, sha: &str) -> Vec<String> {
+            self.cache.commit_files("org/repo", sha).await.unwrap()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_root_commit_reports_the_files_it_added() {
+        let repo = Repo::new("root").await;
+        let root = repo.commit("base.txt", "base").await;
+        // `<sha>^1` does not exist for a root commit, so this only works via `--root`.
+        assert_eq!(repo.files(&root).await, vec!["base.txt".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn an_ordinary_commit_reports_only_what_it_changed() {
+        let repo = Repo::new("ordinary").await;
+        repo.commit("base.txt", "base").await;
+        let second = repo.commit("second.txt", "second").await;
+        assert_eq!(repo.files(&second).await, vec!["second.txt".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn a_merge_reports_its_first_parent_diff_not_nothing_and_not_the_union() {
+        // The case that made this worth writing by hand. Bare `diff-tree <merge>` prints
+        // nothing, which the indexer would store as "changed no code" and never revisit;
+        // `-m --first-parent` prints the union of both parents' diffs. Neither matches what
+        // GitHub's commit API returns, which is the first-parent diff.
+        let repo = Repo::new("merge").await;
+        repo.commit("base.txt", "base").await;
+        repo.git(&["checkout", "-qb", "feature"]).await;
+        repo.commit("feature.txt", "feat").await;
+        repo.git(&["checkout", "-q", "-"]).await;
+        repo.commit("mainonly.txt", "main work").await;
+        repo.git(&["merge", "-q", "--no-ff", "feature", "-m", "merge"])
+            .await;
+        let merge = repo.git(&["rev-parse", "HEAD"]).await.trim().to_string();
+
+        let files = repo.files(&merge).await;
+        assert_eq!(
+            files,
+            vec!["feature.txt".to_string()],
+            "a merge is the change it brought in"
+        );
+        assert!(
+            !files.iter().any(|f| f == "mainonly.txt"),
+            "the first parent's own work is not part of the merge: {files:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_commit_that_is_not_in_the_clone_is_an_error_not_an_empty_list() {
+        // The caller distinguishes these: an error falls back to the GitHub API, whereas an
+        // empty list would be recorded as "this commit touched no code" and never retried.
+        let repo = Repo::new("absent").await;
+        repo.commit("base.txt", "base").await;
+        let absent = "0123456789abcdef0123456789abcdef01234567";
+        assert!(repo.cache.commit_files("org/repo", absent).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn paths_with_spaces_survive_the_round_trip() {
+        // `-z` output, because git quotes and escapes awkward pathnames otherwise and a
+        // quoted path would not match what the index stores elsewhere.
+        let repo = Repo::new("spaces").await;
+        let sha = repo.commit("a file with spaces.txt", "x").await;
+        assert_eq!(
+            repo.files(&sha).await,
+            vec!["a file with spaces.txt".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_missing_checkout_is_an_error() {
+        let cache = CheckoutCache::new(PathBuf::from("/nonexistent-checkout-root"), None, 0, 0);
+        assert!(cache.commit_files("org/repo", "HEAD").await.is_err());
+        assert!(cache.existing("org/repo").await.is_none());
     }
 }

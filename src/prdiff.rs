@@ -116,13 +116,30 @@ pub struct DiffReport {
     /// Why this PR has no diff, when it has none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// The head commit this diff is of.
+    ///
+    /// The freshness token that actually corresponds to the thing being cached. `watermark`
+    /// records what *triggered* the read, which is not the same question: a pull request
+    /// pushed to without notifying anybody keeps its watermark and silently keeps a diff of
+    /// the previous commit. Compared against the live head by the push sweep.
+    ///
+    /// `Option`, and defaulted, because diffs stored before this existed have no sha — those
+    /// read as "unknown", which the sweep treats as *stale* rather than current. Assuming
+    /// current would leave every pre-existing diff permanently unrefreshed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head_sha: Option<String>,
 }
 
 /// A stored report, with what it was built from.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoredDiff {
-    /// The subject watermark this was read at — the newest signal id on the PR. The
-    /// freshness token, and free: it needs no extra API call to compute, unlike a head sha.
+    /// What triggered this read — the newest signal id on the PR, or a synthetic token for
+    /// an explicit re-read. Free to compute, which is why it is here.
+    ///
+    /// **Not** the freshness token any more. It was, and the consequence was the bug this
+    /// field's doc used to describe as a saving: activity is a proxy for "the diff changed",
+    /// and a push to your own branch produces no activity. `report.head_sha` is the real
+    /// answer; this stays for provenance and for the workflow key.
     pub watermark: String,
     pub fetched_at: chrono::DateTime<chrono::Utc>,
     pub report: DiffReport,
@@ -238,17 +255,30 @@ pub struct StoredReview {
 /// Fetch and summarize one PR's diff.
 pub struct DiffReader {
     pub github: Option<GithubClient>,
-    /// Local by policy: reading a diff is exactly the work that shouldn't leave the machine.
+    /// Reads and reviews the diff. The `[reasoner] code` tier — off the machine by default,
+    /// because a 33B local coder reviewing a refactor produced four copies of one sentence,
+    /// each anchored to a line the patch deleted.
     pub reasoner: Arc<dyn Reasoner>,
+    /// What the pane reports as having produced the review. Carried rather than assumed —
+    /// see [`DiffReader::review`].
+    tier: String,
 }
 
 impl DiffReader {
-    pub fn new(token: Option<String>, reasoner: Arc<dyn Reasoner>) -> Result<Self> {
+    pub fn new(
+        token: Option<String>,
+        reasoner: Arc<dyn Reasoner>,
+        tier: impl Into<String>,
+    ) -> Result<Self> {
         let github = match token {
             Some(t) => Some(GithubClient::new(t)?),
             None => None,
         };
-        Ok(Self { github, reasoner })
+        Ok(Self {
+            github,
+            reasoner,
+            tier: tier.into(),
+        })
     }
 
     /// Read `repo#number`'s diff and summarize it.
@@ -266,6 +296,7 @@ impl DiffReader {
             summary: None,
             truncated: false,
             error,
+            head_sha: None,
         };
         let Some(gh) = &self.github else {
             return empty(Some("reading a diff needs a stored GitHub token".into()));
@@ -277,12 +308,24 @@ impl DiffReader {
             Ok(f) => f,
             Err(e) => return empty(Some(format!("{e:#}"))),
         };
+        // One extra call, to record *which commit* this diff is of. Worth it against the
+        // rest of a read — a files call plus up to five model passes — and it is what lets a
+        // push that notified nobody be noticed at all. Best-effort: a diff whose sha could
+        // not be read is still a diff, and reads as stale rather than as current.
+        let head_sha = match gh.pull_head_sha(repo, number as u64).await {
+            Ok(sha) => sha,
+            Err(e) => {
+                debug!("head sha for {repo}#{number} unavailable: {e:#}");
+                None
+            }
+        };
         let summary = self.summarize(repo, number, &files).await;
         let additions = files.iter().map(|f| f.additions).sum();
         let deletions = files.iter().map(|f| f.deletions).sum();
         DiffReport {
             repo: repo.to_string(),
             number,
+            head_sha,
             file_count: files.len(),
             truncated: files.len() >= MAX_DIFF_FILES,
             files: files.into_iter().map(DiffFile::from).collect(),
@@ -319,7 +362,27 @@ impl DiffReader {
     ///
     /// Best-effort throughout: a diff pane with no review is still a diff pane, and a model
     /// that returns prose produces no review rather than a fabricated verdict.
+    /// Review with this reader's own tier — the automatic path.
     pub async fn review(&self, repo: &str, number: i64, report: &DiffReport) -> Option<Review> {
+        self.review_with(repo, number, report, &*self.reasoner, &self.tier)
+            .await
+    }
+
+    /// Review with a model the operator named.
+    ///
+    /// The reasoner is a parameter rather than a field because "review this again on a
+    /// different model" is a question about *this* review, not a reconfiguration of the
+    /// reader. `tier` is what the pane will report as having produced it, so it has to name
+    /// the model that actually ran — the caption is the only way to tell two reviews of the
+    /// same diff apart.
+    pub async fn review_with(
+        &self,
+        repo: &str,
+        number: i64,
+        report: &DiffReport,
+        reasoner: &dyn Reasoner,
+        tier: &str,
+    ) -> Option<Review> {
         let batches = batch_files(&report.files, REVIEW_BATCH_CHARS, MAX_REVIEW_BATCHES);
         if batches.is_empty() {
             return None;
@@ -327,9 +390,11 @@ impl DiffReader {
         let batched = batches.len();
         let mut comments: Vec<ReviewComment> = Vec::new();
         for batch in &batches {
-            comments.extend(self.findings(repo, number, batch, report).await);
+            comments.extend(self.findings(repo, number, batch, report, reasoner).await);
         }
-        let (recommendation, rationale) = self.decide(repo, number, report, &comments).await?;
+        let (recommendation, rationale) = self
+            .decide(repo, number, report, &comments, reasoner)
+            .await?;
         debug!(
             "reviewed {repo}#{number}: {recommendation:?} from {} finding(s) over {batched} batch(es)",
             comments.len()
@@ -338,9 +403,11 @@ impl DiffReader {
             recommendation,
             rationale,
             comments,
-            // "local" rather than a model name: this reader holds the on-device tier by policy,
-            // and the claim worth recording is that the review never left the machine.
-            produced_by: "local".to_string(),
+            // The tier that answered. It used to be hardcoded "local" on the reasoning that
+            // this reader held the on-device tier by policy — true when written, false the
+            // moment review moved to the `code` tier, and the pane went on captioning a
+            // Sonnet review "reviewed by local".
+            produced_by: tier.to_string(),
         })
     }
 
@@ -351,6 +418,7 @@ impl DiffReader {
         number: i64,
         batch: &[&DiffFile],
         report: &DiffReport,
+        reasoner: &dyn Reasoner,
     ) -> Vec<ReviewComment> {
         let system = "You are reviewing part of a pull request as a senior engineer on this \
              codebase. Report findings only — you are NOT deciding whether to approve, and you \
@@ -392,7 +460,19 @@ impl DiffReader {
              - Do not appeal to general practice. \"Not recommended\", \"not a best \
              practice\", \"consider a different approach\" and \"this could cause issues\" \
              are not findings — they are true of every choice and specific to none. If you \
-             cannot say what goes wrong, in these lines, do not raise it.";
+             cannot say what goes wrong, in these lines, do not raise it.\n\
+             - **Anchor on a line the change ADDS (`+`) or leaves as context (space). Never \
+             anchor on a `-` line.** A `-` line is code this pull request is deleting. \
+             Criticizing it is arguing for the state the author is moving away from, and \
+             asking them to restructure something they just removed is worse than useless. \
+             If a deletion looks wrong, the finding is about what replaced it — anchor \
+             there.\n\
+             - Do not anchor on a `@@ ... @@` hunk header. It is positional bookkeeping, \
+             not code.\n\
+             - Two findings that make the same point are one finding. If you write the same \
+             sentence about several places, you have found a pattern you cannot see the \
+             whole of from these hunks — say it once, about the clearest instance, or not at \
+             all.";
         let mut body = String::new();
         for f in batch {
             body.push_str(&format!(
@@ -403,14 +483,47 @@ impl DiffReader {
                 f.patch.as_deref().unwrap_or("")
             ));
         }
+        // What the change is, and how big it is, before the hunks.
+        //
+        // Without this the pass was reviewing two files out of eighteen with no idea what the
+        // pull request was doing — and it showed. Asked to review a refactor that moved each
+        // controller into its own subtree, it read the deletions as proposals and filed four
+        // blockers demanding the author restructure code they were in the middle of deleting.
+        // A reviewer who cannot see that a change is a move cannot review a move.
+        //
+        // Both parts are free: the summary is already computed for the pane before `review`
+        // runs, and the file list is in the report. Neither costs an API call.
+        let intent = report.summary.as_deref().unwrap_or("(not summarized)");
+        let shape = {
+            let mut s = String::new();
+            for f in &report.files {
+                s.push_str(&format!("  {} (+{} -{})\n", f.path, f.additions, f.deletions));
+            }
+            s
+        };
         let mut req = CompletionRequest::single(format!(
-            "=== PULL REQUEST {repo}#{number} — PART OF THE DIFF ===\n{}\n\
-             === YOUR TASK ===\nReport findings on these files. Reply with the JSON array only.",
+            "=== PULL REQUEST {repo}#{number} ===\n\
+             What the change does, overall:\n{intent}\n\n\
+             Every file it touches ({} file(s), +{} -{}){}:\n{shape}\n\
+             === THE PART YOU ARE REVIEWING ({} of these files) ===\n{}\n\
+             === YOUR TASK ===\nReport findings on the files in this part only. Judge them as \
+             pieces of the change described above — if a line is being deleted or moved as \
+             part of that, that is the change working as intended, not a defect. Reply with \
+             the JSON array only.",
+            report.file_count,
+            report.additions,
+            report.deletions,
+            if report.truncated {
+                " — list truncated"
+            } else {
+                ""
+            },
+            batch.len(),
             crate::tools::truncate_for_prompt(&body, MAX_DIFF_PROMPT_CHARS)
         ));
         req.system = Some(system.to_string());
         req.max_tokens = 900;
-        let raw = match self.reasoner.complete(&req).await {
+        let raw = match reasoner.complete(&req).await {
             Ok(t) => t,
             Err(e) => {
                 debug!("findings unavailable for {repo}#{number}: {e:#}");
@@ -442,6 +555,7 @@ impl DiffReader {
         number: i64,
         report: &DiffReport,
         comments: &[ReviewComment],
+        reasoner: &dyn Reasoner,
     ) -> Option<(Recommendation, String)> {
         let system = "You are the reviewer of record on a pull request, writing the note that \
              goes above the Approve button. Reply with ONLY JSON:\n\
@@ -497,7 +611,7 @@ impl DiffReader {
         ));
         req.system = Some(system.to_string());
         req.max_tokens = 400;
-        let raw = match self.reasoner.complete(&req).await {
+        let raw = match reasoner.complete(&req).await {
             Ok(t) => t,
             Err(e) => {
                 debug!("review verdict unavailable for {repo}#{number}: {e:#}");
@@ -664,6 +778,120 @@ const UNVERIFIABLE: &[&str] = &[
     "missing from the codebase",
 ];
 
+/// Is the diff we hold still a diff of this pull request?
+///
+/// The whole freshness question in one place, because it used to be answered implicitly by a
+/// workflow key built from notification activity — and a push to your own branch produces no
+/// activity, so the first evaluation was the only one a pull request ever got.
+///
+/// `None` for the stored sha means the diff predates the field being recorded. Treated as
+/// **stale**: assuming it were current would freeze exactly the rows that already carry the
+/// bug. One redundant re-diff per pre-existing PR is the cost, once.
+pub fn diff_is_current(stored: Option<&str>, head: &str) -> bool {
+    stored.is_some_and(|s| s == head)
+}
+
+/// The marker that carries an operator-chosen model inside a workflow key.
+///
+/// Re-dispatching a review has to reach a workflow, and `submit_workflow` carries no body —
+/// only a key. So the model rides in the key, which is also where it *belongs*: the key is
+/// the idempotency identity, and "review this diff with Opus" is genuinely different work
+/// from "review this diff with Sonnet". Same PR, same watermark, same model → a refused
+/// redo, free, exactly as pressing the button twice should be. Different model → new work.
+///
+/// `#model:` rather than a bare separator because the key already contains `@`, `/`, `!` and
+/// `#` in the pr key and the watermark, and this must not collide with any of them.
+const MODEL_MARKER: &str = "#model:";
+
+/// Decorate a workflow key's version with the model to review on.
+pub fn with_model(version: &str, provider: &str, model: &str) -> String {
+    format!("{version}{MODEL_MARKER}{provider}/{model}")
+}
+
+/// Split a decorated version back into `(watermark, Some((provider, model)))`.
+///
+/// The watermark comes back clean, which matters because it is stored on the pull request's
+/// object as the freshness token: leaving the decoration on it would make every re-dispatched
+/// review look like a different watermark and defeat the caching it exists for.
+pub fn split_model(version: &str) -> (&str, Option<(&str, &str)>) {
+    match version.split_once(MODEL_MARKER) {
+        Some((watermark, spec)) => {
+            // A forced redo appends `#r{timestamp}` *after* the spec to break the key's
+            // idempotency. Cut it off: model names never contain `#`, and leaving it on made
+            // the requested model `claude-opus-4-8#r1785…`, which builds a reasoner pointed at
+            // a model that does not exist.
+            let spec = spec.split_once('#').map_or(spec, |(head, _)| head);
+            match spec.split_once('/') {
+            // A provider with no model, or a model with no provider, is not enough to build a
+            // reasoner — fall back to the default tier rather than guessing one half.
+                Some((p, m)) if !p.is_empty() && !m.is_empty() => (watermark, Some((p, m))),
+                _ => (watermark, None),
+            }
+        }
+        None => (version, None),
+    }
+}
+
+/// Whether an anchor is a quoted hunk header rather than a quoted line of code.
+///
+/// Three shapes, all seen in real output: the header itself (`@@ -10,6 +10,9 @@ fn serve()`),
+/// the header with a diff marker glued on (`+57,18  @@ impl ApiDiscovery {`), and a bare
+/// fragment of one (`-4`). None of them is code, and all of them read as code to a reviewer
+/// skimming the pane.
+fn looks_like_hunk_header(anchor: &str) -> bool {
+    let a = anchor.trim();
+    if a.contains("@@") {
+        return true;
+    }
+    // `-4`, `+57,18` — a marker followed by nothing but line numbers.
+    let rest = a.trim_start_matches(['+', '-', ' ']).trim();
+    !rest.is_empty()
+        && rest
+            .chars()
+            .all(|c| c.is_ascii_digit() || c == ',' || c == ' ')
+}
+
+/// Whether two notes are making the same point.
+///
+/// Word overlap, not a prefix or an exact match, because the repeats seen in practice are
+/// neither verbatim nor front-loaded: the four bogus blockers on `restate-cloud!1255` all
+/// followed one template — *"The use of X implies that Y, which could lead to conflicts or
+/// unexpected behavior. It's recommended to refactor the code so that each Z has its own
+/// W."* — and diverged at the **fourth** word. Comparing leading words misses that
+/// entirely; comparing whole strings misses it too.
+///
+/// The threshold is measured against those four notes rather than guessed. Jaccard over
+/// their word sets: the genuine duplicate pair scores **0.84**, and every other pairing
+/// among them scores **0.45–0.59**. So 0.75 separates "the same claim reworded" from "the
+/// same template, different claim" with room on both sides. The looser pairs are left
+/// alone deliberately — they are killed by the deleted-line rule, and collapsing findings
+/// that merely *sound* alike would hide real ones.
+const SAME_POINT_JACCARD: f32 = 0.75;
+
+/// Below this many words, overlap is noise — two terse notes can share most of their words
+/// and mean different things. Short notes fall back to matching exactly.
+const SAME_POINT_MIN_WORDS: usize = 6;
+
+fn same_point(a: &str, b: &str) -> bool {
+    fn words(s: &str) -> std::collections::BTreeSet<String> {
+        s.to_ascii_lowercase()
+            .split(|c: char| !c.is_alphanumeric() && c != '\'')
+            .filter(|w| !w.is_empty())
+            .map(str::to_string)
+            .collect()
+    }
+    let (wa, wb) = (words(a), words(b));
+    if wa.is_empty() || wb.is_empty() {
+        return false;
+    }
+    if wa.len() < SAME_POINT_MIN_WORDS || wb.len() < SAME_POINT_MIN_WORDS {
+        return wa == wb;
+    }
+    let shared = wa.intersection(&wb).count() as f32;
+    let union = wa.union(&wb).count() as f32;
+    shared / union >= SAME_POINT_JACCARD
+}
+
 /// Whether a note asserts something the diff alone cannot show.
 pub fn unverifiable(note: &str) -> bool {
     let lower = note.to_ascii_lowercase();
@@ -710,10 +938,77 @@ pub fn parse_comments(v: &serde_json::Value, report: &DiffReport) -> Vec<ReviewC
             debug!("dropping an unverifiable finding on {path}: {note}");
             continue;
         }
+        // What the model *quoted* is evidence in its own right, and has to be judged before
+        // where the quote resolved to.
+        //
+        // Checking only the resolved line was not enough — proven by re-reviewing the same
+        // diff on the local model once re-dispatch existed. Two findings anchored
+        // `-pub struct HealthTarget {` came straight through: on a refactor that *moves*
+        // code, that text exists as both a `-` and a `+` line, the anchor search returns
+        // whichever comes first, and landing on the `+` copy made a note about a deletion
+        // look reviewable. The model's own `-` prefix says which one it was reading.
+        //
+        // Three more were anchored `+57,18  @@ impl ApiDiscovery {` — a hunk header with a
+        // `+` stuck on the front, which resolves to nothing and so survived as a file-level
+        // note. A quoted hunk header is not a quotation of code however it is prefixed.
+        if let Some(anchor) = anchor.as_deref() {
+            if anchor.starts_with('-') && !looks_like_hunk_header(anchor) {
+                debug!("dropping a finding quoting a deleted line in {path}: {note}");
+                continue;
+            }
+            if looks_like_hunk_header(anchor) {
+                debug!("dropping a finding quoting a hunk header in {path}: {note}");
+                continue;
+            }
+        }
+        // Where the anchor landed decides whether the finding is reviewable at all. The
+        // prompt asks for all of this; the prompt was also being ignored, and a rule that
+        // isn't enforced is a comment.
+        match patch_index.and_then(|i| file.patch.as_deref()?.lines().nth(i)) {
+            // A finding about a line the pull request *deletes*. This was the single biggest
+            // source of nonsense: on a refactor that moved code between modules, every
+            // "blocker" was anchored to a `-` line and demanded the author restructure
+            // something they were removing. There is no useful version of this note.
+            Some(l) if l.starts_with('-') => {
+                debug!("dropping a finding on a deleted line in {path}: {note}");
+                continue;
+            }
+            // A hunk header is positional bookkeeping. It matches an anchor search happily,
+            // which is how `@@ -23,10 +23,10 @@ struct Cli {}` ended up quoted as code.
+            Some(l) if l.starts_with("@@") => {
+                debug!("dropping a finding anchored to a hunk header in {path}: {note}");
+                continue;
+            }
+            // Anchored to an added or context line: reviewable, keep it.
+            //
+            // An anchor that did not resolve is deliberately *not* dropped here. It degrades
+            // to a file-level note, which is the existing behaviour and was chosen for a
+            // reason that still holds: a model that shortened or slightly misquoted a long
+            // line has still found something real, and a note pinned to a guess would be
+            // worse than one pinned to nothing. The two useless unanchored notes seen in
+            // practice were useless because they were content-free nits, not because they
+            // floated.
+            Some(_) | None => {}
+        }
         let severity = Severity::parse(c.get("severity").and_then(|s| s.as_str()).unwrap_or("nit"));
         // One finding per place. Two notes on the same line are almost always the model saying
         // the same thing twice in different words — which reads as two problems — and the more
         // severe of the two is the one worth keeping.
+        // The same point made about several places is one finding. Anchoring dedup on
+        // path+line only caught verbatim repeats in one file; the failure in practice was one
+        // sentence reproduced across three files with four different anchors, which reads as
+        // four independent problems and inflated the verdict to `request_changes`. Compared on
+        // the note's own words, so it catches the repeat wherever it landed.
+        if let Some(existing) = comments
+            .iter()
+            .find(|e: &&ReviewComment| same_point(&e.note, note))
+        {
+            debug!(
+                "dropping a finding that repeats one already made on {}: {note}",
+                existing.path
+            );
+            continue;
+        }
         if let Some(existing) = comments
             .iter_mut()
             .find(|e: &&mut ReviewComment| e.path == path && e.patch_index == patch_index)
@@ -784,6 +1079,19 @@ pub fn anchor_index(patch: &str, anchor: Option<&str>, line: Option<u64>) -> Opt
         // `+`, and drops it often enough that requiring it would throw away good anchors.
         let want = anchor.trim_start_matches(['+', '-', ' ']).trim();
         if !want.is_empty() {
+            // A moved line exists twice — once as `-`, once as `+` — so content alone cannot
+            // say which copy was quoted, and `position` returns whichever comes first. When
+            // the anchor carries its marker, match the marker too: quoting the `+` copy of a
+            // moved line is a finding about where it landed, and resolving that onto the `-`
+            // copy made it look like a note about the removal and got it dropped.
+            let marker = anchor.chars().next().filter(|c| *c == '+' || *c == '-');
+            if let Some(marker) = marker {
+                if let Some(i) = lines.iter().position(|l| {
+                    l.starts_with(marker) && l.trim_start_matches(['+', '-', ' ']).trim() == want
+                }) {
+                    return Some(i);
+                }
+            }
             if let Some(i) = lines.iter().position(|l| {
                 let content = l.trim_start_matches(['+', '-', ' ']).trim();
                 content == want
@@ -917,6 +1225,7 @@ mod tests {
             summary: None,
             truncated: false,
             error: None,
+            head_sha: Some("deadbeef".into()),
         }
     }
 
@@ -951,6 +1260,138 @@ mod tests {
         // reliable of the two, which is the whole reason it is asked for.
         let by_anchor = anchor_index(PATCH, Some("panic!"), Some(11)).expect("anchored");
         assert!(PATCH.lines().nth(by_anchor).unwrap().contains("panic!"));
+    }
+
+    /// The review that prompted this, reduced to its shape.
+    ///
+    /// Taken from `restatedev/restate-cloud!1255` — a refactor moving each controller into
+    /// its own subtree. The local model returned four "blockers", each anchored to a line
+    /// the patch **deleted**, each a near-copy of one sentence, and the verdict came back
+    /// `request_changes` on the strength of them. Every rule asserted here exists to kill
+    /// one part of that.
+    #[test]
+    fn findings_about_deleted_code_and_repeated_findings_are_dropped() {
+        let files = vec![DiffFile {
+            path: "src/serve.rs".into(),
+            additions: 4,
+            deletions: 1,
+            patch: Some(PATCH.to_string()),
+            patch_omitted: false,
+        }];
+        let r = report(files);
+        let raw = serde_json::json!([
+            // Anchored to a `-` line: the author is deleting this. Arguing for it is arguing
+            // against the change — this was every one of the four live "blockers".
+            {"path": "src/serve.rs", "anchor": "-    let n = 1;", "severity": "blocker",
+             "note": "The use of a literal implies the value is fixed, which could lead to unexpected behaviour. It is recommended to refactor this."},
+            // A hunk header quoted as if it were code.
+            {"path": "src/serve.rs", "anchor": "@@ -10,6 +10,9 @@ fn serve() {",
+             "severity": "nit", "note": "This function signature is unclear."},
+            // Anchored to an added line, so reviewable. Verbatim from the live review.
+            {"path": "src/serve.rs", "anchor": "+        panic!(\"too many\");",
+             "severity": "blocker",
+             "note": "The use of REGISTRY implies that the state struct is being used by multiple controllers, which could lead to conflicts or unexpected behavior. It's recommended to refactor the code so that each controller has its own SharedState."},
+            // The same claim with the subject swapped (0.84), on a different anchor — also
+            // verbatim, and the repeat that per-line dedup could never catch.
+            {"path": "src/serve.rs", "anchor": "+    if n > 100 {", "severity": "blocker",
+             "note": "The use of a HashMap with String keys implies that the state struct is being used by multiple controllers, which could lead to conflicts or unexpected behavior. It's recommended to refactor the code so that each controller has its own SharedState."}
+        ]);
+        let comments = parse_comments(&raw, &r);
+        assert_eq!(
+            comments.len(),
+            1,
+            "two unreviewable and one repeat should go: {comments:?}"
+        );
+        assert!(comments[0].note.starts_with("The use of REGISTRY"));
+        assert_eq!(comments[0].anchor.as_deref(), Some("+        panic!(\"too many\");"));
+    }
+
+    /// The two notes below are verbatim from `restate-cloud!1255` — the pair that scored
+    /// 0.84, differing only in the subject of the sentence. Pinned as the calibration case
+    /// for [`SAME_POINT_JACCARD`], since the threshold was chosen from these measurements
+    /// and a change to either should have to face them.
+    /// The anchors that survived the first version of these guards, verbatim from a
+    /// re-review of `restate-cloud!1255` on the local model. Each one is why the check moved
+    /// from "where did the anchor resolve" to "what did the model quote".
+    #[test]
+    fn a_quoted_hunk_header_or_deletion_is_recognised_from_the_anchor_alone() {
+        // Hunk headers, including the two mangled forms the model actually produced.
+        assert!(looks_like_hunk_header("@@ -10,6 +10,9 @@ fn serve() {"));
+        assert!(looks_like_hunk_header("+57,18  @@ impl ApiDiscovery  {"));
+        assert!(looks_like_hunk_header("-23,10 +23,10 @@ struct Cli  { }"));
+        assert!(looks_like_hunk_header("-4"));
+        assert!(looks_like_hunk_header("+62,18"));
+
+        // Real code is not a hunk header, whatever its marker — including a deletion, which
+        // is caught by the separate `-` rule rather than by this one.
+        assert!(!looks_like_hunk_header("-pub struct HealthTarget  {"));
+        assert!(!looks_like_hunk_header("+    if n > 100 {"));
+        assert!(!looks_like_hunk_header("     let cfg = load();"));
+        // A line that is only digits is indistinguishable from a header fragment and is not
+        // worth anchoring to either way.
+        assert!(looks_like_hunk_header("+    42"));
+    }
+
+    /// A moved line exists as both `-` and `+`. The anchor search returns whichever comes
+    /// first, so resolving alone cannot tell a note about the removal from a note about the
+    /// addition — the model's own prefix can, and this is the case that proved it.
+    #[test]
+    fn a_moved_line_quoted_as_a_deletion_is_still_dropped() {
+        // `pub struct HealthTarget {` appears as a deletion *and* an addition, in that order.
+        const MOVED: &str = "@@ -1,3 +1,4 @@\n-pub struct HealthTarget {\n     pub name: String,\n+pub struct HealthTarget {";
+        let files = vec![DiffFile {
+            path: "src/health.rs".into(),
+            additions: 1,
+            deletions: 1,
+            patch: Some(MOVED.to_string()),
+            patch_omitted: false,
+        }];
+        let r = report(files);
+        let raw = serde_json::json!([
+            {"path": "src/health.rs", "anchor": "-pub struct HealthTarget {",
+             "severity": "blocker", "note": "This struct should not be declared here at all."}
+        ]);
+        assert!(
+            parse_comments(&raw, &r).is_empty(),
+            "quoting the `-` copy of a moved line is a note about the removal"
+        );
+
+        // The same line quoted as the addition is a real finding about where it landed.
+        let raw = serde_json::json!([
+            {"path": "src/health.rs", "anchor": "+pub struct HealthTarget {",
+             "severity": "concern", "note": "The moved struct no longer derives Default, which the caller below relies on."}
+        ]);
+        assert_eq!(parse_comments(&raw, &r).len(), 1);
+    }
+
+    #[test]
+    fn the_same_claim_reworded_is_one_finding() {
+        let registry = "The use of REGISTRY implies that the state struct is being used by \
+             multiple controllers, which could lead to conflicts or unexpected behavior. It's \
+             recommended to refactor the code so that each controller has its own SharedState.";
+        let hashmap = "The use of a HashMap with String keys implies that the state struct is \
+             being used by multiple controllers, which could lead to conflicts or unexpected \
+             behavior. It's recommended to refactor the code so that each controller has its \
+             own SharedState.";
+        assert!(same_point(registry, hashmap), "0.84 — the same claim");
+
+        // Same template, different claim (0.46). Left alone on purpose: collapsing findings
+        // that merely sound alike would hide real ones.
+        let array = "The use of a hardcoded array implies that the controller is only handling \
+             one component, which could lead to unexpected behavior if more components are \
+             added in the future. It's recommended to refactor the code so that each component \
+             has its own renderer.";
+        assert!(!same_point(registry, array), "0.46 — a different claim");
+
+        // Genuinely different findings are not collapsed.
+        assert!(!same_point(
+            "Clamp instead of panicking on this config value at startup.",
+            "This retry loop has no ceiling and will spin forever on a 500.",
+        ));
+        // Short notes match only exactly, and an empty note matches nothing.
+        assert!(same_point("Missing a period.", "Missing a period."));
+        assert!(!same_point("Missing a period.", "Missing a comma."));
+        assert!(!same_point("", ""));
     }
 
     #[test]
@@ -1203,6 +1644,70 @@ mod tests {
 
     /// The PR key shapes that reach the diff pane, and the ones that must not be mistaken
     /// for it.
+    /// The model rides in the workflow key, so the codec has to survive the keys that
+    /// actually occur — and a GitHub watermark is `github/24818841558@2026-07-29T19:22:36Z`,
+    /// which already contains `/` and `@`.
+    /// The push that nobody is told about.
+    ///
+    /// A pull request's diff was cached against the newest *notification* on it, so a push to
+    /// your own branch — which notifies no one — left the diff and its review frozen at the
+    /// first commit while the pane went on presenting them as current. The head sha is the
+    /// only token that moves when the diff moves.
+    #[test]
+    fn a_diff_is_current_only_for_the_commit_it_was_read_at() {
+        assert!(diff_is_current(Some("1ba62cdc"), "1ba62cdc"));
+        // Pushed since: the stored diff is of the previous commit.
+        assert!(!diff_is_current(Some("1ba62cdc"), "9f0e1a22"));
+
+        // No recorded sha — a diff stored before the field existed. Stale, deliberately:
+        // calling it current would leave every pre-existing row frozen forever, which is the
+        // bug rather than a saving.
+        assert!(!diff_is_current(None, "1ba62cdc"));
+    }
+
+    #[test]
+    fn a_model_rides_in_the_key_without_disturbing_the_watermark() {
+        let wm = "github/24818841558@2026-07-29T19:22:36Z";
+        let version = with_model(wm, "claude", "claude-opus-5");
+        // The watermark comes back byte-identical. This is the part that matters: it is the
+        // freshness token stored on the pull request's object, and a decorated one would make
+        // every re-dispatch look like new activity.
+        assert_eq!(split_model(&version), (wm, Some(("claude", "claude-opus-5"))));
+
+        // An undecorated key is the automatic path, and must stay untouched.
+        assert_eq!(split_model(wm), (wm, None));
+
+        // A model name containing a slash still resolves — `split_once` takes the first, so
+        // provider and model separate at the right place.
+        let ollama = with_model(wm, "ollama_local", "deepseek-coder:33b");
+        assert_eq!(
+            split_model(&ollama),
+            (wm, Some(("ollama_local", "deepseek-coder:33b")))
+        );
+
+        // Half a spec is not enough to build a reasoner. Falling back to the default tier is
+        // right; guessing the missing half is not.
+        assert_eq!(split_model(&format!("{wm}#model:claude")), (wm, None));
+        assert_eq!(split_model(&format!("{wm}#model:/opus")), (wm, None));
+        assert_eq!(split_model(&format!("{wm}#model:claude/")), (wm, None));
+
+        // A forced redo breaks the key without corrupting the model name — the suffix lands
+        // after the spec and has to be cut off, or the reasoner is built for a model called
+        // `claude-opus-5#r1785...`.
+        let forced = format!("{}#r1785000000", with_model(wm, "claude", "claude-opus-5"));
+        assert_eq!(
+            split_model(&forced),
+            (wm, Some(("claude", "claude-opus-5")))
+        );
+
+        // Different models are different keys — which is what makes re-dispatch on one model
+        // free and re-dispatch on another real work.
+        assert_ne!(
+            with_model(wm, "claude", "claude-opus-5"),
+            with_model(wm, "claude", "claude-sonnet-5")
+        );
+    }
+
     #[test]
     fn pr_keys_round_trip() {
         assert_eq!(

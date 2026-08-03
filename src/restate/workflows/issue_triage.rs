@@ -104,9 +104,12 @@ fn classify(e: anyhow::Error) -> HandlerError {
     }
 }
 
-/// Reading source is exactly the work that shouldn't leave the machine, so this
-/// pipeline runs on-device — and one Ollama means a queue of one.
-pub const SCOPE: &str = scopes::LOCAL_LLM;
+/// Triage's model calls run on the `[reasoner] triage` tier, off the machine by default —
+/// so this belongs in the off-machine queue, not the one-GPU one. Under `LOCAL_LLM` it
+/// would go on contending with indexing for a permit it no longer needs, which is the
+/// queue the separate tier exists to leave. (The clone step is bounded separately, per
+/// repo — see [`checkout_limit_key`].)
+pub const SCOPE: &str = scopes::CLOUD_LLM;
 
 /// Per-repo, because two clones of the *same* repo at once is a corrupt working tree.
 pub fn checkout_limit_key(repo: &str) -> String {

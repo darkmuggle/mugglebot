@@ -67,11 +67,21 @@ See [AGENTS.md](AGENTS.md) for the full design and roadmap.
 
 ## Where each model runs
 
-**The local model does the work.** Every pass MuggleBot runs on its own — triage,
-correlation, PR critique, root cause, explanation, code indexing, tagging, live
-assist, chat — runs on `deepseek-coder:33b` via Ollama and nowhere else.
+**The local model does the work.** Every pass MuggleBot runs on its own —
+correlation, root cause, explanation, code indexing, tagging, live assist, chat —
+runs on `deepseek-coder:33b` via Ollama and nowhere else.
 
-A cloud model is used only when **you** ask for one, by name, in one of two places:
+**One exception: assigned-issue triage.** It runs on `claude-sonnet-5` through the
+subscription CLI bridge (`[reasoner] triage`), and the reason is queueing rather than
+capability. One Ollama is one GPU, so local calls share a single permit; triage makes
+several large calls per issue, and an issue you'd been assigned would sit behind
+whatever the code indexer was chewing on. Its own tier takes it out of that queue.
+Nothing there is metered — it rides your existing login — but the source excerpts it
+selects do leave the machine. Set `triage = "ollama_local"` under `[reasoner]` to put
+it back on-device; it will be correct, just queued.
+
+Otherwise a cloud model is used only when **you** ask for one, by name, in one of two
+places:
 
 | How you ask | What happens |
 |---|---|
@@ -158,12 +168,14 @@ expensive part of picking an issue back up:
 5. **Check whether somebody's already on it** — scan the repo's open PRs. For each
    plausible one: what the **diff** actually implements, a skeptical critique of
    whether it really fixes the issue, and which other open issues it would also
-   resolve. A PR saying "closes #412" is a claim; the critique is the check. Local
-   model reads the diff; a second local attempt covers an answer that came back as
-   prose instead of JSON.
-6. **Plain English** — the local model re-renders it for the board.
+   resolve. A PR saying "closes #412" is a claim; the critique is the check. A second
+   attempt on the same tier covers an answer that came back as prose instead of JSON.
+6. **Plain English** — re-render it for the board.
 
-Steps 2–5 never leave the machine. Patch options are **proposals, never applied** —
+Step 2 needs no model at all. Steps 3–6 run on the `[reasoner] triage` tier — Claude
+Sonnet over the subscription CLI by default, not the local model; see **Where each
+model runs** above for why, and for how to put them back on-device. Patch options are
+**proposals, never applied** —
 nothing here commits, pushes, opens a PR, or comments on somebody else's, and paths
 the model wasn't actually shown are dropped so a confident-looking citation can't send you hunting for a
 file that doesn't exist. Every triage records the commit it read, so you can tell

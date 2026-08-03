@@ -41,6 +41,12 @@ pub struct IngestOps {
     pub watchers: Vec<Arc<dyn Watcher>>,
     /// Submits workflows — used by the scheduler object's ticks.
     pub ingress: Arc<crate::restate::ingress::Ingress>,
+    /// The repo index, for the push sweep. The scheduler's `commit-poll` tick asks it what
+    /// moved; the full crawl still goes through the `RepoIndex` workflow.
+    pub repos: Arc<crate::repos::RepoIndex>,
+    /// For the push sweep's pull-request check. `None` when no token is stored, which makes
+    /// the check a no-op rather than an error — the sweep's commit half still works.
+    pub github: Option<crate::github::GithubClient>,
     /// The org the repo index crawls, and where the managed contexts tree lives.
     pub org: String,
     pub contexts_dir: std::path::PathBuf,
@@ -109,6 +115,101 @@ impl IngestOps {
     }
 
     /// Every repo in the code-derived index, for arming an indexer each.
+    /// Which repositories have been pushed to since the last sweep. See
+    /// [`crate::repos::RepoIndex::poll_pushed`].
+    pub async fn poll_pushed_repos(&self) -> anyhow::Result<Vec<String>> {
+        self.repos.poll_pushed().await
+    }
+
+    /// Re-evaluate the open pull requests in `repo` whose head commit has moved since the
+    /// diff we hold was read. Returns how many were dispatched.
+    ///
+    /// **One API call per pushed repo**, not per pull request: `open_pulls` returns every
+    /// open PR with its head sha, so the comparison is free once the list is in hand. Only
+    /// pull requests the board actually tracks are considered — the operator's, not the
+    /// org's, which on a busy repo is the difference between a handful and a hundred.
+    ///
+    /// A diff with no recorded sha counts as stale. Those predate the field, and treating
+    /// "unknown" as current would leave every one of them frozen at whatever commit it was
+    /// first read at — which is the bug this exists to fix, preserved forever in the rows
+    /// that already had it.
+    pub async fn restale_pull_requests(&self, repo: &str) -> u64 {
+        let Some(gh) = self.github.as_ref() else {
+            return 0;
+        };
+        let tracked: Vec<i64> = self
+            .store
+            .list_subjects()
+            .unwrap_or_default()
+            .into_iter()
+            // Same filter the board's active view uses: work the operator has resolved or
+            // snoozed is not work a push should drag back into an AI pass.
+            .filter(|s| {
+                !matches!(
+                    s.handled,
+                    crate::subject::Handled::Resolved | crate::subject::Handled::Snoozed
+                )
+            })
+            .filter_map(|s| crate::prdiff::parse_pr_key(s.key.as_str()))
+            .filter(|(r, _)| r == repo)
+            .map(|(_, n)| n)
+            .collect();
+        if tracked.is_empty() {
+            return 0;
+        }
+        let pulls = match gh.open_pulls(repo, 100).await {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::debug!("commit poll: open pulls for {repo} unavailable: {e:#}");
+                return 0;
+            }
+        };
+        let mut dispatched = 0;
+        for pull in pulls {
+            let number = pull.number as i64;
+            if !tracked.contains(&number) {
+                continue;
+            }
+            let Some(head) = pull.head_sha.as_deref() else {
+                continue;
+            };
+            let stored = crate::prdiff::stored(&self.ingress, repo, number)
+                .await
+                .ok()
+                .flatten();
+            // No stored diff at all means nobody has looked yet — the pane offers that read
+            // as a button, and doing it here would diff every PR on the board unasked.
+            let Some(stored) = stored else { continue };
+            if crate::prdiff::diff_is_current(stored.report.head_sha.as_deref(), head) {
+                continue;
+            }
+            // Keyed by the sha, so this is a refused redo if the same push is seen twice and
+            // real work exactly once per commit — the same property `PrCritique` gets from
+            // keying on the head sha rather than on activity.
+            let key = format!("{}@{head}", crate::prdiff::pr_key(repo, number));
+            match self
+                .ingress
+                .submit_workflow(
+                    "PrDiff",
+                    &key,
+                    Some(crate::restate::workflows::rest::PrDiff::SCOPE),
+                )
+                .await
+            {
+                Ok(true) => {
+                    tracing::info!(
+                        "commit poll: {repo}#{number} was pushed to ({} → {head}) — re-diffing",
+                        stored.report.head_sha.as_deref().unwrap_or("unknown"),
+                    );
+                    dispatched += 1;
+                }
+                Ok(false) => {}
+                Err(e) => tracing::debug!("commit poll: {repo}#{number} not re-diffed ({e:#})"),
+            }
+        }
+        dispatched
+    }
+
     pub fn indexed_repos(&self) -> Vec<String> {
         self.store
             .list_repos()
@@ -251,7 +352,12 @@ impl IngestOps {
     /// Reconcile against a complete upstream listing: anything absent is gone
     /// upstream. Each GitHub watcher is authoritative only for its own listing.
     fn reconcile(&self, name: &str, active_ids: &BTreeSet<String>) -> Result<usize> {
-        let gone = if name == "github-assigned" {
+        // Compared against the watcher's own constant, not a literal: the name is also the
+        // health key and the UI's pill id, and three hand-written copies of it is three
+        // chances for a rename to leave one behind — which is precisely what happened.
+        let gone = if name == crate::watchers::incident::NAME {
+            self.store.resolve_missing_incidents(active_ids)?
+        } else if name == "github-assigned" {
             self.store.resolve_missing_assigned_issues(active_ids)?
         } else {
             self.store

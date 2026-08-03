@@ -154,6 +154,7 @@ pub struct Sources {
     pub github: GithubSource,
     pub slack: SlackSource,
     pub granola: GranolaSource,
+    pub incident: IncidentSource,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -180,6 +181,35 @@ impl Default for GithubSource {
             poll_interval: "60s".into(),
             enrich: true,
             ignore_prefixes: vec!["CLA Assistant workflow run".into()],
+        }
+    }
+}
+
+/// incident.io — every open incident, tracked on its own board.
+///
+/// Needs an `incident` API key in the credential store. Without one the watcher is not
+/// started and nothing else changes, the same way GitHub degrades.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct IncidentSource {
+    pub enabled: bool,
+    /// How often to re-read the open set.
+    ///
+    /// Short, because this is the board that answers "is anything on fire": a minute of
+    /// staleness on an outage is worth more than a minute of staleness on a code review. It
+    /// is also cheap — a page or two of a listing, no per-incident calls.
+    pub poll_interval: String,
+    /// Map each open incident to the code it is probably about, using the same engine that
+    /// maps an issue to code. Off → incidents are still tracked, just not analysed.
+    pub map_to_code: bool,
+}
+
+impl Default for IncidentSource {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            poll_interval: "60s".into(),
+            map_to_code: true,
         }
     }
 }
@@ -491,14 +521,46 @@ pub struct Reasoner {
     /// vision is a different capability from reasoning and a coder model has no image
     /// encoder: pointing this at one makes MuggleBot silently ignore the attachment.
     pub vision_model: String,
-    /// **The tier used only when you ask for it**, by name: the chat pane's model
-    /// picker, or the second-opinion button on a subject. Nothing automatic reaches it.
+    /// **The deep-analysis tier**: `claude-opus-5` on the subscription CLI bridge.
+    ///
+    /// Three callers. Two are operator-initiated — the chat pane's model picker and the
+    /// second-opinion button. The third is **automatic**: root-cause investigation's final
+    /// ranking pass, where the local model builds the candidate graph and this judges it.
+    ///
+    /// That third one is a deliberate change of policy. It is unmetered — the bridge rides an
+    /// existing login — but it does mean a shortlist of subject text, repo cards and commit
+    /// summaries leaves the machine on every investigation, without anyone asking. Point this
+    /// at `ollama_local` to put the deep pass back on-device.
     pub cloud: String,
     pub cloud_model: String,
     /// Escalation tier for `[reasoner.routing]`, which is **off** by default. Only
     /// reached if you turn routing on, and then only for tasks graded `hard`.
     pub mid: String,
     pub mid_model: String,
+    /// **The passes that read source code** — assigned-issue triage and pull-request
+    /// review. The only automatic work that is *not* on-device.
+    ///
+    /// Two reasons, one per caller, and they are different reasons:
+    ///
+    /// - **Triage** was starving everything else. Per issue it reads source into a
+    ///   characterization, proposes patches, scores every comment, and critiques the open
+    ///   PRs that might already fix it. Local calls share a single permit (see
+    ///   `local_concurrency`), so all of that queued behind whatever the indexer was doing
+    ///   — an issue assigned to you waited minutes on a repo crawl.
+    /// - **PR review** was simply not good enough on a 33B local coder. Asked to review a
+    ///   refactor it returned four copies of one sentence, every one anchored to a line the
+    ///   patch *deleted*, and graded them all blockers. No amount of prompt tightening
+    ///   fixes a model that can't hold a diff and its purpose in mind at once.
+    ///
+    /// One knob rather than two because it is one question — *may a pass that reads source
+    /// leave the machine?* — and one answer is easier to reason about than two.
+    ///
+    /// The default is the **subscription CLI bridge** (`claude -p`), not the metered API:
+    /// no key, no per-token cost, and no `local_concurrency` gate. What it does mean is
+    /// that issue text, diffs, and the selected source excerpts are sent to a model off the
+    /// machine. Point this at `ollama_local` to put both passes back on-device.
+    pub code: String,
+    pub code_model: String,
     /// How long a single local model request may take before it is abandoned.
     ///
     /// Generous, because a 33B model carding a component legitimately takes minutes — but
@@ -542,9 +604,11 @@ impl Default for Reasoner {
             local_model: "deepseek-coder:33b".into(),
             vision_model: "qwen2.5vl:7b".into(),
             cloud: "claude".into(),
-            cloud_model: "claude-opus-4-8".into(),
+            cloud_model: "claude-opus-5".into(),
             mid: "claude".into(),
             mid_model: "claude-sonnet-5".into(),
+            code: "claude".into(),
+            code_model: "claude-sonnet-5".into(),
             request_timeout: "10m".into(),
             local_concurrency: 1,
             routing: Routing::default(),

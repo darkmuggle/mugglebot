@@ -47,6 +47,14 @@ pub enum SubjectRank {
     /// discussion numbering are independent, so `repo#5` and `repo~5` are
     /// genuinely different things.
     Issue,
+    /// An incident.io incident. Highest rank, and it never loses one: production being
+    /// broken outranks every artifact describing it.
+    ///
+    /// The rank is close to moot in practice, because an incident is **never merged into
+    /// another subject** — see `Attributor`. It relates to the issues, pull requests and
+    /// commits it turns out to be about by *edge*, which is what keeps it on its own board
+    /// instead of disappearing into whatever it was eventually filed as.
+    Incident,
 }
 
 impl SubjectRank {
@@ -55,6 +63,7 @@ impl SubjectRank {
             SubjectRank::SlackThread => "slack_thread",
             SubjectRank::PullRequest => "pull_request",
             SubjectRank::Issue => "issue",
+            SubjectRank::Incident => "incident",
         }
     }
 
@@ -63,6 +72,7 @@ impl SubjectRank {
             "slack_thread" => Some(SubjectRank::SlackThread),
             "pull_request" => Some(SubjectRank::PullRequest),
             "issue" => Some(SubjectRank::Issue),
+            "incident" => Some(SubjectRank::Incident),
             _ => None,
         }
     }
@@ -80,9 +90,17 @@ impl SubjectRank {
 /// | `owner/repo~7` | discussion (issue rank) |
 /// | `owner/repo!987` | pull request |
 /// | `C02ABC/1721822400.001` | Slack thread (`channel/thread_ts`) |
+/// | `incident:INC-448` | incident.io incident |
+///
+/// The incident form leads with a literal prefix rather than a sigil because every sigil is
+/// taken and an incident reference has no repo to hang one off. It is matched first, so
+/// nothing else can claim it.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct SubjectKey(String);
+
+/// Marks an incident key. A prefix rather than a sigil — see the table above.
+pub const INCIDENT_PREFIX: &str = "incident:";
 
 impl SubjectKey {
     pub fn issue(repo: &str, number: u64) -> Self {
@@ -99,6 +117,16 @@ impl SubjectKey {
 
     pub fn slack_thread(channel_and_ts: &str) -> Self {
         Self(channel_and_ts.to_string())
+    }
+
+    /// `incident:INC-448`, from incident.io's own human reference.
+    ///
+    /// Keyed on the reference, not the ULID: the reference is what appears in Slack, in
+    /// alert titles and in what people type, so it is the identity that lets a signal from
+    /// anywhere else resolve onto the same subject. The ULID is carried on the signal for
+    /// API calls.
+    pub fn incident(reference: &str) -> Self {
+        Self(format!("{INCIDENT_PREFIX}{}", reference.trim()))
     }
 
     /// Parse a key, rejecting anything whose kind can't be determined. Called on
@@ -131,7 +159,12 @@ impl SubjectKey {
 
     fn try_rank(&self) -> Result<SubjectRank> {
         let s = &self.0;
-        if s.contains('#') || s.contains('~') {
+        // First, and by prefix: an incident reference contains none of the sigils below, so
+        // without this branch `incident:INC-448` fails to parse rather than being
+        // misclassified — but it must be claimed here before `/` can see a `repo/name`.
+        if s.starts_with(INCIDENT_PREFIX) {
+            Ok(SubjectRank::Incident)
+        } else if s.contains('#') || s.contains('~') {
             Ok(SubjectRank::Issue)
         } else if s.contains('!') {
             Ok(SubjectRank::PullRequest)
@@ -139,7 +172,7 @@ impl SubjectKey {
             // `channel/thread_ts` — the only remaining shape.
             Ok(SubjectRank::SlackThread)
         } else {
-            bail!("'{s}' is not a subject key (expected owner/repo#N, owner/repo~N, owner/repo!N, or channel/ts)")
+            bail!("'{s}' is not a subject key (expected owner/repo#N, owner/repo~N, owner/repo!N, channel/ts, or incident:INC-N)")
         }
     }
 
@@ -153,6 +186,21 @@ impl SubjectKey {
     pub fn number(&self) -> Option<u64> {
         let idx = self.0.find(['#', '~', '!'])?;
         self.0[idx + 1..].parse().ok()
+    }
+
+    /// The incident.io reference (`INC-448`) for an incident key, else `None`.
+    pub fn incident_reference(&self) -> Option<&str> {
+        self.0.strip_prefix(INCIDENT_PREFIX)
+    }
+
+    /// A GitHub *discussion* (`owner/repo~7`) rather than an issue (`owner/repo#7`).
+    ///
+    /// Both carry [`SubjectRank::Issue`], and both answer `number()`, so anything that
+    /// reaches the REST issues API has to tell them apart: discussion 7 and issue 7 are
+    /// unrelated objects in the same repo, and discussions are not on that API at all.
+    /// Asking it for a discussion's comments returns some other conversation entirely.
+    pub fn is_discussion(&self) -> bool {
+        self.0.contains('~')
     }
 }
 
@@ -286,6 +334,20 @@ pub struct SubjectView {
     ///
     /// Derived on read, not stored: it must not be able to disagree with `summary`.
     pub headline: Option<String>,
+    /// A pull request's review decision — `approved`, `changes_requested`, `commented` —
+    /// or `None` when nobody has reviewed it (and on anything that isn't a PR).
+    ///
+    /// The board shows this instead of asking for attention on work a human has already
+    /// signed off. Derived from the signal feed, so it moves when the review does.
+    pub review_state: Option<String>,
+    /// This pull request has cleared **every** gate — approved, and nothing still failing.
+    /// See [`crate::subject::projection::gates_passed`] for what that does and doesn't
+    /// claim. False on anything that isn't a signed-off PR.
+    ///
+    /// Derived here rather than re-derived per surface: the board row's badge, the detail
+    /// panel, and `attention.reason` are all asserting the same thing, and three copies of
+    /// the rule is three chances for them to disagree in front of the operator.
+    pub gates_passed: bool,
     pub signals: Vec<Signal>,
     /// Resolution keys and context drawn from the members, for display.
     pub keys: Vec<ResolutionKey>,
@@ -408,17 +470,19 @@ const HEADLINE_MAX: usize = 160;
 /// Fragments of the summariser's own instructions. A summary containing one of
 /// these is the model reciting the brief instead of doing it.
 const PROMPT_ECHOES: &[&str] = &[
-    "(blast radius)",
+    "(blast radius",
     "(current outcome",
     "(what to do now",
     "labeled sections",
     "at most 120 characters",
+    "only when the evidence includes",
+    "give the call —",
 ];
 
 /// Is this summary content, or a failed pass wearing content's clothes?
 ///
-/// Two failures show up in practice and both are worse than no summary at all,
-/// because storing either one also sets `last_reasoned_at` and so convinces the
+/// Three failures show up in practice and all are worse than no summary at all,
+/// because storing any of them also sets `last_reasoned_at` and so convinces the
 /// board it has a real summary and nothing retries:
 ///
 /// 1. **Prompt echo** — the model repeats the section brief back, so the board
@@ -426,6 +490,11 @@ const PROMPT_ECHOES: &[&str] = &[
 /// 2. **Evidence dump** — the model pastes the `[sig:ID] source · kind · time:` lines
 ///    it was given. Legitimate summaries *do* cite `[sig:ID]` inline, so the tell is
 ///    not the citation but the signal-line shape following it.
+/// 3. **Transcript** — asked to resolve the conversation, the model pastes the
+///    conversation instead. This is the one that looks most like success: a wall of
+///    real quotes from real people, with nobody's question actually answered. The
+///    whole point of the Conversation section is that somebody has to take a side,
+///    so a section that only reproduces the discussion has done none of the work.
 pub fn is_usable_summary(summary: &str) -> bool {
     let text = summary.trim();
     if text.is_empty() {
@@ -435,16 +504,42 @@ pub fn is_usable_summary(summary: &str) -> bool {
     if PROMPT_ECHOES.iter().any(|e| lower.contains(e)) {
         return false;
     }
-    // Count lines that look like a pasted evidence line rather than prose: a signal
-    // citation followed by the ` · `-separated header `signal_line` emits.
     let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+    // A pasted evidence line: a signal citation plus the ` · `-separated header that
+    // `signal_line` emits.
     let dumped = lines
         .iter()
         .filter(|l| l.contains("[sig:") && l.matches(" · ").count() >= 2)
         .count();
     // One such line in a long summary is a heavily-cited sentence; half of them is a
     // transcript.
-    dumped * 2 < lines.len().max(1)
+    if dumped * 2 >= lines.len().max(1) {
+        return false;
+    }
+    // A pasted comment header, the shape `Comment::render` emits: `[review] alice
+    // (APPROVED) 2026-07-27:` or `[discussion] bob 2026-07-27:`. Two or more of these
+    // is the conversation reproduced rather than resolved. One can legitimately appear
+    // when a call quotes the comment it is answering.
+    quoted_comment_headers(&lines) < 2
+}
+
+/// How many lines open with a rendered comment header (see `github::Comment::render`).
+fn quoted_comment_headers(lines: &[&str]) -> usize {
+    lines
+        .iter()
+        .filter(|l| {
+            let t = l.trim().trim_start_matches(['-', '*', '>', ' ']);
+            let Some(rest) = t.strip_prefix('[') else {
+                return false;
+            };
+            let Some((kind, after)) = rest.split_once(']') else {
+                return false;
+            };
+            // The three kinds the GitHub client emits, and nothing else — `[sig:…]`
+            // citations and markdown links must not match.
+            matches!(kind, "review" | "discussion" | "review_comment") && after.contains(':')
+        })
+        .count()
 }
 
 /// The one line the board shows for a subject.
@@ -458,14 +553,60 @@ pub fn headline_from(summary: Option<&str>) -> Option<String> {
     if !is_usable_summary(text) {
         return None;
     }
-    let candidate = labelled_section(text, "headline")
-        .or_else(|| labelled_section(text, "status"))
-        .unwrap_or_else(|| text.to_string());
+    let normalised = split_labels(text);
+    let candidate = labelled_section(&normalised, "headline")
+        .or_else(|| labelled_section(&normalised, "status"))
+        .unwrap_or_else(|| normalised.clone());
     let flat = strip_for_row(&candidate);
     let sentence = first_sentence(&flat);
     let out = truncate_on_word(sentence, HEADLINE_MAX);
     (!out.is_empty()).then_some(out)
 }
+
+/// Put every `**Label:**` at the start of its own line.
+///
+/// The prompt asks for the sections separated by blank lines, and a model that runs them
+/// together on one line used to defeat section extraction entirely: the line-based scan
+/// found `Headline:` and then read to the end of the line, so a board row showed the
+/// headline, the status and the impact concatenated. Normalising first means the
+/// extractor only has to handle one shape.
+/// Not a byte index in sight. Summaries are full of em-dashes and arrows, and the first
+/// version of this sliced at fixed offsets — `after[..l.len()]` landed inside a `—` and
+/// panicked, which took down every board read, because the projection is what serves
+/// them. `str::get` returns `None` on a non-boundary instead of aborting.
+fn split_labels(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + 32);
+    let mut last = 0;
+    for (i, _) in text.match_indices("**") {
+        // `match_indices` yields non-overlapping matches, but `last` also guards the
+        // closing `**` of a label we have already consumed.
+        if i < last {
+            continue;
+        }
+        let after = &text[i + 2..];
+        let is_label = LABELS
+            .iter()
+            .any(|l| after.get(..l.len()).is_some_and(|p| p.eq_ignore_ascii_case(l)));
+        out.push_str(&text[last..i]);
+        if is_label && !out.is_empty() && !out.ends_with('\n') {
+            out.push_str("\n\n");
+        }
+        out.push_str("**");
+        last = i + 2;
+    }
+    out.push_str(&text[last..]);
+    out
+}
+
+/// The section labels the summariser is asked for, without their markdown.
+const LABELS: &[&str] = &[
+    "headline:",
+    "status:",
+    "impact:",
+    "conversation:",
+    "next:",
+    "next steps:",
+];
 
 /// The body of a `**Label:**` section, up to the next blank line or next label.
 fn labelled_section(text: &str, label: &str) -> Option<String> {
@@ -495,9 +636,7 @@ fn labelled_section(text: &str, label: &str) -> Option<String> {
 /// Does this line open one of the summariser's labelled sections?
 fn is_label_line(bare: &str) -> bool {
     let lower = bare.to_ascii_lowercase();
-    ["headline:", "status:", "impact:", "next:", "next steps:"]
-        .iter()
-        .any(|l| lower.starts_with(l))
+    LABELS.iter().any(|l| lower.starts_with(l))
 }
 
 /// Reduce summary markdown to plain single-line text fit for a table row.
@@ -630,6 +769,12 @@ mod tests {
         assert_ne!(issue, discussion);
         assert_eq!(issue.rank(), discussion.rank());
         assert_eq!(issue.number(), discussion.number());
+        // Same rank and same number, different objects — so anything that reaches the
+        // REST issues API for comments has to tell them apart.
+        assert!(discussion.is_discussion());
+        assert!(!issue.is_discussion());
+        assert!(!SubjectKey::pull_request("o/r", 5).is_discussion());
+        assert!(!SubjectKey::slack_thread("C02ABC/1721822400.001").is_discussion());
     }
 
     #[test]
@@ -698,6 +843,145 @@ mod tests {
             headline_from(Some(s)).as_deref(),
             Some("The restate-cloud bump to PR1200 is ready."),
         );
+    }
+
+    /// The shape the summariser now produces: a Conversation section that answers each
+    /// participant, between Impact and Next.
+    const WITH_CONVERSATION: &str = "**Headline:** Approved pending the tunnel conflict — \
+         drop that change and merge.\n\n\
+         **Status:** The image bump is approved [sig:github/9].\n\n\
+         **Impact:** Human UI access only.\n\n\
+         **Conversation:**\n\
+         - pcholakov approved but wants the tunnel conflict resolved first — go with \
+         dropping the change; they flagged it as probably unnecessary.\n\
+         - darkmuggle asks whether to keep the tag — answer no, the reverse-lookup tool \
+         settles it.\n\n\
+         **Next:** Drop the tunnel change, then merge.";
+
+    /// What the local model actually produced for nuon-byoc!140 on the first pass with
+    /// conversations wired in: it pasted the thread instead of resolving it. Trimmed,
+    /// but the header shapes are verbatim.
+    const TRANSCRIPT: &str = "**Status:** The incident is under investigation.\n\n\
+         **Impact:** A subset of JWT-authenticated users.\n\n\
+         **Conversation:**\n\
+         [review] pcholakov (APPROVED) 2026-07-27: Approved assuming you'll resolve the \
+         tunnel conflict - probably safe to drop that change altogether.\n\n\
+         [discussion] pcholakov 2026-07-27: Tunnel tag has probably already overtaken \
+         your change. Might be worth checking and resolving it.\n\n\
+         [discussion] darkmuggle 2026-07-27: That is the current tunnel on the main \
+         branch. I'll wait to pull the trigger.\n\n\
+         **Next:** The engineer will continue investigating.";
+
+    #[test]
+    fn a_pasted_thread_is_not_a_resolved_conversation() {
+        // The failure that looks most like success: real quotes from real people, and
+        // nobody's question answered. Storing it would also mark the subject summarised.
+        assert!(!is_usable_summary(TRANSCRIPT));
+        assert_eq!(headline_from(Some(TRANSCRIPT)), None);
+    }
+
+    #[test]
+    fn a_call_may_quote_the_comment_it_answers() {
+        // One header is a call citing what it responds to, which is not a transcript.
+        let resolved = "**Headline:** Drop the tunnel change, then merge.\n\n\
+             **Status:** Approved with one condition.\n\n\
+             **Conversation:**\n\
+             - pcholakov is blocking on the tunnel conflict ([review] pcholakov \
+             (APPROVED) 2026-07-27:) — go with dropping it; they called it redundant.\n\
+             - darkmuggle is waiting for a second pair of eyes — answer yes, deploy \
+             together to canary.\n\n\
+             **Next:** Drop the change and merge.";
+        assert!(is_usable_summary(resolved));
+        assert_eq!(
+            headline_from(Some(resolved)).as_deref(),
+            Some("Drop the tunnel change, then merge."),
+        );
+    }
+
+    #[test]
+    fn labels_run_together_on_one_line_still_split() {
+        // What the local model actually returned: every label inline, no blank lines. The
+        // line-based extractor read to the end of the line and produced a "headline" that
+        // was three sections concatenated.
+        let inline = "**Headline:** Restate-cloud image bump to PR1200 **Status:** Approved \
+             pending the tunnel conflict **Impact:** Low, only affects staging. \
+             **Next:** Drop that change and merge.";
+        assert_eq!(
+            headline_from(Some(inline)).as_deref(),
+            Some("Restate-cloud image bump to PR1200"),
+        );
+    }
+
+    #[test]
+    fn multibyte_text_around_a_label_does_not_panic() {
+        // The regression that took the board API down: an em-dash sitting where a label
+        // comparison sliced, so `after[..\"next steps:\".len()]` cut mid-character.
+        // Every one of these panicked before; the assertion is mostly that we return.
+        for text in [
+            "**Headline:** Restate-cloud — bump the image and merge.",
+            "**Status:** approved — merge.\n\n**Next:** — drop the tunnel change",
+            "**—** an em-dash where a label would be",
+            "**Headline:** ok**",
+            "**",
+            "****",
+            "**Headline:**",
+            "→**Next:**→",
+            "**Conversation:** @a wants → go with it",
+        ] {
+            let _ = headline_from(Some(text));
+            let _ = split_labels(text);
+            let _ = is_usable_summary(text);
+        }
+        // And the useful case still works with multibyte either side of the label.
+        assert_eq!(
+            headline_from(Some("**Headline:** Approved — drop it. **Status:** x")).as_deref(),
+            Some("Approved — drop it."),
+        );
+    }
+
+    #[test]
+    fn splitting_labels_leaves_ordinary_bold_alone() {
+        // `**Bottom line**` is not one of the section labels and must not gain a break.
+        let text = "**Headline:** All good. Some **emphasis** mid-sentence.";
+        let split = split_labels(text);
+        assert!(!split.contains("Some\n\n**emphasis**"), "{split:?}");
+        assert_eq!(headline_from(Some(text)).as_deref(), Some("All good."));
+    }
+
+    #[test]
+    fn a_conversation_section_does_not_leak_into_the_headline() {
+        // `Status:` must stop at the next label. Before `Conversation:` was a known
+        // label, extraction ran straight through it and the row showed the whole thread.
+        assert!(is_usable_summary(WITH_CONVERSATION));
+        assert_eq!(
+            headline_from(Some(WITH_CONVERSATION)).as_deref(),
+            Some("Approved pending the tunnel conflict — drop that change and merge."),
+        );
+    }
+
+    #[test]
+    fn the_status_section_still_ends_at_the_next_label() {
+        // Same summary with the headline removed: the fallback path has to stop at
+        // `Impact:` rather than swallowing the conversation behind it.
+        let no_headline = WITH_CONVERSATION
+            .split_once("**Status:**")
+            .map(|(_, rest)| format!("**Status:**{rest}"))
+            .expect("status section");
+        assert_eq!(
+            headline_from(Some(&no_headline)).as_deref(),
+            Some("The image bump is approved."),
+        );
+    }
+
+    #[test]
+    fn the_conversation_instructions_are_not_a_summary() {
+        // The new section brought its own instructions to recite back.
+        for echo in [
+            "**Conversation:** (only when the evidence includes a conversation)",
+            "For each participant, name them and give the CALL — go with their approach.",
+        ] {
+            assert!(!is_usable_summary(echo), "{echo:?} passed the guard");
+        }
     }
 
     #[test]

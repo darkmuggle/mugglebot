@@ -101,6 +101,13 @@ impl GithubWatcher {
                 return None;
             }
         };
+        // Report what this call cost. The budget is per token and process-wide, and the
+        // watcher is the highest-frequency caller on it — a poll a minute plus several
+        // enrichment fetches per notification. Spending that without reporting it left
+        // background work pacing itself against a reserve that was not really there.
+        // Before `error_for_status`, because a 403 for an exhausted budget is exactly the
+        // response whose headers matter most.
+        crate::github::observe(resp.headers());
         let resp = match resp.error_for_status() {
             Ok(r) => r,
             Err(e) => {
@@ -145,6 +152,15 @@ impl GithubWatcher {
             }
         }
 
+        // Whether anyone has signed the change off. One extra call, on pull requests
+        // only: REST's PR detail has no review decision (that is GraphQL's
+        // `reviewDecision`), so the reviews have to be read and reduced.
+        if subject.r#type == "PullRequest" {
+            if let Some(url) = subject.url.as_deref() {
+                enrichment.review_state = self.review_decision(headers, url).await;
+            }
+        }
+
         // The triggering comment is the most relevant context; when present it
         // overrides the subject body and re-attributes the signal to its author.
         if let Some(url) = subject.latest_comment_url.as_deref() {
@@ -166,6 +182,19 @@ impl GithubWatcher {
         }
 
         enrichment
+    }
+
+    /// The pull request's effective review decision, or `None` if nobody has reviewed.
+    async fn review_decision(&self, headers: &HeaderMap, pr_url: &str) -> Option<String> {
+        let reviews: Vec<GhReviewState> = self
+            .get_json(headers, &format!("{pr_url}/reviews?per_page={PAGE_SIZE}"))
+            .await?;
+        let decision = crate::github::review_decision(
+            reviews
+                .iter()
+                .filter_map(|r| Some((r.user.as_ref()?.login.as_str(), r.state.as_deref()?))),
+        );
+        Some(decision?.to_string())
     }
 
     /// Resolve a notification to its real subject: the strong correlation entity
@@ -381,7 +410,14 @@ impl GithubWatcher {
         // both cached as negatives/positives, so a burst of CI on one branch is a
         // single lookup and we don't re-hammer a 404 every poll. A 5xx/transport
         // error is left uncached to retry next poll.
-        let pr = match self.client.get(&url).headers(headers.clone()).send().await {
+        let pr = match self
+            .client
+            .get(&url)
+            .headers(headers.clone())
+            .send()
+            .await
+            .inspect(|resp| crate::github::observe(resp.headers()))
+        {
             Ok(resp) if resp.status() == reqwest::StatusCode::NOT_FOUND => {
                 debug!(
                     "github: no PR for {repo}@{branch} (404 — no match, or token \
@@ -514,7 +550,13 @@ impl GithubWatcher {
     /// GET a URL and return its body as text, following redirects (Actions job
     /// logs 302 to a signed storage URL). `None` on any transport/status error.
     async fn fetch_text(&self, headers: &HeaderMap, url: &str) -> Option<String> {
-        let resp = self.client.get(url).headers(headers.clone()).send().await;
+        let resp = self
+            .client
+            .get(url)
+            .headers(headers.clone())
+            .send()
+            .await
+            .inspect(|r| crate::github::observe(r.headers()));
         match resp.and_then(|r| r.error_for_status()) {
             Ok(r) => r.text().await.ok(),
             Err(e) => {
@@ -930,12 +972,29 @@ struct GhLabel {
 
 /// Content pulled from the subject and its triggering comment, folded into the
 /// signal so correlation and notifications see real context, not just a title.
+/// One review, as much of it as the decision needs.
+#[derive(Deserialize)]
+struct GhReviewState {
+    #[serde(default)]
+    user: Option<GhUser>,
+    #[serde(default)]
+    state: Option<String>,
+}
+
 #[derive(Default)]
 struct Enrichment {
     /// Who to attribute the signal to — comment author, else subject author.
     author: Option<String>,
     /// Lifecycle label: `open` / `closed` / `merged` / `draft`.
     state: Option<String>,
+    /// A pull request's effective review decision: `approved`, `changes_requested`,
+    /// or `commented`. `None` on anything that isn't a PR, and on a PR nobody has
+    /// reviewed. See [`review_decision`] for how competing reviews are resolved.
+    ///
+    /// This is what the board needs to stop asking for attention on work that has
+    /// already been signed off: "somebody reviewed this and said yes" is the answer
+    /// to "does this need me", and it was not being recorded anywhere.
+    review_state: Option<String>,
     /// GitHub's canonical browser URL for the subject, when the detail fetch
     /// returned one — preferred over reconstructing the link from the API URL.
     html_url: Option<String>,
@@ -1105,6 +1164,7 @@ impl Watcher for GithubWatcher {
                 .send()
                 .await
                 .context("requesting github notifications")?;
+            crate::github::observe(resp.headers());
 
             if page == 1 && resp.status() == reqwest::StatusCode::NOT_MODIFIED {
                 debug!("github: 304 not modified");
@@ -1244,6 +1304,7 @@ impl Watcher for GithubWatcher {
                 "ci_log_url": enrichment.ci_log.as_ref().and_then(|log| log.url.clone()),
                 "ci_log_kind": enrichment.ci_log.as_ref().map(|log| if log.failed { "failure" } else { "tail" }),
                 "ci_outcome": ci_outcome,
+                "review_state": enrichment.review_state,
             });
             // GitHub reuses a notification's id for the life of a thread, so the
             // id alone is not the event: `updated_at` is the version, and each
@@ -1293,7 +1354,6 @@ mod tests {
     use super::{
         ci_branch, ci_failed, ci_workflow_name, extract_ci_errors, subject_entity, subject_html_url,
     };
-
     #[test]
     fn ci_workflow_name_and_failed() {
         assert_eq!(

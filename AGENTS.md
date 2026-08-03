@@ -929,10 +929,12 @@ model, and the model is only asked to reason when it adds value.
      _clients_, not callable inference servers — the genuine subscription-riding
      "local connection" is the CLI bridge (a local process using your existing
      login), but your signal data still leaves the machine to be reasoned over.
-   - **Which is why the default is Ollama for everything.** Every automatic pass is
-     on-device, so no signal data leaves the machine unless the operator asks a cloud
-     model a question themselves — the chat picker or the second-opinion button. The CLI
-     bridge is how those two calls happen when they do. Interactive deep-dive is the
+   - **Which is why the default is Ollama for everything but one pass.** Every automatic
+     pass except assigned-issue triage is on-device, so no signal data leaves the machine
+     unless the operator asks a cloud model a question themselves — the chat picker or the
+     second-opinion button. The CLI bridge is how those calls happen when they do, and it
+     is also what triage rides: unmetered, but off the machine. Triage is the one place
+     the queueing argument beat the privacy one; see the triage section for why. Interactive deep-dive is the
      MCP-server path, where your Claude/ChatGPT client connects to MuggleBot; there the
      data leaves because you are the one asking.
 
@@ -1247,18 +1249,23 @@ time. So `IssueTriage` runs ahead of you, keyed `{issue}@{sha}`:
    paths and contents, with a path hit worth far more than a body hit. No model
    is involved, so selection works even with nothing reachable, and the model is
    never asked to guess at paths it hasn't seen.
-3. **Characterize** on the local coder model, with the source in hand.
+3. **Characterize** with the source in hand.
 4. **Propose N distinct approaches** — distinctness is the requirement, not a
    nicety: three variations on one idea is a single option wearing three hats and
    doesn't help you choose. Each carries files, a risk, an effort, and a
    confidence. Paths the model wasn't shown are dropped, because a patch citing a
    file that doesn't exist reads as authoritative and sends you hunting.
-5. **Plain English** via the `brief` tier, told explicitly to add nothing. That
-   constraint is what makes a small model right here: it's re-wording a
-   conclusion, not reaching one.
+5. **Plain English**, told explicitly to add nothing. That constraint is what would
+   make a small model right here: it's re-wording a conclusion, not reaching one.
 
-Steps 2–4 are on-device — reading source is exactly the work that shouldn't leave
-the machine, and a coder model is better at it than a generalist. Nothing in this
+Steps 3–5 run on the `triage` tier, which is **the one automatic pass not on-device** —
+and the exception is about queueing, not capability. Reading source is still work you'd
+rather keep local, and a coder model is still better at it than a generalist; what
+overrode that is the single local permit. Triage makes several large calls per issue, so
+on the local tier an issue assigned to *you* queued behind the code indexer's 147-repo
+crawl — the pass whose whole point is to be ready before you look at the board was the
+one guaranteed not to be. Its own tier decouples them. The default is the CLI bridge, so
+it is unmetered but not private: the source excerpts leave the machine. Nothing in this
 path writes to a repository: no commit, no push, no PR. The output is an artifact
 in SQLite and an `ArtifactRef` on the subject, and the workflow key records the
 commit it read — so "has this analysis gone stale?" is answered by comparing the
@@ -1634,12 +1641,17 @@ vqueues *requires* a fresh cluster. That is a deliberate acceptance, not an over
 
 ## Reasoning tiers — local by default, cloud only when asked
 
-**The local model does the work.** Every pass MuggleBot runs on its own — triage,
-correlation, PR critique, root cause, explanation, code indexing, tagging, live assist,
-chat — runs on `deepseek-coder:33b` via Ollama and nowhere else.
+**The local model does the work.** Every pass MuggleBot runs on its own — correlation,
+root cause, explanation, code indexing, tagging, live assist, chat — runs on
+`deepseek-coder:33b` via Ollama and nowhere else.
 
-A cloud model is used only when the operator asks for one, **by name**, in one of two
-places:
+**Assigned-issue triage is the one exception**, on `claude-sonnet-5` via the CLI bridge
+(`[reasoner] triage`). It is a queueing decision: one Ollama is one GPU, triage makes
+several large calls per issue, and it was reliably stuck behind the indexer. Unmetered,
+but the source excerpts leave the machine; `triage = "ollama_local"` reverts it.
+
+Otherwise a cloud model is used only when the operator asks for one, **by name**, in one
+of two places:
 
 | How you ask | What it does |
 |---|---|

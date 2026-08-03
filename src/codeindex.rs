@@ -22,7 +22,7 @@
 //! strictly more complete than it found it, and the scorer works off a partial index from
 //! the first batch onwards.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::collections::BTreeSet;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
@@ -131,6 +131,16 @@ impl CodeIndexer {
         self.github.is_some() && crate::checkout::have_git()
     }
 
+    /// Whether this repo is still one we index.
+    ///
+    /// Shared with the indexer object's tick so the two cannot disagree: `index_repo` refuses
+    /// an unknown repo, and the tick uses this to stop its own timer chain rather than warn
+    /// about the refusal forever. A repo leaves the index by being renamed, deleted or
+    /// removed from the crawl — none of which the next tick can fix.
+    pub fn knows_repo(&self, full_name: &str) -> bool {
+        matches!(self.store.get_repo(full_name), Ok(Some(_)))
+    }
+
     /// Index one repo: dependency edges, then component cards, then a batch of commits.
     ///
     /// That order is cheapest-first, and it is what makes a partial index useful. Edges cost
@@ -147,14 +157,29 @@ impl CodeIndexer {
         let Some(gh) = &self.github else {
             anyhow::bail!("code indexing is unavailable: no GitHub token stored");
         };
-        if self.store.get_repo(full_name)?.is_none() {
+        if !self.knows_repo(full_name) {
             anyhow::bail!("{full_name} is not in the repo index");
         }
         if !crate::checkout::have_git() {
             anyhow::bail!("`git` is not on PATH");
         }
-        let (branch, size_kb) = gh.repo_checkout_info(full_name).await?;
-        let checkout = self.checkouts.ensure(full_name, &branch, size_kb).await?;
+        // Refreshing the tree needs an API call, and that call is the first thing the
+        // background budget refuses. Aborting here used to take the whole tick with it —
+        // including the commit summarising below, which needs no network at all — so an
+        // exhausted budget stopped local work that was already paid for. That contradicted
+        // the intent stated at `fetch_history` ("the commits already cached are still worth
+        // summarizing this tick"), which could never be reached.
+        let checkout = match gh.repo_checkout_info(full_name).await {
+            Ok((branch, size_kb)) => self.checkouts.ensure(full_name, &branch, size_kb).await?,
+            Err(e) => match self.checkouts.existing(full_name).await {
+                Some(stale) => {
+                    debug!("index {full_name}: {e:#} — continuing on the existing checkout");
+                    stale
+                }
+                // No tree and no way to get one: there is genuinely nothing to do.
+                None => return Err(e).context("no checkout and the repo lookup failed"),
+            },
+        };
 
         // ---- dependency edges -------------------------------------------------
         // First, because it is the cheapest artifact and the most distinctive one. Two
@@ -192,11 +217,22 @@ impl CodeIndexer {
         }
 
         // ---- commit history ---------------------------------------------------
-        progress.commits_fetched = match self.fetch_history(full_name, gh).await {
+        // Forward first, then backward. Both best-effort: a rate limit or a flaky page is
+        // transient, and the commits already cached are still worth summarizing this tick.
+        //
+        // New commits before old ones because only the forward fetch keeps the index
+        // *current*, and a repo mid-backfill would otherwise spend days walking history
+        // while today's commits went unrecorded.
+        progress.commits_fetched = match self.fetch_new(full_name, gh).await {
             Ok(n) => n,
             Err(e) => {
-                // A rate limit or a flaky page is transient, and the commits already cached
-                // are still worth summarizing this tick.
+                warn!("new commits {full_name}: {e:#}");
+                0
+            }
+        };
+        progress.commits_fetched += match self.fetch_history(full_name, gh).await {
+            Ok(n) => n,
+            Err(e) => {
                 warn!("history {full_name}: {e:#}");
                 0
             }
@@ -204,20 +240,46 @@ impl CodeIndexer {
 
         // ---- commits ----------------------------------------------------------
         let component_paths: Vec<String> = discovered.iter().map(|c| c.path.clone()).collect();
-        for mut commit in self
+        let batch = self
             .store
-            .commits_needing_summary(full_name, COMMIT_BATCH)?
-        {
+            .commits_needing_summary(full_name, COMMIT_BATCH)?;
+        // Make sure the clone reaches these commits before asking it about them. The batch
+        // is oldest-first, so its first entry is the oldest commit still outstanding for
+        // this repo — deepen to there and every commit in the backlog is answerable
+        // locally. Idempotent, so this is a no-op on all but the first tick, and
+        // best-effort: failing it just means falling back to the API as before.
+        if let Some(oldest) = batch.first().map(|c| c.committed_at) {
+            if let Err(e) = self.checkouts.ensure_history(full_name, oldest).await {
+                debug!("index {full_name}: could not deepen history to {oldest}: {e:#}");
+            }
+        }
+        for mut commit in batch {
             // The commit list endpoint doesn't carry changed files, so a freshly fetched
             // commit arrives with none. That is *unknown*, not "changed nothing" — and
             // conflating the two would fill the index with placeholder rows and then report
             // itself complete, which is worse than an empty index because it looks done.
             if commit.files.is_empty() {
-                match gh.commit_files(full_name, &commit.sha).await {
+                // Local clone first. This used to be one GitHub call per commit, and with
+                // thousands of commits outstanding against a 5000/hour budget it was the
+                // entire reason indexing stalled: the backlog needed more API calls than the
+                // hour allowed, every hour. The commit's own tree answers the same question
+                // for free, so the API is now only the fallback for what the clone can't
+                // reach (a commit outside the shallow boundary, a deepen that failed).
+                let files = match self.checkouts.commit_files(full_name, &commit.sha).await {
+                    Ok(files) => Ok(files),
+                    Err(local) => {
+                        debug!(
+                            "files for {full_name}@{}: not in the clone ({local:#}); asking the API",
+                            commit.short_sha()
+                        );
+                        gh.commit_files(full_name, &commit.sha).await
+                    }
+                };
+                match files {
                     Ok(files) => {
                         commit.files = files;
-                        // Cached on the row: the file list is immutable per sha, and this is
-                        // one API call apiece.
+                        // Cached on the row: the file list is immutable per sha, so whichever
+                        // source answered, nothing has to ask again.
                         self.store.put_commits(std::slice::from_ref(&commit))?;
                     }
                     Err(e) => {
@@ -295,6 +357,56 @@ impl CodeIndexer {
             );
         }
         Ok(progress)
+    }
+
+    /// Pick up commits pushed since the last tick.
+    ///
+    /// This is the half of the walk that was missing, and its absence froze the index.
+    /// [`Self::fetch_history`] only ever moves *backwards*, and it deliberately
+    /// terminates: when it reaches the root commit it parks the cursor at an epoch
+    /// sentinel and returns 0 from then on. The only forward fetch was the very first
+    /// tick, where a `None` cursor meant `until = now`. So a repo whose backfill had
+    /// finished never asked GitHub for another commit — 112 of 114 repos here — and the
+    /// index sat frozen at whatever HEAD was on the day the walk started, five days stale
+    /// on the busiest repo, reporting itself complete the whole time. Nothing looked
+    /// broken: the hourly timers kept firing, each tick found nothing outstanding, and the
+    /// summary count never moved.
+    ///
+    /// Unconditional, and separate from the backward walk, because the two answer
+    /// different questions and only one of them can ever be finished. Costs one API call
+    /// per repo per tick — at the steady hourly cadence that is ~114 calls an hour against
+    /// a 5000/hour budget.
+    ///
+    /// Returns how many commits were new to the cache.
+    async fn fetch_new(
+        &self,
+        full_name: &str,
+        gh: &crate::github::GithubClient,
+    ) -> Result<usize> {
+        // Nothing cached yet: `fetch_history`'s first page seeds from HEAD, and asking
+        // "what's newer than nothing" would mean paging the entire history forwards.
+        let Some(since) = self.store.newest_commit_at(full_name)? else {
+            return Ok(0);
+        };
+        let batch = gh.commits(full_name, since, HISTORY_PAGE).await?;
+        if batch.is_empty() {
+            return Ok(0);
+        }
+        let (_, before) = self.store.commit_index_progress(full_name)?;
+        self.store.put_commits(&batch)?;
+        let (_, after) = self.store.commit_index_progress(full_name)?;
+        let added = (after - before).max(0) as usize;
+        // The boundary commit comes back every time — GitHub's `since` is inclusive — so
+        // `batch` is never empty on a live repo and only `added` says whether anything
+        // actually moved. Deliberately *not* touching `commit_window`: that cursor means
+        // "cached back to here" and takes the MIN, so a newer timestamp is meaningless to
+        // it and writing one would only muddle what it records.
+        debug!(
+            "new commits {full_name}: {} fetched since {}, {added} new",
+            batch.len(),
+            since.to_rfc3339()
+        );
+        Ok(added)
     }
 
     /// Walk one page further back through this repo's history.
@@ -516,6 +628,67 @@ fn truncate(s: &str, max: usize) -> String {
 mod tests {
     use super::*;
 
+    /// A renamed repo leaves the index under its old name, and `knows_repo` is what the
+    /// indexer's tick reads to retire its own timer chain instead of warning hourly forever.
+    ///
+    /// Asserted against `index_repo`'s refusal rather than in isolation, because the two being
+    /// the same predicate is the whole point: if `index_repo` ever refuses a repo that
+    /// `knows_repo` calls known, the loop is back to warning about a condition it cannot fix.
+    /// Observed on `restatedev/wip-agent` → `restatedev/agent`.
+    #[tokio::test]
+    async fn a_renamed_repo_stops_being_known() {
+        let store = Arc::new(crate::store::Store::open_in_memory().unwrap());
+        let entry = |full_name: &str| crate::store::RepoEntry {
+            full_name: full_name.into(),
+            description: None,
+            topics: vec![],
+            language: None,
+            archived: false,
+            pushed_at: None,
+            readme_etag: None,
+            readme: None,
+            summary: None,
+            indexed_sha: None,
+            digest: None,
+            kind: None,
+            kind_pinned: false,
+            fetched_at: chrono::Utc::now().to_rfc3339(),
+        };
+        store.put_repo(&entry("restatedev/agent"), false).unwrap();
+
+        let indexer = CodeIndexer {
+            store: store.clone(),
+            checkouts: Arc::new(crate::checkout::CheckoutCache::new(
+                std::env::temp_dir(),
+                None,
+                1,
+                1,
+            )),
+            // A real client with a junk token. `None` would refuse earlier on "no GitHub token
+            // stored" and the assertion below would pass for the wrong reason; this way the
+            // refusal can only be the repo one, which also pins that the repo guard runs
+            // before anything reaches the network — nothing here can make a request.
+            github: Some(crate::github::GithubClient::new("not-a-token".into()).unwrap()),
+            coder: Arc::new(crate::reasoner::MockReasoner::new("{}")),
+            embedder: Arc::new(crate::embed::HashEmbedder),
+        };
+
+        assert!(indexer.knows_repo("restatedev/agent"), "the new name is indexed");
+        assert!(
+            !indexer.knows_repo("restatedev/wip-agent"),
+            "the old name is gone from the index, and no later tick can bring it back"
+        );
+
+        let refused = indexer
+            .index_repo("restatedev/wip-agent", &[])
+            .await
+            .expect_err("an unindexed repo cannot be indexed");
+        assert!(
+            format!("{refused:#}").contains("is not in the repo index"),
+            "the tick's stop condition must be the same one `index_repo` refuses on, got: {refused:#}"
+        );
+    }
+
     /// `complete` gates the cadence: true drops the tick from every 30s to hourly. Three
     /// separate things can be unfinished, and each one used to be able to report done —
     /// most insidiously a repo whose history has never been fetched, which has 0 of 0
@@ -558,6 +731,69 @@ mod tests {
         );
     }
 
+    /// The forward fetch resumes from the newest commit cached, and that point must keep
+    /// moving after the backward walk has finished.
+    ///
+    /// This is the regression that froze the index. `fetch_history` parks `commit_window`
+    /// at the epoch sentinel to record "backfill complete", and then returns 0 for ever —
+    /// so the resume point for *new* commits cannot come from that cursor. It comes from
+    /// `newest_commit_at`, which is a fact about the cached commits and knows nothing about
+    /// the sentinel. Asserted together here because reading either one alone looks fine:
+    /// the bug was that only the terminating cursor was ever consulted.
+    #[test]
+    fn the_forward_resume_point_survives_a_finished_backfill() {
+        let store = crate::store::Store::open_in_memory().unwrap();
+        let at = |s: &str| chrono::DateTime::parse_from_rfc3339(s).unwrap().to_utc();
+        let commit = |sha: &str, when: &str| crate::store::CommitEntry {
+            full_name: "restatedev/restate".into(),
+            sha: sha.into(),
+            author: Some("someone".into()),
+            committed_at: at(when),
+            message: "a change".into(),
+            url: None,
+            files: vec!["src/lib.rs".into()],
+        };
+
+        assert_eq!(
+            store.newest_commit_at("restatedev/restate").unwrap(),
+            None,
+            "no commits cached: there is nowhere to resume from, and the backward walk seeds"
+        );
+
+        store
+            .put_commits(&[
+                commit("aaa", "2026-07-20T10:00:00Z"),
+                commit("bbb", "2026-07-24T21:31:22Z"),
+            ])
+            .unwrap();
+
+        // Backfill reaches the root: the cursor parks at the sentinel and stops asking.
+        store
+            .set_commit_window("restatedev/restate", full_history_sentinel())
+            .unwrap();
+        assert_eq!(
+            store.commit_window("restatedev/restate").unwrap(),
+            Some(full_history_sentinel()),
+        );
+
+        // The resume point is still the newest commit, not the sentinel — which is what
+        // makes a forward fetch possible at all once the walk is done.
+        assert_eq!(
+            store.newest_commit_at("restatedev/restate").unwrap(),
+            Some(at("2026-07-24T21:31:22Z")),
+        );
+
+        // ...and it advances as new commits land, so successive ticks don't re-ask for the
+        // same range.
+        store
+            .put_commits(&[commit("ccc", "2026-07-29T16:15:48Z")])
+            .unwrap();
+        assert_eq!(
+            store.newest_commit_at("restatedev/restate").unwrap(),
+            Some(at("2026-07-29T16:15:48Z")),
+        );
+    }
+
     #[test]
     fn dependency_names_resolve_onto_repos_we_index() {
         // The forms a manifest actually uses.
@@ -578,7 +814,7 @@ mod tests {
     /// `ecosystem::detect` and out the other side as an edge to a repo we index.
     #[test]
     fn a_real_manifest_resolves_to_an_edge_end_to_end() {
-        let dir = std::env::temp_dir().join("mugglebot-dep-edge-test");
+        let dir = std::env::temp_dir().join(format!("mugglebot-dep-edge-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(

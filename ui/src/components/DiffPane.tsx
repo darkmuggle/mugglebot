@@ -1,5 +1,6 @@
 import {
   createEffect,
+  createResource,
   createSignal,
   For,
   onCleanup,
@@ -13,6 +14,15 @@ import type {
   Recommendation,
   ReviewComment,
 } from "../types";
+
+/// Providers a re-review can be sent to. Same list and order as the subject panel's
+/// RECONSIDER control — one vocabulary for "pick a model", wherever it is offered.
+const PROVIDERS = [
+  { id: "ollama_local", label: "Ollama (Local)" },
+  { id: "anthropic", label: "Anthropic" },
+  { id: "openai", label: "OpenAI" },
+  { id: "ollama", label: "Ollama Cloud" },
+] as const;
 
 /// A pull request's diff, summarized first and readable underneath.
 ///
@@ -51,6 +61,68 @@ export default function DiffPane(props: {
   /// Collapsing keeps the fetched report: re-expanding is instant and costs neither an API call
   /// nor another model pass, which is the whole reason this is a toggle and not a reload.
   const [shut, setShut] = createSignal<Record<string, boolean>>({});
+
+  /// Provider/model for a re-review, and the dispatch result.
+  ///
+  /// Defaults to the on-device provider deliberately: the first press of a button whose
+  /// label doesn't name a model should not be the thing that sends a diff off the machine.
+  const [provider, setProvider] = createSignal<string>(PROVIDERS[0].id);
+  const [model, setModel] = createSignal<string>("");
+  const [models, { refetch: refetchModels }] = createResource(provider, (p) =>
+    api.models(p),
+  );
+  createEffect(() => {
+    const list = models();
+    if (list && list.length && !list.includes(model())) setModel(list[0]);
+  });
+  /// What the last re-review dispatch said, per `repo#number`. `dispatched: false` is not an
+  /// error — it means this model has already reviewed this diff and the verdict on screen is
+  /// its answer — so it needs its own message rather than the error channel.
+  const [dispatch, setDispatch] = createSignal<Record<string, string>>({});
+  /// PRs whose re-review is in flight, and the model asked for. Cleared when a review
+  /// produced by that model shows up — comparing the model rather than the timestamp,
+  /// because `produced_by` is the one field that distinguishes the answer we are waiting
+  /// for from the one already on screen.
+  const [awaiting, setAwaiting] = createSignal<Record<string, string>>({});
+
+  const reReview = async (repo: string, number: number) => {
+    const id = `${repo}#${number}`;
+    setBusy(true);
+    setError("");
+    try {
+      // Picking the model that produced the review already on screen means "do it again",
+      // not "do nothing" — a button labelled Re-review has to review. Without this the key
+      // is already spent and the press is silently free, which reads as broken. Any *other*
+      // model keeps the free-by-default behaviour: that press is a genuine new question.
+      const again =
+        report()?.diffs.find((d) => `${d.repo}#${d.number}` === id)?.review
+          ?.produced_by === model();
+      const r = await api.tool<{ dispatched: boolean; model: string }>(
+        "pr_review",
+        {
+          subject_key: `${repo}!${number}`,
+          provider: provider(),
+          model: model(),
+          force: again,
+        },
+      );
+      setDispatch((prev) => ({
+        ...prev,
+        [id]: r.dispatched
+          ? `reviewing on ${r.model} — the verdict replaces the one above when it lands`
+          : `${r.model} has already reviewed this diff; the verdict above is its answer`,
+      }));
+      // Wait for the new verdict. The existing poll only runs when a diff has *no* review,
+      // and a re-review replaces one — so it needs its own reason to keep looking.
+      if (r.dispatched) {
+        setAwaiting((prev) => ({ ...prev, [id]: r.model }));
+      }
+    } catch (e) {
+      setError(`${e}`);
+    } finally {
+      setBusy(false);
+    }
+  };
 
   const load = async (opts: { storedOnly?: boolean; refresh?: boolean }) => {
     setBusy(true);
@@ -93,8 +165,27 @@ export default function DiffPane(props: {
   ///
   /// Only while something is actually pending, and only after a diff has been shown: an idle
   /// pane makes no requests at all.
+  /// A re-review that has landed: its `produced_by` is the model we asked for.
   createEffect(() => {
-    if (!report() || !needsReview() || busy()) return;
+    const r = report();
+    if (!r) return;
+    const pending = awaiting();
+    if (!Object.keys(pending).length) return;
+    const done = { ...pending };
+    let changed = false;
+    for (const d of r.diffs) {
+      const id = `${d.repo}#${d.number}`;
+      if (done[id] && d.review?.produced_by === done[id]) {
+        delete done[id];
+        changed = true;
+      }
+    }
+    if (changed) setAwaiting(done);
+  });
+
+  createEffect(() => {
+    const pending = Object.keys(awaiting()).length > 0;
+    if (!report() || busy() || (!needsReview() && !pending)) return;
     const timer = setInterval(() => {
       void load({ storedOnly: true });
     }, 8000);
@@ -187,7 +278,68 @@ export default function DiffPane(props: {
                   >
                     <span class="rc-label">Review</span>
                     <span>{d.review!.rationale}</span>
+                    <span class="muted review-by">
+                      — {d.review!.produced_by}
+                    </span>
                   </div>
+                </Show>
+
+                {/* Re-review on a model you name. Placed under the verdict rather than in the
+                    header because that is where the reason to press it is felt: you have just
+                    read a recommendation and want a second reader on it. Collapsed by default —
+                    an always-open pair of selects reads as configuration for the whole pane. */}
+                <Show when={!isShut() && !d.error}>
+                  <details class="menu review-again">
+                    <summary>Re-review on another model ▾</summary>
+                    <div class="menu-body">
+                      <div class="model-bar">
+                        <select
+                          value={provider()}
+                          onChange={(e) => setProvider(e.currentTarget.value)}
+                        >
+                          <For each={PROVIDERS}>
+                            {(p) => <option value={p.id}>{p.label}</option>}
+                          </For>
+                        </select>
+                        <select
+                          value={model()}
+                          disabled={!models()?.length}
+                          onFocus={() => refetchModels()}
+                          onChange={(e) => setModel(e.currentTarget.value)}
+                        >
+                          <Show
+                            when={models()?.length}
+                            fallback={
+                              <option>
+                                {models.loading
+                                  ? "loading…"
+                                  : models.error
+                                    ? "unavailable"
+                                    : "no models"}
+                              </option>
+                            }
+                          >
+                            <For each={models()}>
+                              {(m) => <option value={m}>{m}</option>}
+                            </For>
+                          </Show>
+                        </select>
+                      </div>
+                      <button
+                        class="explain-btn"
+                        disabled={busy() || !model()}
+                        data-tip="Review this diff again on the model selected — runs in the background, no GitHub call"
+                        onClick={() => void reReview(d.repo, d.number)}
+                      >
+                        {awaiting()[id] ? "Reviewing…" : "Re-review"}
+                      </button>
+                      {/* "Already reviewed on this model" is an answer, not a failure, so it
+                          says so here rather than in the error line. */}
+                      <Show when={dispatch()[id]}>
+                        <span class="muted">{dispatch()[id]}</span>
+                      </Show>
+                    </div>
+                  </details>
                 </Show>
 
                 <For each={isShut() ? [] : d.files}>

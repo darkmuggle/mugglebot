@@ -137,6 +137,56 @@ const MARKER_FILES: &[&str] = &[
     "main.tf",
 ];
 
+/// What a push sweep should do with one entry of the org listing.
+#[derive(Debug, PartialEq, Eq)]
+enum PushVerdict {
+    /// A push newer than the one on record. Fetch this repo's commits.
+    Moved,
+    /// A push already on record. Because the listing is sorted newest-push-first, this also
+    /// means every remaining entry is older — the sweep can stop here, which is what keeps it
+    /// to one API call.
+    CaughtUp,
+    /// Nothing to do, and no conclusion about the rest of the page.
+    Skip,
+}
+
+/// Judge one listing entry against what the index already holds.
+///
+/// Pure, because the interesting part is the `CaughtUp` case: it terminates the sweep, so
+/// getting it wrong either costs the whole org's pagination every five minutes or stops the
+/// sweep before it has seen the new pushes.
+fn push_verdict(listed: Option<&str>, stored: Option<&str>, archived: bool) -> PushVerdict {
+    // An archived repo receives no pushes. Skip rather than CaughtUp: archived repos are
+    // sorted among the rest by their last push, so one in the middle of the page says nothing
+    // about the entries after it.
+    if archived {
+        return PushVerdict::Skip;
+    }
+    match (listed, stored) {
+        // No timestamp from GitHub is not evidence of a push, and tells us nothing about the
+        // ordering either.
+        (None, _) => PushVerdict::Skip,
+        // Never recorded a push for a repo we do index: treat it as moved and find out.
+        (Some(_), None) => PushVerdict::Moved,
+        // RFC-3339 in a fixed offset (`Z`) compares correctly as a string, which is how it is
+        // stored and how GitHub sends it.
+        (Some(listed), Some(stored)) => {
+            if listed > stored {
+                PushVerdict::Moved
+            } else {
+                PushVerdict::CaughtUp
+            }
+        }
+    }
+}
+
+/// Pages of the org listing one push-poll will read before giving up.
+///
+/// Two, not one: the sweep normally stops on the first already-seen push, and the only way
+/// to need a second page is more than a hundred repos pushed inside one interval — a mass
+/// force-push or a bulk migration. Beyond that the next sweep picks up the rest.
+const MAX_POLL_PAGES: usize = 2;
+
 pub struct RepoIndex {
     store: Arc<Store>,
     github: Option<GithubClient>,
@@ -444,6 +494,67 @@ impl RepoIndex {
 
     /// A repo earns a checkout + characterization if it's live code. Archived repos
     /// and (when configured) long-dormant ones don't.
+    /// Which repositories have been pushed to since we last looked.
+    ///
+    /// The cheap half of a crawl, for asking "is there anything new?" on a tight cadence.
+    /// A full [`Self::refresh`] reads READMEs, clones trees and cards repos with a model
+    /// call each; this reads one page of the org listing and nothing else.
+    ///
+    /// **One API call in steady state**, which is what makes a five-minute cadence
+    /// affordable at all. The listing is sorted `pushed` descending, so the moment a page
+    /// contains a repo whose `pushed_at` we already have, every repo after it is older
+    /// still and there is nothing left to find — so it stops. Polling each of 147 repos
+    /// directly instead would be two calls apiece: ~2,700 an hour against a budget of
+    /// 5,000 with 1,000 reserved, which would starve the notification watchers that share
+    /// it.
+    ///
+    /// Returns the repos that moved, newest push first. The stored `pushed_at` is advanced
+    /// as a side effect, so a repo is reported once per push rather than on every sweep
+    /// until something else happens to update it.
+    pub async fn poll_pushed(&self) -> Result<Vec<String>> {
+        let Some(gh) = &self.github else {
+            anyhow::bail!("no GitHub token stored");
+        };
+        let mut moved = Vec::new();
+        for page in 1..=MAX_POLL_PAGES {
+            let batch = gh.org_repos_page(&self.cfg.org, page).await?;
+            let n = batch.len();
+            let mut caught_up = false;
+            for meta in batch.iter().filter(|r| !r.fork) {
+                // Not in the index yet: a repo added since the last crawl. Left for
+                // `refresh` to enumerate properly — it needs a card, a checkout and a
+                // classification, none of which this path does.
+                let Some(mut row) = self.store.get_repo(&meta.full_name)? else {
+                    continue;
+                };
+                match push_verdict(
+                    meta.pushed_at.as_deref(),
+                    row.pushed_at.as_deref(),
+                    row.archived,
+                ) {
+                    PushVerdict::Moved => {}
+                    PushVerdict::Skip => continue,
+                    // Sorted descending, so everything beyond this point is older too.
+                    PushVerdict::CaughtUp => {
+                        caught_up = true;
+                        break;
+                    }
+                }
+                row.pushed_at = meta.pushed_at.clone();
+                // `recharacterized: false` — this touches the push timestamp and nothing a
+                // model produced. Passing true would discard the repo's card.
+                self.store.put_repo(&row, false)?;
+                moved.push(meta.full_name.clone());
+            }
+            // `n` is the unfiltered page length, so a page that is mostly forks still counts
+            // as full and paging continues.
+            if caught_up || n < 100 {
+                break;
+            }
+        }
+        Ok(moved)
+    }
+
     fn worth_indexing(&self, archived: &bool, pushed_at: Option<&str>) -> bool {
         if *archived {
             return false;
@@ -778,6 +889,37 @@ mod tests {
     ///
     /// An unparseable answer must leave the kind NULL rather than defaulting to `code`: NULL keeps
     /// the repo in the retry set, while a default silently settles it on a non-answer.
+    /// The sweep runs every five minutes against a shared API budget, so the case that
+    /// matters most is the one that makes it *stop*: seeing a push already on record means
+    /// every later entry is older, and the sweep ends after one call. Getting that wrong
+    /// either pages the whole org twelve times an hour or misses the new pushes entirely.
+    #[test]
+    fn a_push_sweep_stops_at_the_first_push_it_already_knows() {
+        use super::{push_verdict, PushVerdict};
+        let older = Some("2026-07-29T10:00:00Z");
+        let newer = Some("2026-07-30T10:54:46Z");
+
+        // Newer than what we hold: fetch it.
+        assert_eq!(push_verdict(newer, older, false), PushVerdict::Moved);
+        // Exactly what we hold: nothing new here or after it.
+        assert_eq!(push_verdict(older, older, false), PushVerdict::CaughtUp);
+        // Older than what we hold — a repo we polled more recently by other means. Still the
+        // end of the interesting part.
+        assert_eq!(push_verdict(older, newer, false), PushVerdict::CaughtUp);
+
+        // Never recorded a push: find out rather than assume.
+        assert_eq!(push_verdict(newer, None, false), PushVerdict::Moved);
+        // No timestamp from GitHub is not evidence of anything, in either direction.
+        assert_eq!(push_verdict(None, older, false), PushVerdict::Skip);
+        assert_eq!(push_verdict(None, None, false), PushVerdict::Skip);
+
+        // Archived repos are `Skip`, never `CaughtUp`. They sort among the rest by their last
+        // push, so one in the middle of a page must not end the sweep and hide the pushes
+        // listed after it.
+        assert_eq!(push_verdict(newer, older, true), PushVerdict::Skip);
+        assert_eq!(push_verdict(older, newer, true), PushVerdict::Skip);
+    }
+
     #[test]
     fn only_the_three_kinds_are_accepted_from_a_model() {
         assert_eq!(RepoKind::parse("code"), Some(RepoKind::Code));

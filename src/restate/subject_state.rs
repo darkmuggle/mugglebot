@@ -185,6 +185,7 @@ pub fn service_for(rank: SubjectRank) -> &'static str {
         SubjectRank::Issue => "Issue",
         SubjectRank::PullRequest => "PullRequest",
         SubjectRank::SlackThread => "SlackThread",
+        SubjectRank::Incident => "Incident",
     }
 }
 

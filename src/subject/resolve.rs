@@ -84,6 +84,10 @@ fn as_subject(k: &ResolutionKey) -> Option<SubjectKey> {
         return None;
     }
     match kind.as_str() {
+        // `incident:INC-448` → the incident subject. Highest rank, so a signal naming both an
+        // incident and an issue lands on the incident — the outage is the work, and the issue
+        // it turns out to be about is attached to it as an edge rather than owning it.
+        "incident" => (!k.value.trim().is_empty()).then(|| SubjectKey::incident(&k.value)),
         // `issue:owner/repo#412` → `owner/repo#412`
         "issue" => split_repo_number(&k.value).map(|(repo, n)| SubjectKey::issue(repo, n)),
         "discussion" => {

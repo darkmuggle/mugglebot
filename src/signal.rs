@@ -10,6 +10,10 @@ pub enum Source {
     GitHub,
     Slack,
     Granola,
+    /// incident.io. Its own source rather than a flavour of Slack: an incident is a
+    /// first-class piece of work with a lifecycle (`triage` → `active` → `closed`), and it
+    /// is reconciled against that lifecycle rather than against a notification feed.
+    IncidentIo,
 }
 
 impl Source {
@@ -18,6 +22,7 @@ impl Source {
             Source::GitHub => "github",
             Source::Slack => "slack",
             Source::Granola => "granola",
+            Source::IncidentIo => "incident_io",
         }
     }
 
@@ -26,6 +31,7 @@ impl Source {
             "github" => Some(Source::GitHub),
             "slack" => Some(Source::Slack),
             "granola" => Some(Source::Granola),
+            "incident_io" => Some(Source::IncidentIo),
             _ => None,
         }
     }

@@ -301,7 +301,7 @@ pub async fn list_models(
             .map(|s| s.to_string())
             .collect(),
         // "claude" and anything unrecognized.
-        _ => ["claude-opus-4-8", "claude-sonnet-5", "claude-haiku-4-5"]
+        _ => ["claude-opus-5", "claude-opus-4-8", "claude-sonnet-5", "claude-haiku-4-5"]
             .iter()
             .map(|s| s.to_string())
             .collect(),
@@ -313,6 +313,7 @@ pub async fn list_models(
         ("ollama_local", cfg.vision_model.clone()),
         (cfg.mid.as_str(), cfg.mid_model.clone()),
         (cfg.cloud.as_str(), cfg.cloud_model.clone()),
+        (cfg.code.as_str(), cfg.code_model.clone()),
     ]
     .into_iter()
     .filter(|(p, _)| *p == provider)
@@ -349,11 +350,12 @@ fn dedup_prepend(models: &mut Vec<String>, extra: impl IntoIterator<Item = Strin
 /// The reasoners the daemon hands out.
 ///
 /// The shape encodes the policy: **the local model does the work, and a cloud model is
-/// asked only when the operator asks for one by name.** There is exactly one
-/// cloud-capable handle here, so "does this run on Claude?" is answerable by grepping
-/// for `.cloud` rather than by reading every call site and hoping.
+/// asked only when the operator asks for one by name — or for the one pass that is named
+/// here.** Two handles can leave the machine, [`Self::cloud`] and [`Self::triage`], so
+/// "does this run on Claude?" is answerable by grepping for those two rather than by
+/// reading every call site and hoping.
 pub struct Reasoners {
-    /// On-device. Every automatic pass runs here.
+    /// On-device. Every automatic pass except assigned-issue triage runs here.
     pub local: Arc<dyn Reasoner>,
     /// Also local, unless `[reasoner.routing] enabled = true` — which re-enables
     /// automatic escalation. Kept as a distinct handle so the call sites that would
@@ -369,10 +371,24 @@ pub struct Reasoners {
     /// Local vision model, for images dropped into chat. Separate because a coder model
     /// has no image encoder and would silently ignore the attachment.
     pub vision: Arc<dyn Reasoner>,
-    /// **The only cloud-capable handle, and it is opt-in.** Two callers may hold it:
-    /// the chat pane when the operator picks a cloud model, and `SecondOpinion` when
-    /// they press the button. Anything else holding this is a policy break.
+    /// **The deep-analysis tier** — `claude-opus-5`, on the subscription CLI bridge.
+    ///
+    /// Three callers: the chat pane when the operator picks a cloud model, `SecondOpinion`
+    /// when they press the button, and — automatically — root-cause investigation's final
+    /// ranking pass, which judges the candidate graph the local model built.
+    ///
+    /// That last one used to be a policy break and is now the policy: the deep pass escalates
+    /// for every subject, incidents included. Unmetered, but off the machine.
     pub cloud: Arc<dyn Reasoner>,
+    /// **Assigned-issue triage, and nothing else.** The one automatic pass allowed off the
+    /// machine, because it was the one starving every other pass: triage makes many large
+    /// calls per issue and they all queued behind indexing on the single local permit.
+    ///
+    /// Held only by [`crate::triage::Triager`] (and, through it, the PR-fix critique). It
+    /// defaults to the subscription CLI bridge, so it is neither metered nor gated —
+    /// see `[reasoner] triage` for what it does cost, which is that the source excerpts
+    /// leave the machine.
+    pub code: Arc<dyn Reasoner>,
 }
 
 impl Reasoners {
@@ -432,6 +448,18 @@ impl Reasoners {
             &cfg.cloud,
             &cfg.cloud_model,
         );
+        // Triage's own tier. Cached like the rest, so a re-triage of an unchanged commit is
+        // still free — the point of moving it is the queue, not the call count.
+        let code = wrap(
+            build(
+                provider_label(&cfg.code),
+                &cfg.code_model,
+                cfg,
+                ollama_key.clone(),
+            ),
+            &cfg.code,
+            &cfg.code_model,
+        );
         // The bulk handle: same endpoint and model, marked so the gate holds a worker back from
         // it. A separate handle rather than a per-call flag because the callers are known — the
         // indexer and the crawler — and a flag would have to be threaded through every one of
@@ -470,6 +498,7 @@ impl Reasoners {
             local_background,
             vision,
             cloud,
+            code,
         }
     }
 }
@@ -503,15 +532,18 @@ impl Reasoner for MockReasoner {
 mod tests {
     use super::*;
 
-    /// The policy, asserted on the thing that actually decides it: what `from_config`
-    /// builds. With the shipped defaults, `local`, `routed` and `vision` must all be
-    /// on-device, and `cloud` must be the only handle that isn't.
+    /// The policy, asserted on the thing that actually decides it: what `from_config` builds.
     ///
-    /// This is the test that fails if someone "helpfully" points a tier back at Claude, or
-    /// adds a fifth handle and wires it to the cloud provider. The wiring is the guarantee,
-    /// so the wiring is what gets checked.
+    /// With the shipped defaults `local`, `routed` and `vision` are on-device, and exactly two
+    /// handles leave the machine: `code` (assigned-issue triage and PR review) and `cloud`
+    /// (the deep-analysis tier — chat picker, second opinion, and root-cause ranking).
+    ///
+    /// Both of those are now reached by **automatic** passes, which earlier revisions of this
+    /// test existed to forbid. What it still guarantees is the part that matters: the bulk,
+    /// high-volume work stays on-device, and no *third* handle grows a cloud provider without
+    /// someone editing this assertion and reading this comment.
     #[test]
-    fn the_shipped_config_puts_only_one_handle_in_the_cloud() {
+    fn only_code_and_cloud_leave_the_machine() {
         let cfg = ReasonerCfg::default();
         assert_eq!(provider_label(&cfg.local), "ollama_local");
         // Vision is always built local regardless of what `local` says — see
@@ -526,9 +558,15 @@ mod tests {
         assert!(!cfg.routing.enabled);
         assert!(!cfg.routing.cleanup);
         assert!(!cfg.routing.cloud_fallback);
-        // ...and the one cloud handle is genuinely cloud, so the second-opinion button
-        // isn't quietly asking the local model the same question twice.
+        // ...and the cloud handle is genuinely cloud, so the second-opinion button isn't
+        // quietly asking the local model the same question twice — and the root-cause deep
+        // pass is genuinely a deeper model than the one that built its shortlist.
         assert_eq!(provider_label(&cfg.cloud), "claude");
+        assert_eq!(cfg.cloud_model, "claude-opus-5");
+        // Triage is off the local permit by default — the whole reason the tier exists. If
+        // this flips back to a local provider, triage silently rejoins the indexing queue.
+        assert_eq!(provider_label(&cfg.code), "claude");
+        assert_eq!(cfg.code_model, "claude-sonnet-5");
     }
 
     /// The catch-all decides what a typo does. Under local-by-default it must resolve to

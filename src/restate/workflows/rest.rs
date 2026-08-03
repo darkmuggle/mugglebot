@@ -106,8 +106,7 @@ fn browser_classify(e: anyhow::Error) -> HandlerError {
 ///
 /// Keyed `{owner}/{repo}!{n}@{sha}`: the same diff is the same judgment, so a re-run
 /// on an unchanged PR is a refused key rather than another read of the diff and its
-/// reviews. Runs on-device — reading a diff is exactly the work that shouldn't leave
-/// the machine.
+/// reviews.
 pub struct PrCritique {
     ops: Arc<WorkflowOps>,
 }
@@ -116,7 +115,9 @@ impl PrCritique {
     pub fn new(ops: Arc<WorkflowOps>) -> Self {
         Self { ops }
     }
-    pub const SCOPE: &'static str = scopes::LOCAL_LLM;
+    /// This is triage's step 5 run on its own, so it runs on the same `[reasoner] triage`
+    /// tier — off the machine by default, and therefore not in the one-GPU queue.
+    pub const SCOPE: &'static str = scopes::CLOUD_LLM;
 }
 
 #[restate_sdk::workflow]
@@ -246,7 +247,12 @@ impl PrDiff {
 
 impl PrDiff {
     async fn read(&self, ctx: WorkflowContext<'_>) -> HandlerResult<bool> {
-        let (pr, watermark) = split_versioned(ctx.key());
+        let (pr, version) = split_versioned(ctx.key());
+        // An operator-chosen model rides in the key — see `prdiff::split_model` for why there
+        // and not in a body. The watermark comes back without it, so re-dispatching a review
+        // does not look like new activity on the pull request.
+        let (watermark, model) = crate::prdiff::split_model(version);
+        let model = model.map(|(p, m)| (p.to_string(), m.to_string()));
         let (pr, watermark) = (pr.to_string(), watermark.to_string());
         let Some((repo, number)) = crate::prdiff::parse_pr_key(&pr) else {
             return Err(TerminalError::new(format!("{pr} does not name a pull request")).into());
@@ -294,8 +300,21 @@ impl PrDiff {
                     let ops = ops.clone();
                     let (repo, watermark) = (repo_for_review.clone(), watermark_for_review.clone());
                     let report = report.clone();
+                    let model = model.clone();
                     async move {
-                        let review = ops.diff_reader().review(&repo, number, &report).await;
+                        let reader = ops.diff_reader();
+                        let review = match &model {
+                            // The operator named a model. Built here rather than held on the
+                            // reader: this is one question about one review, not a change to
+                            // how the daemon is configured.
+                            Some((provider, model)) => {
+                                let reasoner = ops.reasoner_for(provider, model);
+                                reader
+                                    .review_with(&repo, number, &report, &*reasoner, model)
+                                    .await
+                            }
+                            None => reader.review(&repo, number, &report).await,
+                        };
                         Ok(Json(review.map(|review| crate::prdiff::StoredReview {
                             watermark,
                             reviewed_at: chrono::Utc::now(),

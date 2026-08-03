@@ -43,6 +43,10 @@ pub const KNOWN_SECRETS: &[&str] = &[
     "github",
     "slack",
     "granola",
+    // incident.io. Listed here because this list *is* the config page's form: a credential
+    // absent from it cannot be entered through the UI at all, however ready the rest of the
+    // integration is.
+    "incident",
     "ollama",
     "anthropic",
     "openai",

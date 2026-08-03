@@ -12,8 +12,10 @@
 /// worse than a queue of one — the single strongest fit for a concurrency limit here.
 pub const LOCAL_LLM: &str = "local-llm";
 
-/// Every concurrent invocation is real money. Limit keys per tier bound the
-/// expensive one separately.
+/// Model calls that leave the machine. Mostly that means real money per concurrent
+/// invocation, which is reason enough for a bound; assigned-issue triage rides the
+/// unmetered subscription bridge and still belongs here, because what this scope really
+/// separates is *not competing for the one GPU*.
 pub const CLOUD_LLM: &str = "cloud-llm";
 pub const TIER_SONNET: &str = "sonnet";
 pub const TIER_OPUS: &str = "opus";

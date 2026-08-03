@@ -309,7 +309,7 @@ impl AgentSessions {
             live: Mutex::new(HashMap::new()),
             events,
             checkouts: Arc::new(crate::checkout::CheckoutCache::new(
-                std::env::temp_dir().join("mugglebot-agent-test"),
+                std::env::temp_dir().join(format!("mugglebot-agent-test-{}", std::process::id())),
                 None,
                 64,
                 0,

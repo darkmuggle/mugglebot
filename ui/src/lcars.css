@@ -395,6 +395,21 @@ body {
   font-variant-numeric: tabular-nums;
   letter-spacing: 0;
 }
+/* The type split inside a lane. Quieter than the lane head — the lane is the
+   judgement ("decide this"), the type is only what doing it involves. */
+.type-head {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  margin: 0;
+  padding: 10px 2px 3px;
+  font-size: var(--t-micro);
+  font-weight: 500;
+  color: var(--faint);
+}
+.type-head .lane-count {
+  color: var(--faint);
+}
 .lane-empty {
   margin: 0;
   padding: 2px 2px 6px;
@@ -408,8 +423,13 @@ body {
 .lane-row {
   display: grid;
   /* Fixed side columns so the kind, the actor and the age line up down the page —
-     a column that re-sizes per row is a column you have to read rather than scan. */
-  grid-template-columns: 3.2rem minmax(0, 1fr) 10.5rem 3rem 8.4rem;
+     a column that re-sizes per row is a column you have to read rather than scan.
+     The kind column is 6.4rem because `GITHUB ISSUE` measures 90.3px at this type style
+     (11px, uppercase, 0.1em tracking) — measured in the browser, not guessed. At the 3.2rem
+     that fitted `PR` it wrapped onto two lines and took the row's height with it. The ~12px
+     of slack is deliberate: a font that resolves differently on another machine only has to
+     be a few percent wider to wrap, and the cost of the margin is title width nobody misses. */
+  grid-template-columns: 6.4rem minmax(0, 1fr) 10.5rem 3rem 8.4rem;
   gap: 0 12px;
   align-items: start;
   padding: 8px 8px 8px 0;
@@ -437,11 +457,21 @@ body {
   border-left-color: var(--lilac);
 }
 
-/* Right-aligned so `PR` and `Issue` share an edge and every title starts at the
-   same x — left-aligned, the wider word pushed its row's title 20px out. */
+/* Right-aligned so the kinds share an edge and every title starts at the same x —
+   left-aligned, the wider word pushed its row's title 20px out.
+
+   `--dim`, not `--faint`: at 11px on `--bg` faint measures 3.99:1, under the 4.5:1 AA
+   floor for normal text, and it was the *issue* rows that suffered — pull requests are
+   overridden to `--blue` below (7.50:1) and read fine, which is why only half the column
+   looked broken. `--dim` is 6.18:1.
+
+   Tracking is dropped too. The 0.1em that makes a two-letter `PR` legible turns a
+   twelve-character `GITHUB ISSUE` into something you spell out rather than recognise; the
+   longer the string, the more letter-spacing costs. The uppercase house style stays. */
 .row-kind {
   font-size: var(--t-micro);
-  color: var(--faint);
+  color: var(--dim);
+  letter-spacing: 0.02em;
   padding-top: 3px;
   text-align: right;
 }
@@ -536,6 +566,32 @@ body {
 }
 .badge-live {
   background: var(--lilac);
+}
+/* The incidents board. Rows reuse `.lane-row`, so they line up and behave like the main
+   board's — the difference between the two boards is what is on them, not how they look. */
+.lane-row.rank-incident .row-kind {
+  color: var(--sev-warning);
+}
+.inc-list {
+  margin-bottom: 12px;
+}
+
+/* Cleared every gate. Solid green: this is the one badge that says "you can stop
+   reading here", so it gets the strongest positive weight on the row. */
+.badge-cleared {
+  background: var(--ok);
+}
+/* Approved but *not* finished — something is still failing. Outlined rather than
+   filled, so it can't be mistaken at a glance for the cleared badge above; a filled
+   green pill on a PR with red CI would read as done when it isn't. */
+.badge-approved {
+  background: transparent;
+  border: 1px solid var(--ok);
+  color: var(--ok);
+  padding: 0 6px;
+}
+.badge-blocked {
+  background: var(--sev-warning);
 }
 .badge-ai {
   background: var(--surface-2);
@@ -663,24 +719,23 @@ body {
   color: var(--faint);
   font-variant-numeric: tabular-nums;
 }
+/* One column, one width. Every panel is the same box.
+   This was a two-column grid where some panels spanned both and others took a single
+   column, and the summary panel was additionally capped to its own text width — so a
+   click-in view showed boxes at 749, 837, 333 and 1180px and read as though the layout
+   had come apart. The prose inside is still capped (see `.md`); the *container* no
+   longer varies, because a box whose width encodes nothing should not vary at all. */
 .detail-grid {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
+  display: flex;
+  flex-direction: column;
   gap: var(--gap);
   /* The page is a reading column, so it stops where reading stops being comfortable.
      Panels of prose used to stretch to whatever the window was. */
   max-width: 1180px;
 }
-/* The summary panel: full width of the grid, but only as wide as its own prose needs
-   to be. Capping `.md` alone left the panel stretched with an empty right half — the
-   panel should end where the text ends. */
-.detail-grid .panel:first-child {
-  grid-column: 1 / -1;
-  max-width: calc(var(--measure) + 4rem);
-}
-.timeline-panel,
-.browser-investigations {
-  grid-column: 1 / -1;
+.detail-grid > * {
+  /* Natural height in a scrolling column, rather than shrinking to fit the viewport. */
+  flex: 0 0 auto;
 }
 .summary {
   color: var(--text);
@@ -948,9 +1003,6 @@ body {
 
 /* Root cause. Candidates are hypotheses: the relation pill carries the claim and
    the confidence is always shown next to it, so nothing reads as a verdict. */
-.root-cause {
-  grid-column: 1 / -1;
-}
 .panel-head {
   display: flex;
   align-items: center;
@@ -1078,9 +1130,6 @@ body {
 /* Assigned-issue triage. The plain-English gloss leads; the technical analysis
    and the patch options sit under it. Patches are proposals, and the numbering
    plus the "nothing applied" note keep that visible. */
-.issue-triage {
-  grid-column: 1 / -1;
-}
 .triage-plain {
   margin-top: 10px;
   padding: 10px 12px;
@@ -1175,12 +1224,6 @@ body {
 .triage-provenance summary {
   cursor: pointer;
 }
-@media (max-width: 1180px) {
-  .detail-grid {
-    grid-template-columns: 1fr;
-  }
-}
-
 /* hints */
 .hint {
   border: 1px solid var(--line);
@@ -1405,6 +1448,18 @@ body {
 .cost-metered {
   color: var(--amber);
 }
+/* The re-review control sits inside a diff block, under the verdict. Indented and quiet:
+   it is an action on the review above it, not a new section of the pane. */
+.review-again {
+  margin: 4px 0 8px 0;
+}
+/* Which model produced the verdict, on the rationale line. The one fact that makes two
+   reviews of the same diff tellable apart. */
+.review-by {
+  margin-left: 6px;
+  white-space: nowrap;
+}
+
 .menu-sep {
   margin-top: 6px;
   padding: 8px 4px 2px;
@@ -3195,12 +3250,6 @@ code {
 .ai-failed {
   color: var(--sev-critical);
   border: 1px solid var(--sev-critical);
-}
-
-/* The attempts panel in the detail view spans both columns: an attempt carries a diff,
-   and a diff in a half-width column is a column of wrapped patch lines. */
-.attempts-panel {
-  grid-column: 1 / -1;
 }
 
 /* ---- the click-in view reads, the board scans -----------------------------------

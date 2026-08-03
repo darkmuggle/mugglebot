@@ -69,7 +69,10 @@ export function AttentionBadge(props: {
       <Show
         when={props.attention.needed}
         fallback={
-          <span class="att att-clear" data-tip="Nothing here is asking for you">
+          <span
+            class="att att-clear"
+            data-tip={props.attention.reason ?? "Nothing here is asking for you"}
+          >
             CLEAR
           </span>
         }
@@ -81,11 +84,10 @@ export function AttentionBadge(props: {
           NEEDS YOU
         </span>
       </Show>
-      <Show
-        when={
-          props.attention.reason && props.attention.needed && !props.compact
-        }
-      >
+      {/* Printed whether or not it needs you. A reason now exists for the good case
+          too — "all gates passed" — and that is worth reading, where the old blanket
+          absence of one was not. */}
+      <Show when={props.attention.reason && !props.compact}>
         <span class="att-reason">{props.attention.reason}</span>
       </Show>
 

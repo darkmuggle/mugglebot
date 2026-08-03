@@ -26,6 +26,7 @@ use restate_sdk::prelude::*;
 use crate::subject::{SubjectKey, SubjectRank};
 
 pub mod debounce;
+pub mod incident;
 pub mod issue;
 pub mod pull_request;
 pub mod repo_indexer;
@@ -69,7 +70,7 @@ pub(crate) async fn drop_signal(ctx: &ObjectContext<'_>, id: String) -> HandlerR
     Ok(())
 }
 
-/// Dispatch `record` to whichever of the three subject objects owns this key.
+/// Dispatch `record` to whichever subject object owns this key.
 ///
 /// Matched on the rank rather than on a name string: routing through
 /// `&'static str` meant a typo in one arm fell through to the Slack-thread client
@@ -89,6 +90,11 @@ pub(crate) fn send_record(ctx: &ObjectContext<'_>, key: &SubjectKey, signal_id: 
         }
         SubjectRank::SlackThread => {
             ctx.object_client::<slack_thread::SlackThreadClient>(key.to_string())
+                .record(signal_id)
+                .send();
+        }
+        SubjectRank::Incident => {
+            ctx.object_client::<incident::IncidentClient>(key.to_string())
                 .record(signal_id)
                 .send();
         }

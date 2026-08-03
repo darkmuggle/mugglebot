@@ -1,7 +1,7 @@
 // Mirrors the Rust wire types (serde snake_case). Keep in sync with the backend
 // (src/signal.rs, src/subject.rs, src/correlation.rs, src/live.rs, src/event.rs).
 
-export type Source = "github" | "slack" | "granola";
+export type Source = "github" | "slack" | "granola" | "incident_io";
 export type Severity = "info" | "notice" | "warning" | "critical";
 
 /// Operator triage, per *subject*. Acknowledging half a PR's CI failures was never
@@ -9,7 +9,14 @@ export type Severity = "info" | "notice" | "warning" | "critical";
 export type Handled = "open" | "seen" | "acknowledged" | "snoozed" | "resolved";
 
 /// The three kinds of durable work, ranked: issue > pull request > Slack thread.
-export type SubjectRank = "issue" | "pull_request" | "slack_thread";
+export type SubjectRank =
+  | "issue"
+  | "pull_request"
+  | "slack_thread"
+  /// An incident.io incident. Only ever rendered by the Incidents view — the main board's
+  /// read excludes this rank server-side. Listed in the union so the `Record<SubjectRank, …>`
+  /// label maps fail to compile rather than silently missing a case.
+  | "incident";
 
 /// Something a signal names. Only issue/PR/Slack-thread keys can *own* a signal;
 /// the rest are how the owner was found, plus context.
@@ -98,6 +105,14 @@ export interface SubjectView {
   /// sentence by the backend, or null when there is no usable summary yet. Derived
   /// on read, so it can never disagree with `summary`.
   headline: string | null;
+  /// A pull request's review decision — `approved`, `changes_requested`,
+  /// `commented` — or null when nobody has reviewed it (and on anything that
+  /// isn't a PR). Derived from the signal feed by the backend.
+  review_state: string | null;
+  /// This PR cleared every gate: approved, and nothing still failing. The backend
+  /// derives it (see `projection::gates_passed`) so the row badge, the detail panel,
+  /// and `attention.reason` can't disagree about it. False on anything else.
+  gates_passed: boolean;
   created_at: string;
   updated_at: string;
   last_reasoned_at: string | null;

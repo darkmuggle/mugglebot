@@ -281,6 +281,12 @@ CREATE TABLE IF NOT EXISTS issue_pr_fixes (
     -- comments the critique already reads. Stored so the board can show what
     -- reviewers actually said without re-fetching or re-judging it.
     conversation TEXT,
+    -- The reviewers' actual verdict: `approved`, `changes_requested`, `commented`, or
+    -- NULL when nobody has reviewed. Distinct from `verdict` above, which is
+    -- MuggleBot's own judgment of whether the PR fixes the issue — this one is what
+    -- the humans said, and it is what the board reports instead of asking for
+    -- attention on a change somebody has already signed off.
+    review_state TEXT,
     also_fixes  TEXT NOT NULL DEFAULT '[]',
     -- Which tier produced the analysis — local, or an escalation.
     analyzed_by TEXT,
@@ -481,7 +487,7 @@ const REPO_SELECT: &str = "SELECT full_name, description, topics, language, arch
 /// Column list for [`row_to_pr_fix`].
 const PR_FIX_SELECT: &str = "SELECT issue_key, pr_repo, pr_number, pr_title, pr_url, pr_author, \
      pr_state, files, verdict, confidence, implementation, critique, conversation, \
-     also_fixes, analyzed_by, created_at, updated_at FROM issue_pr_fixes";
+     review_state, also_fixes, analyzed_by, created_at, updated_at FROM issue_pr_fixes";
 
 /// Column list for [`row_to_issue_triage`].
 const TRIAGE_SELECT: &str = "SELECT issue_key, repo, number, title, url, signal_id, status, \
@@ -682,6 +688,12 @@ pub struct PrFix {
     pub critique: Option<String>,
     /// What reviewers actually said, distilled from the merit-scored discussion.
     pub conversation: Option<String>,
+    /// The reviewers' verdict — `approved`, `changes_requested`, `commented` — or
+    /// `None` when nobody has reviewed.
+    ///
+    /// Not to be confused with `verdict`, which is MuggleBot's own reading of whether
+    /// this PR fixes the issue. This is the humans'.
+    pub review_state: Option<String>,
     /// Other issue references this PR would also resolve.
     pub also_fixes: Vec<String>,
     /// The tier that produced this analysis (`local`, `brief`, `mid`).
@@ -1132,6 +1144,40 @@ impl Store {
         active_ids: &BTreeSet<String>,
     ) -> Result<Vec<Signal>> {
         self.resolve_missing(active_ids, true, |signal| signal.external_id.clone())
+    }
+
+    /// Resolve incidents absent from a complete listing of incident.io's **open** set.
+    ///
+    /// The removal half of "all open incidents tracked, resolved ones removed". Unlike the
+    /// GitHub reconcilers this needs no half-selection: the incident source has exactly one
+    /// listing and it is authoritative for all of it.
+    pub fn resolve_missing_incidents(
+        &self,
+        active_ids: &BTreeSet<String>,
+    ) -> Result<Vec<Signal>> {
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        let mut candidates = {
+            let mut stmt = tx.prepare(&format!(
+                "{SIGNAL_SELECT} WHERE source = ?1 AND upstream_gone = 0"
+            ))?;
+            let rows = stmt.query_map(params![Source::IncidentIo.as_str()], row_to_signal)?;
+            collect(rows)?
+        };
+        let mut resolved = Vec::new();
+        for signal in &mut candidates {
+            if active_ids.contains(&signal.external_id) {
+                continue;
+            }
+            tx.execute(
+                "UPDATE signals SET upstream_gone = 1 WHERE id = ?1",
+                params![signal.id],
+            )?;
+            signal.upstream_gone = true;
+            resolved.push(signal.clone());
+        }
+        tx.commit()?;
+        Ok(resolved)
     }
 
     /// Shared reconciliation. `assigned` selects which half of the GitHub signals
@@ -1604,15 +1650,15 @@ impl Store {
         self.lock().execute(
             "INSERT INTO issue_pr_fixes \
              (issue_key, pr_repo, pr_number, pr_title, pr_url, pr_author, pr_state, files, \
-              verdict, confidence, implementation, critique, conversation, also_fixes, \
-              analyzed_by, created_at, updated_at) \
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?16) \
+              verdict, confidence, implementation, critique, conversation, review_state, \
+              also_fixes, analyzed_by, created_at, updated_at) \
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?17) \
              ON CONFLICT(issue_key, pr_repo, pr_number) DO UPDATE SET \
                pr_title=excluded.pr_title, pr_url=excluded.pr_url, pr_author=excluded.pr_author, \
                pr_state=excluded.pr_state, files=excluded.files, verdict=excluded.verdict, \
                confidence=excluded.confidence, implementation=excluded.implementation, \
                critique=excluded.critique, conversation=excluded.conversation, \
-               also_fixes=excluded.also_fixes, \
+               review_state=excluded.review_state, also_fixes=excluded.also_fixes, \
                analyzed_by=excluded.analyzed_by, updated_at=excluded.updated_at",
             params![
                 f.issue_key,
@@ -1628,6 +1674,7 @@ impl Store {
                 f.implementation,
                 f.critique,
                 f.conversation,
+                f.review_state,
                 json(&f.also_fixes)?,
                 f.analyzed_by,
                 Utc::now().to_rfc3339(),
@@ -3209,6 +3256,27 @@ impl Store {
         .map_err(Into::into)
     }
 
+    /// The newest commit cached for one repo — where a forward fetch resumes from.
+    ///
+    /// The counterpart to [`Self::oldest_commit_at`], and the two are needed for opposite
+    /// reasons: the backward walk terminates at the root, while the forward fetch never
+    /// does, because a repo keeps receiving commits.
+    pub fn newest_commit_at(&self, full_name: &str) -> Result<Option<DateTime<Utc>>> {
+        let conn = self.lock();
+        let raw: Option<String> = conn
+            .query_row(
+                "SELECT MAX(committed_at) FROM repo_commits WHERE full_name = ?1",
+                [full_name],
+                |r| r.get(0),
+            )
+            .optional()
+            .map(Option::flatten)?;
+        Ok(raw
+            .as_deref()
+            .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+            .map(|d| d.with_timezone(&Utc)))
+    }
+
     /// Every explanation of a subject, local first so the board's default is the one that
     /// didn't cost anything.
     pub fn explanations(&self, subject_key: &str) -> Result<Vec<Explanation>> {
@@ -3548,10 +3616,11 @@ fn row_to_pr_fix(row: &Row) -> rusqlite::Result<PrFix> {
         implementation: row.get(10)?,
         critique: row.get(11)?,
         conversation: row.get(12)?,
-        also_fixes: from_json::<Vec<String>>(row, 13)?,
-        analyzed_by: row.get(14)?,
-        created_at: row.get(15)?,
-        updated_at: row.get(16)?,
+        review_state: row.get(13)?,
+        also_fixes: from_json::<Vec<String>>(row, 14)?,
+        analyzed_by: row.get(15)?,
+        created_at: row.get(16)?,
+        updated_at: row.get(17)?,
     })
 }
 
@@ -3599,6 +3668,7 @@ fn add_columns(conn: &Connection) -> Result<()> {
     const ADDED: &[(&str, &str, &str)] = &[
         ("repo_index", "kind", "TEXT"),
         ("repo_index", "kind_pinned", "INTEGER NOT NULL DEFAULT 0"),
+        ("issue_pr_fixes", "review_state", "TEXT"),
     ];
     for (table, column, def) in ADDED {
         if has_column(conn, table, column)? {
@@ -4259,7 +4329,7 @@ mod tests {
     /// holding 147 repos and 718 commit summaries.
     #[test]
     fn a_new_column_reaches_a_database_that_predates_it() {
-        let dir = std::env::temp_dir().join("mugglebot-add-column-test");
+        let dir = std::env::temp_dir().join(format!("mugglebot-add-column-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("older.sqlite");
@@ -5221,7 +5291,7 @@ mod tests {
     /// `subject_root_cause`, which was neither the cause nor even mentioned in the error.
     #[test]
     fn an_older_database_is_refused_by_name_rather_than_failing_mid_schema() {
-        let dir = std::env::temp_dir().join("mugglebot-schema-compat-test");
+        let dir = std::env::temp_dir().join(format!("mugglebot-schema-compat-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("old.sqlite");
@@ -5261,7 +5331,7 @@ mod tests {
     /// only useful if the happy path is unaffected by it.
     #[test]
     fn a_current_database_reopens_cleanly() {
-        let dir = std::env::temp_dir().join("mugglebot-schema-reopen-test");
+        let dir = std::env::temp_dir().join(format!("mugglebot-schema-reopen-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("current.sqlite");

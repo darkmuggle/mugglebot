@@ -26,6 +26,7 @@ mod embed;
 mod enrich;
 mod event;
 mod github;
+mod incident;
 mod live;
 mod live_engine;
 mod mcp;
@@ -136,11 +137,15 @@ async fn main() -> Result<()> {
     // log rather than by reading the config and then the wiring. `routing` is the only
     // setting that lets an automatic pass escalate, so it is the one worth naming.
     info!(
-        "models: everything on {} ({}); {} reachable only when you ask for it \
-         (chat picker, 2nd opinion){}",
+        "models: local passes on {} ({}); assigned-issue triage and PR review on {} ({}); \
+         root-cause deep analysis on {} ({}), which also serves the chat picker and 2nd \
+         opinion{}",
         cfg.reasoner.local_model,
         cfg.reasoner.local,
+        cfg.reasoner.code_model,
+        cfg.reasoner.code,
         cfg.reasoner.cloud_model,
+        cfg.reasoner.cloud,
         if cfg.reasoner.routing.enabled {
             " — WARNING: [reasoner.routing] is on, so hard tasks escalate on their own"
         } else {
@@ -201,23 +206,48 @@ async fn main() -> Result<()> {
         &cfg.restate,
         Arc::new(restate::ingress::Ingress::new(&cfg.restate)),
     ));
-    let analyst = Arc::new(Analyst::new(
-        store.clone(),
-        attributor.clone(),
-        reasoners.routed.clone(),
-        reasoners.local.clone(),
-        memory.clone(),
-        context.clone(),
-        cfg.correlation.dedup_threshold,
-        cfg.correlation.auto_merge,
-        cfg.correlation.reopen_min_confidence,
-        window,
-    ));
+    // Read before the analyst is built: a summary that can reach GitHub reads the
+    // issue/PR discussion, which is usually where the subject's real content is.
+    let github_token = secrets.get_opt("github");
+    let analyst = {
+        let analyst = Analyst::new(
+            store.clone(),
+            attributor.clone(),
+            reasoners.routed.clone(),
+            reasoners.local.clone(),
+            memory.clone(),
+            context.clone(),
+            cfg.correlation.dedup_threshold,
+            cfg.correlation.auto_merge,
+            cfg.correlation.reopen_min_confidence,
+            window,
+        );
+        // Comment scoring is a high-volume mechanical judgment, so it stays on the local
+        // model by the same policy as tag classification.
+        match github_token
+            .as_ref()
+            .and_then(|t| github::GithubClient::new(t.clone()).ok())
+        {
+            // Background priority: reading a discussion is two API calls per subject on
+            // every summary pass, and a summary that arrives a minute late costs far
+            // less than a watcher that runs out of budget and stops noticing incidents.
+            Some(gh) => Arc::new(analyst.with_conversations(correlation::llm::Conversations::new(
+                Arc::new(gh.background()),
+                Arc::new(comments::CommentJudge::new(reasoners.local.clone())),
+            ))),
+            None => {
+                warn!(
+                    "no GitHub token: subject summaries will be written from signals alone, \
+                     without the issue/PR discussion"
+                );
+                Arc::new(analyst)
+            }
+        }
+    };
 
     // Root-cause investigation: the README-derived repo index, and the issue/PR/
     // commit search over it. Crawling and shortlisting run on the local classifier;
     // only the final verdict reaches the cloud tier.
-    let github_token = secrets.get_opt("github");
     // One checkout cache, shared: the repo index reads code to characterize it and
     // triage reads code to analyze an issue, and they want the same working copies.
     let checkout_root = {
@@ -247,22 +277,43 @@ async fn main() -> Result<()> {
         attributor.clone(),
         repo_index.clone(),
         github_token.clone(),
+        // Stage one, on-device: extract the symptoms and shortlist the wide search down to
+        // what is worth reasoning over. Cheap, mechanical, high-volume — and it is what
+        // builds the candidate graph the deep pass then judges.
         reasoners.local.clone(),
-        // The ranking pass reads a shortlist, not a repository — pinned local.
-        reasoners.local.clone(),
+        // Stage two, the deep pass, on the cloud tier — `claude-opus-5`.
+        //
+        // **This is an automatic pass reaching a cloud model, and it is the first one.** The
+        // local-by-default policy elsewhere in this codebase said the operator had to name a
+        // cloud model before one was called; that is no longer true of root-cause ranking,
+        // and every doc asserting otherwise has been corrected rather than left to rot.
+        //
+        // What it costs and does not cost: `cloud` resolves to the subscription CLI bridge,
+        // so this is **unmetered** — no key, no per-token charge. What it does mean is that
+        // the shortlist (subject text, candidate repos, component cards, commit summaries)
+        // leaves the machine on every investigation. Point `[reasoner] cloud` at
+        // `ollama_local` to put it back.
+        //
+        // The side benefit is real: the ranking pass was the longest single hold on the one
+        // Ollama permit, and moving it off leaves the GPU to stage one.
+        reasoners.cloud.clone(),
         cfg.investigation.clone(),
     ));
     let browser_driver = Arc::new(browser::BrowserDriver::new(cfg.browser.clone()));
 
-    // Assigned-issue triage: check the repo out, read the code with the local
-    // coder model, propose patches, look for a PR that already fixes it, then
-    // render the lot in plain English.
+    // Assigned-issue triage: check the repo out, read the code, propose patches, look for a
+    // PR that already fixes it, then render the lot in plain English.
+    //
+    // On the `triage` tier — Claude Sonnet over the subscription CLI by default — not the
+    // local model. Both handles, so the whole pass is off the local permit: leaving the
+    // final plain-English rewrite behind would have put the issue back at the end of the
+    // indexing queue for its last step, which is the problem this move exists to fix.
     let triager = Arc::new(triage::Triager::new(
         store.clone(),
         checkouts.clone(),
         github_token.clone(),
-        reasoners.local.clone(),
-        reasoners.local.clone(),
+        reasoners.code.clone(),
+        reasoners.code.clone(),
         analyst.clone(),
         cfg.assigned.clone(),
     ));
@@ -336,7 +387,11 @@ async fn main() -> Result<()> {
     // workflow (the background warm). Local reasoner by policy: reading a diff is exactly
     // the work that shouldn't leave the machine.
     let diff_reader = Arc::new(
-        prdiff::DiffReader::new(secrets.get_opt("github"), reasoners.local.clone())
+        prdiff::DiffReader::new(
+            secrets.get_opt("github"),
+            reasoners.code.clone(),
+            &cfg.reasoner.code_model,
+        )
             .context("building the diff reader")?,
     );
     let tools = Arc::new(Tools {
@@ -445,6 +500,12 @@ async fn main() -> Result<()> {
         events: events.clone(),
         watchers: watchers.clone(),
         ingress: ingress.clone(),
+        repos: repo_index.clone(),
+        // Its own client: the sweep's pull-request check needs one, and every other
+        // GitHub-reading component here builds its own from the stored token the same way.
+        github: github_token
+            .clone()
+            .and_then(|t| github::GithubClient::new(t).ok()),
         org: cfg.investigation.org.clone(),
         contexts_dir: data_dir.join("contexts"),
     });
@@ -477,6 +538,21 @@ async fn main() -> Result<()> {
         browser: browser_driver.clone(),
         context: context.clone(),
         diffs: diff_reader.clone(),
+        // Operator-named models only — the re-dispatch button. The Ollama key is read
+        // inside the closure rather than captured, so rotating it through the config page
+        // takes effect on the next call.
+        reasoner_factory: {
+            let cfg = cfg.clone();
+            let secrets = secrets.clone();
+            Arc::new(move |provider: &str, model: &str| {
+                reasoner::build(
+                    reasoner::provider_label(provider),
+                    model,
+                    &cfg.reasoner,
+                    secrets.get_opt("ollama"),
+                )
+            })
+        },
     });
     {
         // Claim the endpoint port before anything else, and make a collision fatal.
@@ -541,6 +617,9 @@ async fn main() -> Result<()> {
             tasks.push(restate::objects::scheduler::REPO_INDEX.into());
             if code_indexer.enabled() {
                 tasks.push(restate::objects::scheduler::CODE_INDEX.into());
+                // Only alongside the indexer: a sweep that finds pushes with nothing able to
+                // fetch them would spend API calls to log a list.
+                tasks.push(restate::objects::scheduler::COMMIT_POLL.into());
             } else {
                 warn!(
                     "code indexing needs a stored GitHub token and `git` on PATH — issue \
@@ -645,6 +724,21 @@ fn build_watchers(cfg: &Config, secrets: &secrets::Secrets) -> Vec<Arc<dyn Watch
             },
             Ok(None) => warn!("slack enabled but no token stored (account 'slack'); skipping"),
             Err(e) => error!("slack credential read failed: {e:#}"),
+        }
+    }
+
+    if cfg.sources.incident.enabled {
+        match secrets.get("incident") {
+            Ok(Some(key)) => match watchers::incident::IncidentWatcher::new(&cfg.sources.incident, key)
+            {
+                Ok(w) => watchers.push(Arc::new(w)),
+                Err(e) => error!("incident.io watcher init failed: {e:#}"),
+            },
+            Ok(None) => warn!(
+                "incident.io enabled but no API key stored (account 'incident'); \
+                 the incidents board will stay empty until one is added"
+            ),
+            Err(e) => error!("incident.io credential read failed: {e:#}"),
         }
     }
 

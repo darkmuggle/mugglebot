@@ -172,6 +172,8 @@ impl Tools {
             "repo_index_detail" => self.repo_index_detail(args).await,
             "chat_context" => self.chat_context(args),
             "pr_diff" => self.pr_diff(args).await,
+            "pr_review" => self.pr_review(args).await,
+            "list_incidents" => self.list_incidents(args),
             "start_agent_session" => {
                 let repo = req_str(args, "repo")?;
                 let tool = opt_str(args, "tool").unwrap_or_else(|| "claude".into());
@@ -305,7 +307,29 @@ impl Tools {
             .get("active_only")
             .and_then(|v| v.as_bool())
             .unwrap_or(true);
+        // Deliberately *all* subjects, incidents included. A caller asking for subjects means
+        // all of them; the two boards do their own filtering (`board_views` /
+        // `incident_views`), and hiding a kind from the general lister would make an incident
+        // unreachable from MCP.
         Ok(json!(self.attributor.subject_views(active_only)?))
+    }
+
+    /// The incidents board: open incidents, with whatever each has been mapped to.
+    ///
+    /// Its own tool rather than a filter argument on `list_subjects`, because "what is on
+    /// fire" is a different question from "what does my work need" and the answer is read by
+    /// a different screen. `active_only` here means what incident.io says, not what the
+    /// operator has read.
+    fn list_incidents(&self, args: &Value) -> Result<Value> {
+        let active_only = args
+            .get("active_only")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+        let views = self.attributor.incident_views(active_only)?;
+        Ok(json!({
+            "open": views.iter().filter(|v| !v.subject.handled.is_handled()).count(),
+            "incidents": views,
+        }))
     }
 
     fn get_subject(&self, args: &Value) -> Result<Value> {
@@ -918,6 +942,79 @@ impl Tools {
             }));
         }
         Ok(json!({ "subject_key": key, "diffs": diffs, "target_count": target_count }))
+    }
+
+    /// Re-review a pull request on a model the operator named.
+    ///
+    /// Separate from `pr_diff`'s automatic review because the two answer different questions.
+    /// `pr_diff` asks "what is this change, and what does the default reviewer make of it?"
+    /// and must stay cheap enough to run on a render. This asks "what would *that* model say
+    /// about it?", which is only ever worth paying for when somebody asks — so it is a button,
+    /// not a fallback, and nothing automatic reaches it.
+    ///
+    /// The work goes through the `PrDiff` workflow rather than running here. It is several
+    /// model passes over the patches — five minutes on an eighteen-file change, measured — and
+    /// a request that holds the page for five minutes is a hung button. The dispatch strip
+    /// shows it in flight and the pane picks up the verdict from object state.
+    async fn pr_review(&self, args: &Value) -> Result<Value> {
+        let key = req_str(args, "subject_key")?;
+        let provider = req_str(args, "provider")?;
+        let model = req_str(args, "model")?;
+        if model.trim().is_empty() {
+            bail!("a model is required: pick one from `list_models`");
+        }
+        let Some((repo, number)) = crate::prdiff::parse_pr_key(&key) else {
+            bail!("{key} does not name a pull request");
+        };
+        let pr_key = crate::prdiff::pr_key(&repo, number);
+
+        // The watermark the review will be filed under — the same one the diff uses, so a
+        // re-review lands beside the diff it is about rather than inventing a version.
+        let watermark = self
+            .store
+            .signals_for_subject(&pr_key)
+            .ok()
+            .and_then(|s| s.last().map(|s| s.id.clone()))
+            .unwrap_or_else(|| "inline".into());
+
+        // Where it queues is decided by *which* model was picked, not by the fact that a
+        // human picked it: an on-device re-review contends for the one GPU exactly like every
+        // other local pass, and a cloud one must not be held behind it.
+        let label = crate::reasoner::provider_label(&provider);
+        let scope = if label == "ollama_local" {
+            crate::restate::scopes::LOCAL_LLM
+        } else {
+            crate::restate::scopes::CLOUD_LLM
+        };
+        // Re-running the *same* model on an unchanged pull request is a spent key, and free —
+        // which is right for a double click and wrong for an operator who read a bad review
+        // and wants another sample. `force` is the same escape hatch `pr_diff`'s re-read uses,
+        // and for the same reason: per-second, so a double click is still free while a
+        // deliberate redo is not.
+        let force = args
+            .get("force")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let mut version = crate::prdiff::with_model(&watermark, label, &model);
+        if force {
+            version.push_str(&format!("#r{}", chrono::Utc::now().timestamp()));
+        }
+        let wf_key = format!("{pr_key}@{version}");
+        let dispatched = self
+            .ingress
+            .submit_workflow("PrDiff", &wf_key, Some(scope))
+            .await
+            .unwrap_or(false);
+        Ok(json!({
+            "subject_key": pr_key,
+            "provider": label,
+            "model": model,
+            // False means Restate refused the key: this PR has already been reviewed on this
+            // model at this watermark, and the stored review *is* the answer. Said out loud so
+            // the pane can report "already done" rather than showing a button that did nothing.
+            "dispatched": dispatched,
+            "scope": scope,
+        }))
     }
 
     /// Ask for a review of a pull request whose diff is already known.
@@ -1741,6 +1838,12 @@ pub fn definitions() -> Vec<ToolDef> {
         ToolDef { name: "pr_diff", read_only: true,
             description: "A pull request's diff, the summary of what it changes, and the code review of it — recommendation (approve / comment / request_changes), the general rationale, and inline comments resolved to lines of the patch. Pass a PR subject key for that PR, or an issue key for every PR attempting it. Read from the pull request's own object state, so it costs a state read rather than an API call and a model pass; a PR with nothing stored yet is fetched inline once and then kept. `stored_only` answers from state alone and omits what isn't there — for a pane opening itself. `refresh` forces a re-read, for a PR that moved without notifying anybody.",
             schema: obj(json!({ "subject_key": s(), "stored_only": {"type":"boolean"}, "refresh": {"type":"boolean"} }), &["subject_key"]) },
+        ToolDef { name: "pr_review", read_only: false,
+            description: "Re-review a pull request's diff on a model YOU name — a second reader on the same change, when the default reviewer's verdict looks wrong or you want a stronger model on it. `provider` is `anthropic` | `openai` | `ollama_local` | `ollama` and `model` is one of that provider's models (see `list_models`). Runs as a workflow because it is several model passes over the patches; it returns as soon as the work is accepted, and the review appears on the pull request when it lands. Re-requesting the SAME model on an unchanged pull request is free — the key is already spent and the stored review is the answer, reported as `dispatched: false`; pass `force: true` to run it again anyway, for a review that came back badly. Replaces the stored review rather than sitting beside it, so the pane always shows one verdict and says which model produced it.",
+            schema: obj(json!({ "subject_key": s(), "provider": s(), "model": s(), "force": {"type":"boolean"} }), &["subject_key", "provider", "model"]) },
+        ToolDef { name: "list_incidents", read_only: true,
+            description: "Open incident.io incidents, each with what it has been mapped to: the ranked code candidates (repo / component / commit, with evidence), and any issues or pull requests it has been linked to. Tracks what incident.io says is open — `triage`, `active` and `post-incident` — so an incident leaves this list when it is closed upstream rather than when you acknowledge it. Pass `active_only: false` to include closed ones.",
+            schema: obj(json!({ "active_only": {"type":"boolean"} }), &[]) },
         ToolDef { name: "chat_context", read_only: true,
             description: "Assemble everything the code index knows about a repo — its card, component cards, dependency edges and recent commit summaries — or about one commit in it (pass `sha`), as a context block ready to hand to a chat. Built deterministically from the store: a model asked to go and find this would invent some of it.",
             schema: obj(json!({ "repo": s(), "sha": s() }), &["repo"]) },
@@ -1988,7 +2091,7 @@ mod tests {
             investigator,
             repos,
             browser,
-            diffs: Arc::new(crate::prdiff::DiffReader::new(None, reasoner.clone()).unwrap()),
+            diffs: Arc::new(crate::prdiff::DiffReader::new(None, reasoner.clone(), "local").unwrap()),
         }
     }
 

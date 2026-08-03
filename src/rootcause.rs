@@ -88,7 +88,12 @@ impl Investigator {
     ) -> Self {
         let github = token.and_then(|t| GithubClient::new(t).ok());
         Self {
-            pr_fixes: crate::prfix::PrFixFinder::new(store.clone(), local.clone(), ranker.clone()),
+            pr_fixes: crate::prfix::PrFixFinder::new(
+                store.clone(),
+                local.clone(),
+                ranker.clone(),
+                "local",
+            ),
             store,
             attributor,
             repos,
@@ -1064,6 +1069,8 @@ mod tests {
                 merge_key: None,
             },
             headline: None,
+            review_state: None,
+            gates_passed: false,
             signals: vec![],
             keys,
             severity: Severity::Warning,
