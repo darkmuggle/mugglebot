@@ -47,6 +47,9 @@ pub const KNOWN_SECRETS: &[&str] = &[
     // absent from it cannot be entered through the UI at all, however ready the rest of the
     // integration is.
     "incident",
+    // Grafana. A **Viewer** service-account token: this tier only ever reads, and a
+    // Viewer token cannot silence an alert or save a dashboard even if something tried.
+    "grafana",
     "ollama",
     "anthropic",
     "openai",

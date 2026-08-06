@@ -810,11 +810,7 @@ impl Analyst {
     /// Returns an empty string when there is nothing to say about the conversation, and
     /// an explicit "not read" line when there *is* a conversation we could not reach —
     /// silence and "we looked and found nothing" must not be the same output.
-    async fn conversation_evidence(
-        &self,
-        view: &SubjectView,
-        fresh: bool,
-    ) -> ConversationEvidence {
+    async fn conversation_evidence(&self, view: &SubjectView, fresh: bool) -> ConversationEvidence {
         let Some(c) = &self.conversations else {
             return ConversationEvidence::default();
         };
@@ -958,8 +954,7 @@ impl Analyst {
         let conversation = self.conversation_evidence(view, fresh).await;
         let conversation_block = &conversation.block;
         let system = SUMMARY_SYSTEM;
-        let prompt =
-            format!("Signals:\n{ev}{conversation_block}{notes_block}{grounding_block}");
+        let prompt = format!("Signals:\n{ev}{conversation_block}{notes_block}{grounding_block}");
         // Session chat per topic: continue this thread's ongoing conversation.
         // Raised from 512 when the Conversation section arrived: a thread with four
         // participants needs four calls plus the other three sections, and a summary

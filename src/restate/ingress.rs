@@ -28,6 +28,10 @@ pub struct Ingress {
     base: String,
     /// The admin API, for invocation introspection.
     admin: String,
+    /// When false, every call here is a no-op that reports "nothing submitted".
+    ///
+    /// See [`Ingress::offline`].
+    online: bool,
 }
 
 impl Ingress {
@@ -36,6 +40,31 @@ impl Ingress {
             client: reqwest::Client::new(),
             base: cfg.ingress.trim_end_matches('/').to_string(),
             admin: cfg.admin.trim_end_matches('/').to_string(),
+            online: true,
+        }
+    }
+
+    /// An ingress that submits nothing, for tests.
+    ///
+    /// The test fixtures build a `Tools` with a real `Ingress` on `RestateConfig::default()`,
+    /// which is `http://127.0.0.1:8080` — the operator's *actual running Restate server* during
+    /// development. So `cargo test` was reaching out and invoking live handlers: the persona
+    /// tests create and delete `pav`, `else` and `pavel-cholakov`, and each one armed a durable
+    /// timer and fired a harvest on the developer's own daemon, which then logged
+    /// `harvest failed: no persona 'else'` against a database the test never touched.
+    ///
+    /// Latent while the only call was `start` (arming a timer that retires itself on the next
+    /// tick), and not latent at all once creation began poking a real harvest — which can spend
+    /// GitHub budget and write evidence.
+    ///
+    /// A flag rather than an unroutable URL: pointing tests at a dead port works but pays a
+    /// connection timeout per call, and says nothing about intent when a test hangs.
+    pub fn offline() -> Self {
+        Self {
+            client: reqwest::Client::new(),
+            base: String::new(),
+            admin: String::new(),
+            online: false,
         }
     }
 
@@ -53,6 +82,11 @@ impl Ingress {
         idempotency_key: Option<&str>,
         payload: &impl Serialize,
     ) -> Result<String> {
+        // Offline in tests: submit nothing rather than invoking the developer's
+        // own running Restate server. See `Ingress::offline`.
+        if !self.online {
+            return Ok(String::new());
+        }
         let url = format!("{}/{object}/{}/{handler}/send", self.base, urlencoding(key));
         let mut req = self.client.post(&url).json(payload);
         if let Some(k) = idempotency_key {
@@ -69,6 +103,37 @@ impl Ingress {
         }
         debug!("ingress: sent {object}/{key}/{handler}");
         Ok(body)
+    }
+
+    /// Fire-and-forget a handler that takes **no input**.
+    ///
+    /// Not [`Self::send_object`] with `null`: sending `null` with a JSON content-type is not
+    /// the same as sending nothing, and the ingress answers
+    /// `input validation error: Expected body and content-type to be empty`. That arrives as a
+    /// failed send and reads as "the handler is broken" — which is the trap
+    /// [`Self::call_object`] and [`Self::submit_workflow`] both carry the same warning about.
+    ///
+    /// Used for the arm/poke handlers on the recurring objects, whose only input is their key.
+    pub async fn send_object_empty(&self, object: &str, key: &str, handler: &str) -> Result<()> {
+        // Offline in tests: submit nothing rather than invoking the developer's
+        // own running Restate server. See `Ingress::offline`.
+        if !self.online {
+            return Ok(());
+        }
+        let url = format!("{}/{object}/{}/{handler}/send", self.base, urlencoding(key));
+        let resp = self
+            .client
+            .post(&url)
+            .send()
+            .await
+            .with_context(|| format!("sending {object}/{key}/{handler}"))?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            bail!("ingress {object}/{key}/{handler} returned {status}: {body}");
+        }
+        debug!("ingress: sent {object}/{key}/{handler}");
+        Ok(())
     }
 
     /// Call a handler and wait for its result.
@@ -88,6 +153,11 @@ impl Ingress {
     /// as a failed call and reads as "there is nothing stored". [`Self::submit_workflow`]
     /// carries the same warning for the same reason.
     pub async fn call_object(&self, object: &str, key: &str, handler: &str) -> Result<String> {
+        // Offline in tests: submit nothing rather than invoking the developer's
+        // own running Restate server. See `Ingress::offline`.
+        if !self.online {
+            return Ok(String::new());
+        }
         let url = format!("{}/{object}/{}/{handler}", self.base, urlencoding(key));
         let resp = self
             .client
@@ -119,6 +189,11 @@ impl Ingress {
         key: &str,
         scope: Option<&str>,
     ) -> Result<bool> {
+        // Offline in tests: submit nothing rather than invoking the developer's
+        // own running Restate server. See `Ingress::offline`.
+        if !self.online {
+            return Ok(false);
+        }
         // A scope is carried by the *path*, not a header: matching invocations are
         // held in that scope's virtual queue until a slot frees. Without one the
         // invocation is unscoped and no concurrency limit applies to it, which is the
@@ -174,6 +249,11 @@ impl Ingress {
     /// the operator needs to know at boot, and a send would report success for a
     /// watcher that immediately failed to resolve.
     pub async fn start_watcher(&self, name: &str) -> Result<bool> {
+        // Offline in tests: submit nothing rather than invoking the developer's
+        // own running Restate server. See `Ingress::offline`.
+        if !self.online {
+            return Ok(false);
+        }
         let url = format!("{}/Watcher/{}/start", self.base, urlencoding(name));
         let resp = self
             .client
@@ -201,6 +281,11 @@ impl Ingress {
         approve: bool,
         reason: Option<&str>,
     ) -> Result<()> {
+        // Offline in tests: submit nothing rather than invoking the developer's
+        // own running Restate server. See `Ingress::offline`.
+        if !self.online {
+            return Ok(());
+        }
         let url = format!(
             "{}/restate/invocation/{}/promise/{}/resolve",
             self.base,
@@ -243,6 +328,11 @@ impl Ingress {
     /// the timer alone, which is also the right meaning: a push is a reason to index now, not a
     /// reason to index more often from now on.
     pub async fn poke_repo_indexer(&self, repo: &str) -> Result<()> {
+        // Offline in tests: submit nothing rather than invoking the developer's
+        // own running Restate server. See `Ingress::offline`.
+        if !self.online {
+            return Ok(());
+        }
         let url = format!("{}/RepoIndexer/{}/poke/send", self.base, urlencoding(repo));
         let resp = self
             .client
@@ -259,6 +349,11 @@ impl Ingress {
     }
 
     pub async fn start_repo_indexer(&self, repo: &str) -> Result<bool> {
+        // Offline in tests: submit nothing rather than invoking the developer's
+        // own running Restate server. See `Ingress::offline`.
+        if !self.online {
+            return Ok(false);
+        }
         let url = format!("{}/RepoIndexer/{}/start", self.base, urlencoding(repo));
         let resp = self
             .client
@@ -280,6 +375,11 @@ impl Ingress {
     /// server is the authority on what is running, and a mirror would be a second
     /// thing to get out of date.
     pub async fn invocations(&self, subject: Option<&str>) -> Result<serde_json::Value> {
+        // Offline in tests: submit nothing rather than invoking the developer's
+        // own running Restate server. See `Ingress::offline`.
+        if !self.online {
+            return Ok(serde_json::json!([]));
+        }
         let filter = match subject {
             // The subject key is part of the target string (`Issue/o/r#412/record`),
             // so a LIKE over the target is the whole filter. Escaped, because a key
@@ -316,6 +416,11 @@ impl Ingress {
 
     /// Arm a recurring scheduler task. Same idempotence as [`Self::start_watcher`].
     pub async fn start_scheduler(&self, task: &str) -> Result<bool> {
+        // Offline in tests: submit nothing rather than invoking the developer's
+        // own running Restate server. See `Ingress::offline`.
+        if !self.online {
+            return Ok(false);
+        }
         let url = format!("{}/Scheduler/{}/start", self.base, urlencoding(task));
         let resp = self
             .client

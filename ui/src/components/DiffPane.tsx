@@ -61,6 +61,22 @@ export default function DiffPane(props: {
   /// Collapsing keeps the fetched report: re-expanding is instant and costs neither an API call
   /// nor another model pass, which is the whole reason this is a toggle and not a reload.
   const [shut, setShut] = createSignal<Record<string, boolean>>({});
+  /// Whether the raw patches are shown, by `repo#number`. **Folded by default, always.**
+  ///
+  /// `expand` used to unfold these too, on the reasoning that the patches are the substance of
+  /// the click-in view and a disclosure triangle over them hides the answer. That was right when
+  /// there was no review — the patch *was* the only answer available. There is a review now, so
+  /// the answer is the verdict and its findings, and the patch is the evidence behind it.
+  /// Unfolding evidence by default is what made one pull request's detail view 12,126px tall,
+  /// **6,319px of it unified diff** — 52% of the page — with the verdict, the proposed approaches
+  /// and the Actions row all buried beneath it.
+  ///
+  /// So: unfold the judgement, fold the evidence. `expand` still governs whether individual
+  /// files start open *once the patches are shown*.
+  const [patches, setPatches] = createSignal<Record<string, boolean>>({});
+  const patchesOn = (id: string) => patches()[id] ?? false;
+  const togglePatches = (id: string) =>
+    setPatches((prev) => ({ ...prev, [id]: !patchesOn(id) }));
 
   /// Provider/model for a re-review, and the dispatch result.
   ///
@@ -342,7 +358,42 @@ export default function DiffPane(props: {
                   </details>
                 </Show>
 
-                <For each={isShut() ? [] : d.files}>
+                {/* Every finding, listed. Until now a review's notes were rendered only against
+                    the line they were anchored to — inside the patches — so folding the patches
+                    hid the findings, and *not* folding them buried the verdict under 6,000px of
+                    diff. The findings are the review's actual content, so they belong beside the
+                    verdict where the reader already is. */}
+                <Show when={!isShut() && d.review?.comments.length}>
+                  <ul class="review-findings">
+                    <For each={d.review!.comments}>
+                      {(c: ReviewComment) => (
+                        <li class={`finding sev-${c.severity}`}>
+                          <span class="finding-sev">{c.severity}</span>
+                          <Show when={c.path}>
+                            <code class="finding-path">{c.path}</code>
+                          </Show>
+                          <span class="finding-note">{c.note}</span>
+                        </li>
+                      )}
+                    </For>
+                  </ul>
+                </Show>
+
+                {/* The evidence, behind one control that says how much of it there is. */}
+                <Show when={!isShut() && !d.error && d.files.length}>
+                  <button
+                    class="patch-toggle"
+                    data-tip="The patches behind the review — folded by default so the verdict is not buried under them"
+                    onClick={() => togglePatches(id)}
+                  >
+                    {patchesOn(id) ? "▾ hide" : "▸ show"} the {d.file_count} patch
+                    {d.file_count === 1 ? "" : "es"}
+                    <span class="diff-add">+{d.additions}</span>
+                    <span class="diff-del">−{d.deletions}</span>
+                  </button>
+                </Show>
+
+                <For each={isShut() || !patchesOn(id) ? [] : d.files}>
                   {(f) => {
                     const key = `${d.repo}#${d.number}:${f.path}`;
                     const notes = () =>

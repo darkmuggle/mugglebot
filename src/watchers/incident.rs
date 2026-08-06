@@ -33,8 +33,7 @@ impl IncidentWatcher {
     pub fn new(cfg: &IncidentSource, api_key: String) -> Result<Self> {
         Ok(Self {
             client: IncidentClient::new(api_key)?,
-            interval: config::parse_duration(&cfg.poll_interval)
-                .unwrap_or(Duration::from_secs(60)),
+            interval: config::parse_duration(&cfg.poll_interval).unwrap_or(Duration::from_secs(60)),
         })
     }
 }
@@ -240,9 +239,18 @@ mod tests {
     /// rule.
     #[test]
     fn a_closed_incident_reports_itself_closed() {
-        assert_eq!(normalize(&incident("INC-445", "closed", None)).raw["state"], "closed");
-        assert_eq!(normalize(&incident("INC-445", "merged", None)).raw["state"], "closed");
-        assert_eq!(normalize(&incident("INC-445", "triage", None)).raw["state"], "open");
+        assert_eq!(
+            normalize(&incident("INC-445", "closed", None)).raw["state"],
+            "closed"
+        );
+        assert_eq!(
+            normalize(&incident("INC-445", "merged", None)).raw["state"],
+            "closed"
+        );
+        assert_eq!(
+            normalize(&incident("INC-445", "triage", None)).raw["state"],
+            "open"
+        );
     }
 
     /// End to end through a real store: an incident lands on the incidents board and on

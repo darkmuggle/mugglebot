@@ -154,6 +154,91 @@ body {
   flex: 1;
 }
 
+/* ---- foot: the three-zone clock ----
+   Mirrors the top band — a panel cap where the elbow is, then content — so the
+   frame closes rather than just stopping. 26px, right-aligned, and it takes its
+   height out of the body's flex slot, so no view can be scrolled underneath it.
+
+   The digits are tabular and monospaced. A proportional `1` is narrower than a
+   `0`, so on a running clock the whole field twitches sideways every second,
+   which is exactly the sort of motion the eye cannot ignore. */
+.lcars-foot {
+  flex: 0 0 auto;
+  height: 26px;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 22px;
+  padding-left: 4px;
+  border-top: 1px solid var(--line);
+}
+
+.foot-cap {
+  width: 68px;
+  align-self: stretch;
+  flex: 0 0 auto;
+  margin-right: auto;
+  background: var(--slate);
+  border-radius: 4px 4px 4px 14px;
+}
+
+.zone {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+
+/* UTC, set apart by a rule. It is the reference the other three offsets are written
+   against rather than a fourth city, and the cities are in west-to-east order — so it
+   heads the row instead of joining it. */
+.zone.anchor {
+  padding-right: 22px;
+  border-right: 1px solid var(--line);
+}
+
+/* Three zones, set three ways — dimmed outside working hours, one label in the
+   identity hue for your own — read as three different *kinds* of thing when they
+   are one row of clocks. So the styling says "place, then time" once and the row
+   is scanned rather than decoded; which zone is yours and whether it is anyone's
+   working day are both still there, on hover.
+
+   Place in the identity hue, time in white: the hue names the column and the
+   weight carries the value, so nothing has to be read twice. */
+.zone-label {
+  color: var(--lilac);
+  font-size: var(--t-micro);
+  text-transform: uppercase;
+  letter-spacing: 0.14em;
+}
+
+.zone-time {
+  color: var(--text);
+  font-size: var(--t-meta);
+  font-weight: 700;
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.04em;
+}
+
+/* The live UTC offset. Subordinate to the time — it is what the time is measured
+   against, not a second reading — so it sits at micro weight in the faint tier
+   while the digits keep the emphasis. */
+.zone-utc {
+  color: var(--faint);
+  font-size: var(--t-micro);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.04em;
+}
+
+/* Shown only when the date there isn't the date here — the answer to "is it
+   already tomorrow in Berlin", which is what makes a same-looking hour mean two
+   different things. */
+.zone-day {
+  color: var(--faint);
+  font-size: var(--t-micro);
+  font-variant-numeric: tabular-nums;
+}
+
 /* ---- body ---- */
 .lcars-body {
   flex: 1;
@@ -688,7 +773,6 @@ body {
   color: var(--dim);
 }
 
-
 /* ---- panels / detail ---- */
 .panel {
   background: var(--surface);
@@ -967,6 +1051,102 @@ body {
   color: var(--blue);
   font-size: var(--t-meta);
 }
+/* Which tier answered. A hairline chip rather than a coloured badge: it qualifies the
+   reading below it, and it is read once when you first look at a panel — a saturated
+   colour would compete with the reading itself every time after that.
+
+   `verified` earns the identity hue because it means something specific and checkable:
+   the figures in that reading were compared against the series and marked where they
+   could not be found. A `page` reading makes no such claim. */
+.read-via {
+  padding: 1px 7px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--pill);
+  color: var(--faint);
+  font-size: var(--t-micro);
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+}
+.read-via.verified {
+  border-color: var(--lilac);
+  color: var(--lilac);
+}
+
+/* The series behind a Grafana reading — numbers, not a chart.
+   A chart is the thing the browser tier already gives you: a picture to interpret. The
+   value of this tier is that the conclusion's figures were checked against these, so
+   these are shown as figures. Folded by the same rule as the diff: unfold the judgement,
+   fold the evidence. */
+details.grafana-evidence {
+  margin-top: 10px;
+  border-top: 1px solid var(--line);
+  padding-top: 8px;
+}
+details.grafana-evidence > summary {
+  cursor: pointer;
+  color: var(--dim);
+  font-size: var(--t-meta);
+  list-style: none;
+}
+details.grafana-evidence > summary::-webkit-details-marker {
+  display: none;
+}
+details.grafana-evidence > summary::before {
+  content: "▸ ";
+  color: var(--faint);
+}
+details.grafana-evidence[open] > summary::before {
+  content: "▾ ";
+}
+.series {
+  margin-top: 8px;
+  padding-left: 10px;
+  border-left: 2px solid var(--line);
+}
+/* The series that reached the threshold is the one the alert is about. Amber, which in
+   this codebase means warning and only warning — and this is the one place in the panel
+   where something genuinely crossed a line. */
+.series.breached {
+  border-left-color: var(--amber);
+}
+.series-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.series-ref {
+  color: var(--faint);
+  font-size: var(--t-micro);
+  font-weight: 700;
+}
+.series-labels {
+  color: var(--text);
+  font:
+    12px/1.4 ui-monospace,
+    "SF Mono",
+    Menlo,
+    monospace;
+  overflow-wrap: anywhere;
+}
+.series-breach {
+  color: var(--amber);
+  font-size: var(--t-micro);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+/* Tabular figures so min/max/mean line up down a column of series — comparing them is
+   the whole reason several are listed. */
+.series-stats {
+  display: flex;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-top: 2px;
+  color: var(--dim);
+  font-size: var(--t-micro);
+  font-variant-numeric: tabular-nums;
+}
+
 .browser-prompt {
   margin: 8px 0;
   padding: 10px;
@@ -3492,4 +3672,1125 @@ select[data-tip],
 }
 .attempts-panel .rec {
   font-size: var(--t-micro);
+}
+
+/* ---- personas -------------------------------------------------------------
+   The "who is this work with" axis. Styled deliberately *quieter* than the board:
+   a persona never competes for attention, and a profile of a colleague rendered as
+   loudly as a critical alert would misstate what it is. Lilac throughout, which is
+   already the identity hue here (see `.src-slack`), and no severity colours — a
+   prediction is never an alarm. */
+
+.persona-row {
+  display: grid;
+  grid-template-columns: minmax(140px, 1.2fr) minmax(0, 1.6fr) auto auto;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--line);
+  cursor: pointer;
+}
+.persona-row:hover,
+.persona-row.open {
+  background: var(--surface);
+}
+.persona-name {
+  color: var(--lilac);
+  font-weight: 600;
+  font-size: var(--t-body);
+}
+.persona-ids,
+.persona-counts {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  font-size: var(--t-meta);
+  color: var(--dim);
+}
+/* An unconfirmed join. Outlined rather than filled: it contributes no evidence
+   until it is confirmed, and a guess that looks like a fact is the failure this
+   whole provenance distinction exists to prevent. */
+.src.proposed {
+  color: var(--dim);
+  background: transparent;
+  border: 1px dashed var(--line-strong);
+}
+
+/* Counted facts. One row, small, because the numbers are context for the traits
+   below rather than the point of the page. */
+.persona-stats {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 12px;
+  margin: 10px 0 14px;
+  font-size: var(--t-meta);
+  color: var(--dim);
+}
+
+/* How thin the profile is. Amber, because this is the one thing on the page that is
+   genuinely a warning: acting on a prediction built from four excerpts is the
+   mistake the feature can cause. */
+.persona-caveats {
+  margin: 10px 0;
+  padding: 8px 10px;
+  border-left: 2px solid var(--amber);
+  background: var(--surface-2);
+  font-size: var(--t-meta);
+  color: var(--dim);
+  max-width: var(--measure);
+}
+.persona-note {
+  max-width: var(--measure);
+  font-size: var(--t-body);
+}
+
+.facet {
+  margin: 14px 0;
+}
+.facet-name {
+  font-size: var(--t-micro);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--faint);
+  margin-bottom: 6px;
+}
+
+/* One trait, its citations one click away. Collapsed by default because the claim is
+   the readable unit and the excerpts are the proof — but never more than one
+   interaction away, since a claim you cannot check is one you should not act on. */
+.trait {
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--surface-2);
+  margin-bottom: 8px;
+}
+.trait > summary {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 9px 12px;
+  cursor: pointer;
+  list-style: none;
+}
+.trait > summary::-webkit-details-marker {
+  display: none;
+}
+.trait-claim {
+  font-size: var(--t-body);
+  max-width: var(--measure);
+}
+.trait-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: var(--t-micro);
+  color: var(--dim);
+  white-space: nowrap;
+}
+.trait-cites {
+  padding: 0 12px 10px;
+}
+.against-label {
+  margin: 10px 0 4px;
+  font-size: var(--t-micro);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--amber);
+}
+
+/* A verbatim excerpt. Monospace-ish measure and a quote rule, so it reads as
+   somebody else's words rather than as MuggleBot's prose. */
+.excerpt {
+  border-left: 2px solid var(--line-strong);
+  padding: 6px 0 6px 10px;
+  margin: 6px 0;
+}
+.excerpt.against {
+  border-left-color: var(--amber);
+}
+.excerpt-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  font-size: var(--t-micro);
+  color: var(--faint);
+}
+.excerpt-text {
+  margin-top: 4px;
+  font-size: var(--t-meta);
+  color: var(--dim);
+  white-space: pre-wrap;
+  max-width: var(--measure);
+}
+
+/* What verification refused. Collapsed, but present: on a first pass this is longer
+   than the profile, and hiding it would hide how much of the model's output is noise. */
+.persona-removed,
+.persona-evidence {
+  margin-top: 14px;
+  font-size: var(--t-meta);
+}
+.persona-removed > summary,
+.persona-evidence > summary {
+  cursor: pointer;
+  color: var(--faint);
+}
+.removed-item {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 8px;
+  padding: 4px 0;
+  color: var(--dim);
+}
+.removed-claim {
+  text-decoration: line-through;
+  text-decoration-color: var(--line-strong);
+}
+
+/* ---- predictions ---- */
+
+.persona-select {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 10px 0;
+}
+.persona-chip {
+  cursor: pointer;
+  color: var(--lilac);
+  border-color: var(--line-strong);
+}
+.persona-chip.on {
+  color: var(--ink);
+  background: var(--lilac);
+  border-color: var(--lilac);
+}
+
+.prediction {
+  border: 1px solid var(--line);
+  border-left: 2px solid var(--lilac);
+  border-radius: var(--radius);
+  background: var(--surface-2);
+  padding: 10px 12px;
+  margin: 10px 0;
+}
+/* "They would not engage" is a real answer and the panel's most useful one — dimmed
+   so it reads as a quiet outcome rather than as an empty card. */
+.prediction.quiet {
+  border-left-color: var(--slate);
+  opacity: 0.75;
+}
+.prediction.pending {
+  border-left-color: var(--blue);
+  color: var(--dim);
+}
+.prediction-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  font-size: var(--t-micro);
+  color: var(--dim);
+}
+.prediction-summary {
+  margin: 8px 0;
+  font-size: var(--t-body);
+  max-width: var(--measure);
+  white-space: pre-wrap;
+}
+.prediction-point {
+  border-top: 1px solid var(--line);
+  padding: 8px 0 4px;
+  font-size: var(--t-meta);
+  max-width: var(--measure);
+}
+.point-path {
+  display: block;
+  font-size: var(--t-micro);
+  color: var(--faint);
+  margin-bottom: 3px;
+}
+.point-line {
+  margin: 6px 0 0;
+  padding: 5px 8px;
+  background: var(--bg);
+  border-radius: 6px;
+  font-size: var(--t-micro);
+  color: var(--dim);
+  overflow-x: auto;
+}
+/* The citation. Every point names the trait it follows from — a point that cited
+   none was dropped server-side, which is what stops a prediction being the base
+   model's own review wearing somebody's name. */
+.point-because {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 6px;
+}
+/* Recommendations reuse the review vocabulary the diff pane already uses, so a
+   predicted verdict and a real one are read the same way — and are told apart by the
+   "predicted" chip beside them, never by colour. */
+.badge.rec-approve {
+  color: var(--ok);
+  border-color: var(--ok);
+}
+.badge.rec-comment {
+  color: var(--dim);
+}
+.badge.rec-request_changes {
+  color: var(--amber);
+  border-color: var(--amber);
+}
+
+.persona-add {
+  border-top: 1px solid var(--line);
+  margin-top: 10px;
+  padding-top: 10px;
+}
+.candidate {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 0;
+  border-bottom: 1px solid var(--line);
+  font-size: var(--t-meta);
+  color: var(--dim);
+}
+.candidate-sample {
+  color: var(--faint);
+  font-style: italic;
+  flex: 1 1 240px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* The chat's persona picker, and the label on a simulated reply. The label is not
+   optional: an unlabelled simulated colleague reads as a quotation. */
+.persona-picker.on {
+  color: var(--ink);
+  background: var(--lilac);
+}
+.bubble.persona {
+  border-left: 2px solid var(--lilac);
+}
+.bubble-persona {
+  font-size: var(--t-micro);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--lilac);
+  margin-bottom: 4px;
+}
+
+/* Both handles at once, laid out as labelled rows rather than a source dropdown: a
+   persona with one source is half a persona, and a dropdown makes that the default
+   by accident. */
+.identity-fields {
+  display: grid;
+  gap: 6px;
+}
+.identity-fields label {
+  display: grid;
+  grid-template-columns: 90px 1fr;
+  align-items: center;
+  gap: 8px;
+}
+.identity-manage {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  margin: 8px 0 14px;
+  font-size: var(--t-meta);
+}
+.identity-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 6px 3px 3px;
+  border: 1px solid var(--line);
+  border-radius: var(--pill);
+  background: var(--surface-2);
+}
+.identity-add {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.identity-add input {
+  width: 180px;
+}
+/* The opaque id beside the readable name — present so a link can be verified, quiet
+   so the name is what you read. */
+.mono {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: var(--t-micro);
+}
+
+/* Where somebody's activity concentrates — the "who do I ask" axis.
+
+   The one rule this styling has to enforce: established expertise and mere presence
+   must not look alike. An area the model found their comments specific in is marked;
+   an area they are merely active in is dimmed and says so. Flattening the two would
+   put somebody forward as an expert on the strength of having commented a lot, which
+   is frequently the signature of the person *learning* an area. */
+.sme-list {
+  display: grid;
+  gap: 6px;
+  margin: 8px 0 14px;
+}
+.sme-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1.1fr) auto minmax(0, 1.4fr);
+  align-items: baseline;
+  gap: 12px;
+  padding: 6px 10px;
+  border-left: 2px solid var(--slate);
+  background: var(--surface-2);
+  border-radius: 0 var(--radius) var(--radius) 0;
+  font-size: var(--t-meta);
+}
+.sme-row.expert {
+  border-left-color: var(--lilac);
+}
+.sme-area {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+.sme-counts {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  color: var(--dim);
+  white-space: nowrap;
+}
+.sme-depth {
+  color: var(--text);
+}
+/* Presence, not expertise. Dimmed and italic so it reads as an absence of a finding
+   rather than as a finding. */
+.sme-depth.none {
+  color: var(--faint);
+  font-style: italic;
+}
+.sme-chip {
+  color: var(--dim);
+  border-color: var(--line-strong);
+}
+.sme-chip.expert {
+  color: var(--lilac);
+  border-color: var(--lilac);
+}
+
+/* What the operator knows. The one block on the page that has NOT been through
+   verification — bordered in the identity hue rather than amber, because it is
+   authoritative rather than a warning. */
+.persona-context {
+  margin: 14px 0;
+  padding: 10px 12px;
+  border: 1px dashed var(--line-strong);
+  border-radius: var(--radius);
+}
+.persona-context h4 {
+  margin: 0 0 4px;
+}
+.context-item {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 4px 0;
+  font-size: var(--t-meta);
+  border-bottom: 1px solid var(--line);
+}
+.context-content {
+  flex: 1;
+  max-width: var(--measure);
+}
+
+/* Reviewing the board as somebody.
+
+   The picker sits with the board's own controls and lights up when active, because
+   "the board is showing you one person's view" is a mode and a mode you cannot see
+   you are in is a mode you will misread. */
+.review-as {
+  color: var(--lilac);
+  border-color: var(--line-strong);
+}
+.review-as.on {
+  color: var(--ink);
+  background: var(--lilac);
+  border-color: var(--lilac);
+}
+
+/* One row's predicted verdict. A chip, not a card: the board is a scanning surface,
+   and the question it answers here — where would they push back — needs a colour and
+   two words, not a paragraph. The detail view has the citations. */
+.persona-verdict {
+  color: var(--lilac);
+  border-color: var(--lilac);
+}
+/* "Wouldn't engage" is a real answer and usually the most common one on a sweep, so it
+   is dimmed rather than hidden — it must not read as "not predicted yet", which is the
+   absence of a chip entirely. */
+.persona-verdict.quiet {
+  color: var(--faint);
+  border-color: var(--line);
+}
+/* The verdicts reuse the review vocabulary from the diff pane, so a predicted
+   `request changes` is read the same way as a real one — and told apart by the chip
+   being lilac and hover saying "predicted", never by colour alone. */
+.persona-verdict.rec-approve {
+  color: var(--ok);
+  border-color: var(--ok);
+}
+.persona-verdict.rec-request_changes {
+  color: var(--amber);
+  border-color: var(--amber);
+}
+
+/* ---- board cards ------------------------------------------------------------
+   Each block answers one question: what kind of thing (head), what is it (title),
+   why is it on my board (why), what is known (headline), what has been done and
+   what can I do (foot). Anything answering none of those was cut. */
+
+.card-grid {
+  display: grid;
+  /* Responsive by content width rather than a fixed column count: 22rem is the
+     narrowest a two-line title reads at, and `auto-fill` gives two columns on a
+     laptop and four on a wide monitor without a breakpoint to maintain. */
+  grid-template-columns: repeat(auto-fill, minmax(22rem, 1fr));
+  gap: 10px;
+  /* Stretch, not start: cards in the same row share a height so the grid reads as a
+     grid rather than as a ragged shelf. The footer is pinned to the bottom of each
+     card (`margin-top: auto`) so the extra space lands between content and controls
+     rather than inside the content. */
+  align-items: stretch;
+}
+
+.card {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px 12px;
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  /* The rank spine. Replaces a 102px fixed text column that restated what the ref
+     sigil and the group heading also said. */
+  border-left: 3px solid var(--slate);
+  border-radius: 0 var(--radius) var(--radius) 0;
+  cursor: pointer;
+  text-align: left;
+}
+.card:hover {
+  background: var(--surface);
+  border-color: var(--line-strong);
+}
+.card:focus-visible {
+  outline: none;
+  border-color: var(--blue);
+  background: var(--surface);
+}
+.card.rank-issue {
+  border-left-color: var(--blue);
+}
+.card.rank-pull_request {
+  border-left-color: var(--lilac);
+}
+.card.rank-slack_thread {
+  border-left-color: var(--slate);
+}
+.card.rank-incident {
+  border-left-color: var(--sev-critical);
+}
+/* Acknowledged: triaged, still listed, visibly settled. */
+.card.acked {
+  opacity: 0.62;
+}
+.card.dim {
+  opacity: 0.5;
+}
+.card.live {
+  box-shadow: inset 0 0 0 1px rgba(149, 133, 207, 0.35);
+}
+
+.card-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: var(--t-micro);
+  color: var(--faint);
+}
+.card-type {
+  color: var(--dim);
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  font-weight: 700;
+}
+.card-ref {
+  font-variant-numeric: tabular-nums;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.card-spacer {
+  flex: 1;
+  min-width: 0;
+}
+.card-when {
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+/* The title **wraps**. The row this replaced ellipsed at a fixed column, so a long
+   title was unreadable at exactly the moment it mattered; two lines is the whole
+   reason a card is worth more vertical space than a row. */
+.card-title {
+  margin: 0;
+  font-size: var(--t-body);
+  font-weight: 500;
+  line-height: 1.3;
+  color: var(--text);
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+/* Why this is on the board. `attention.reason` was on the wire with nowhere to go,
+   so a lane said "Decide" without saying what was asking. */
+.card-why {
+  margin: 0;
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  font-size: var(--t-micro);
+}
+.why-label {
+  color: var(--amber);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  font-weight: 700;
+  white-space: nowrap;
+}
+.why-reason {
+  color: var(--dim);
+}
+
+/* What is known — present only when it says something the title did not, which the
+   backend now enforces (`subject::headline_is_noise`). No placeholder: a card with
+   nothing here has nothing to add, which is quieter and more honest than a line
+   reading "Not summarised yet" on every third card. */
+.card-headline {
+  margin: 0;
+  font-size: var(--t-meta);
+  line-height: 1.4;
+  color: var(--dim);
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.card-verdict {
+  margin: 0;
+}
+
+.card-foot {
+  margin-top: auto;
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 2px;
+  padding-top: 6px;
+  border-top: 1px solid var(--line);
+  font-size: var(--t-micro);
+}
+.card-ai {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+}
+/* Filled when the artifact exists, hollow when it doesn't — a row of hollow dots is
+   the "nobody has looked at this yet" signal, otherwise only discoverable by opening
+   the subject and finding empty panels.
+
+   Dots rather than the labelled pills this started as: six 9px abbreviations on every
+   card was a row of things to decode, which is the clutter the rework exists to
+   remove. The signal is carried by fill, not by the word. */
+.facet-dots {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+}
+.facet-dot {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  border: 1px solid var(--line-strong);
+}
+.facet-dot.on {
+  background: var(--slate);
+  border-color: var(--slate);
+}
+.pass-count {
+  color: var(--faint);
+  font-variant-numeric: tabular-nums;
+}
+/* A non-zero cloud count should be rare, so it is the one that draws the eye. */
+.pass-count.cloud {
+  color: var(--amber);
+}
+.card-tags {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+.card-tags .chip.tag {
+  font-style: normal;
+  padding: 1px 6px;
+}
+/* Always visible. The row this replaces hid its actions behind `visibility: hidden`,
+   which also hid `review as` — an affordance nobody could discover by looking. */
+.card-actions {
+  display: inline-flex;
+  gap: 4px;
+}
+.card-actions button {
+  padding: 2px 8px;
+  font-size: var(--t-micro);
+  min-height: 0;
+}
+
+/* ---- review findings, and the patches behind them ---------------------------
+   The review's notes used to render only against the line they were anchored to,
+   which is inside the patches — so folding the patches hid the findings, and not
+   folding them buried the verdict under 6,000px of diff. The findings are the
+   review's content; they belong beside the verdict. */
+.review-findings {
+  list-style: none;
+  margin: 8px 0 0;
+  padding: 0;
+  display: grid;
+  gap: 4px;
+}
+.finding {
+  display: grid;
+  grid-template-columns: 4.6rem minmax(0, auto) minmax(0, 1fr);
+  gap: 8px;
+  align-items: baseline;
+  padding: 5px 8px;
+  background: var(--surface-2);
+  border-left: 2px solid var(--slate);
+  border-radius: 0 6px 6px 0;
+  font-size: var(--t-meta);
+}
+.finding-sev {
+  font-size: var(--t-micro);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--dim);
+}
+/* Only a blocker earns a colour. A praise and a nit rendered in amber would make
+   every review look contested — the same mistake the persona "contested" badge made
+   before it needed two dissenters. */
+.finding.sev-blocker {
+  border-left-color: var(--sev-critical);
+}
+.finding.sev-blocker .finding-sev {
+  color: var(--sev-critical);
+}
+.finding.sev-concern {
+  border-left-color: var(--amber);
+}
+.finding.sev-concern .finding-sev {
+  color: var(--amber);
+}
+.finding-path {
+  font-size: var(--t-micro);
+  color: var(--faint);
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.finding-note {
+  color: var(--text);
+}
+
+/* One control for the evidence, saying how much of it there is — a fold whose size
+   is invisible is a fold nobody opens. */
+.patch-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 10px;
+  font-size: var(--t-meta);
+}
+
+/* An approach, folded to its headline. Choosing between three proposals means
+   comparing them, which is impossible when the first one fills the screen. */
+details.patch > summary.patch-head {
+  cursor: pointer;
+  list-style: none;
+}
+details.patch > summary.patch-head::-webkit-details-marker {
+  display: none;
+}
+details.patch > summary.patch-head::before {
+  content: "▸";
+  color: var(--faint);
+  margin-right: 4px;
+}
+details.patch[open] > summary.patch-head::before {
+  content: "▾";
+}
+/* The mechanism, in the head: "js-yaml parse" vs "ValidatingAdmissionPolicy" is the
+   difference between a real answer and a generic one, so it belongs where the
+   comparison happens rather than one fold down. */
+.patch-via {
+  font-size: var(--t-micro);
+  color: var(--faint);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 22ch;
+}
+
+/* The page's own index. Sticky, because its value is being reachable from the middle
+   of a long page — a map you have to scroll back to is a map you stop using. */
+.spine {
+  position: sticky;
+  top: 0;
+  z-index: 5;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 8px 0;
+  margin-bottom: 4px;
+  background: var(--bg);
+  border-bottom: 1px solid var(--line);
+}
+.spine-item {
+  padding: 2px 10px;
+  font-size: var(--t-micro);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--dim);
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  border-radius: var(--pill);
+  min-height: 0;
+}
+.spine-item:hover {
+  color: var(--blue);
+  border-color: var(--blue);
+}
+
+/* The timeline, folded to a count and a span. */
+.timeline-fold > summary {
+  cursor: pointer;
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  font-size: var(--t-meta);
+}
+.tl-count {
+  color: var(--dim);
+}
+
+/* ---- Slack thread analysis ----
+   The page's job is to make one distinction visible: did both models reach this, or only
+   one. Everything else is subordinate to that, because a single model's confident opinion
+   about a colleague is exactly the thing not to trust. */
+
+.thread-input {
+  display: flex;
+  gap: 8px;
+  margin-top: 10px;
+}
+.thread-input input {
+  flex: 1;
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  border-radius: var(--pill);
+  padding: 10px 14px;
+  color: var(--text);
+  font-family: inherit;
+  font-size: var(--t-body);
+}
+.thread-input input:focus {
+  outline: none;
+  border-color: var(--blue);
+}
+.thread-error {
+  margin: 8px 0 0;
+  color: var(--sev-critical);
+  font-size: var(--t-meta);
+}
+
+.thread-card-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  cursor: pointer;
+}
+.thread-title {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--t-body);
+}
+.thread-counts {
+  display: flex;
+  gap: 10px;
+  font-size: var(--t-micro);
+}
+/* The count the operator opened this page for. */
+.you-count {
+  color: var(--lilac);
+  font-weight: 700;
+}
+
+/* Both models' reads of the thread, unreconciled and side by side. Where they disagree
+   about what the thread was even about, that is the first useful thing on the page. */
+.model-summaries {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+  gap: var(--gap);
+  margin-top: 12px;
+}
+.model-summary {
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 10px 12px;
+  background: var(--surface-2);
+  max-width: var(--measure);
+}
+.model-name {
+  color: var(--lilac);
+  font-size: var(--t-micro);
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  margin-bottom: 6px;
+}
+.model-summary .outcome {
+  margin: 6px 0 0;
+  font-size: var(--t-meta);
+}
+details.dropped > summary {
+  margin-top: 8px;
+  cursor: pointer;
+  color: var(--faint);
+  font-size: var(--t-micro);
+}
+.dropped-item {
+  margin: 4px 0;
+  color: var(--dim);
+  font-size: var(--t-micro);
+}
+.dropped-why {
+  color: var(--sev-critical);
+}
+
+.about-you,
+.about-others {
+  margin-top: 16px;
+}
+.about-you .nothing {
+  max-width: var(--measure);
+  color: var(--dim);
+  font-size: var(--t-body);
+}
+
+/* One finding. The spine carries the stance, so a column of these reads as a shape before
+   any of it is read as words. */
+.finding-card {
+  margin-top: 8px;
+  padding: 8px 12px;
+  border-left: 3px solid var(--line-strong);
+  background: var(--surface-2);
+  border-radius: 0 8px 8px 0;
+}
+/* Criticism is red, not amber. Amber in this app means "a warning about the system"; this
+   is a judgement about a person, and borrowing the system's warning colour would make an
+   assessment of your own conduct read like a failing service. */
+.finding-card.stance-criticism {
+  border-left-color: var(--sev-critical);
+}
+.finding-card.stance-credit {
+  border-left-color: var(--ok);
+}
+.finding-card.stance-observation {
+  border-left-color: var(--slate);
+}
+.finding-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.stance {
+  font-size: var(--t-micro);
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--dim);
+}
+.stance-criticism .stance {
+  color: var(--sev-critical);
+}
+.stance-credit .stance {
+  color: var(--ok);
+}
+
+/* The distinction the whole two-model design exists to draw. */
+.corroboration {
+  padding: 1px 7px;
+  border-radius: var(--pill);
+  border: 1px solid var(--line-strong);
+  font-size: var(--t-micro);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+.corroboration.both {
+  border-color: var(--lilac);
+  color: var(--lilac);
+}
+.corroboration.one {
+  color: var(--faint);
+}
+
+.cite-toggle {
+  margin-left: auto;
+  background: none;
+  border: none;
+  cursor: pointer;
+  color: var(--faint);
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: var(--t-micro);
+}
+.cite-toggle:hover {
+  color: var(--blue);
+}
+.finding-claim {
+  margin: 4px 0 0;
+  max-width: var(--measure);
+  font-size: var(--t-body);
+}
+/* The other model's wording, kept verbatim. They agreed on the person and the message, not
+   on the sentence — merging them would be the synthesis this design refuses. */
+.finding-also {
+  margin: 4px 0 0;
+  max-width: var(--measure);
+  color: var(--dim);
+  font-size: var(--t-meta);
+}
+
+/* The messages a finding rests on. A candid claim you cannot check against what was
+   actually written is an accusation with a citation format. */
+.cited-messages {
+  margin-top: 8px;
+  border-top: 1px solid var(--line);
+  padding-top: 6px;
+}
+.cited {
+  display: flex;
+  gap: 8px;
+  padding: 3px 0;
+  font-size: var(--t-meta);
+}
+.cited-id {
+  flex: 0 0 auto;
+  color: var(--faint);
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: var(--t-micro);
+}
+.cited-author {
+  flex: 0 0 auto;
+  color: var(--dim);
+}
+.cited.yours .cited-author {
+  color: var(--lilac);
+}
+.cited-text {
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+
+details.thread-cast {
+  margin-top: 16px;
+  border-top: 1px solid var(--line);
+  padding-top: 8px;
+}
+details.thread-cast > summary {
+  cursor: pointer;
+  color: var(--dim);
+  font-size: var(--t-meta);
+}
+.cast-row {
+  display: flex;
+  gap: 10px;
+  align-items: baseline;
+  padding: 3px 0;
+  font-size: var(--t-meta);
+}
+.cast-handle.yours {
+  color: var(--lilac);
+  font-weight: 700;
+}
+/* Visible on purpose: without a profile, "this is how they always behave" is not a claim
+   anything here can support. */
+.no-profile {
+  color: var(--faint);
+  font-size: var(--t-micro);
+}
+.has-profile {
+  color: var(--dim);
+  font-size: var(--t-micro);
+}
+
+/* A model that was asked and did not answer. Deliberately the loudest thing on the page:
+   with one reader missing, every "one model only" mark below means "there was only one
+   model", not "the models disagreed" — and a page that silently degrades from two
+   independent opinions to one while still looking like two is worse than no page. */
+.panel-incomplete {
+  margin-top: 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--sev-critical);
+  border-radius: 8px;
+  background: rgba(224, 87, 79, 0.08);
+  color: var(--text);
+  font-size: var(--t-meta);
+  max-width: var(--measure);
+}
+.panel-failure {
+  margin-top: 4px;
+  color: var(--dim);
+  font-size: var(--t-micro);
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  overflow-wrap: anywhere;
+}
+.one-model {
+  color: var(--sev-critical);
+  font-size: var(--t-micro);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+/* A finding that leaned on a persona trait. Marked because it changes what is being
+   claimed: without a profile behind it, a finding says "he did this here"; with one, it
+   says "this is how he works" — a much stronger thing to say about a colleague. */
+.from-traits {
+  margin-top: 3px;
+  color: var(--lilac);
+  font-size: var(--t-micro);
+  letter-spacing: 0.04em;
 }

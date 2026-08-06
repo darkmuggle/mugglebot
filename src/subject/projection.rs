@@ -78,9 +78,22 @@ impl Board {
         // preview of the newest event body — fine as a placeholder in the detail view,
         // but presenting a chat message's first sentence as "what this needs from you"
         // would be a claim the board hasn't earned.
-        let headline = subject
-            .last_reasoned_at
-            .and_then(|_| super::headline_from(subject.summary.as_deref()));
+        let headline = subject.last_reasoned_at.and_then(|_| {
+            // The title is passed so a headline that merely restates it is refused — the
+            // board's one line for *new* information must not spend it repeating the line
+            // above. See `subject::headline_is_noise`.
+            super::headline_for(subject.summary.as_deref(), &subject.title)
+        });
+        // The summary the *view* renders, with its dead blocks dropped. A display transform:
+        // the stored summary keeps every word, because the explainer and the MCP surface read it
+        // and they are not the detail view. See `subject::trim_summary`.
+        let mut subject = subject;
+        if let Some(full) = subject.summary.as_deref() {
+            let trimmed = super::trim_summary(full, &subject.title);
+            if trimmed.len() != full.trim().len() {
+                subject.summary = Some(trimmed);
+            }
+        }
         let review = review_state(&signals, &pull_requests);
         let cleared = gates_passed(&signals, &pull_requests);
         Ok(Some(SubjectView {
@@ -283,7 +296,10 @@ pub fn review_state(signals: &[Signal], pull_requests: &[crate::store::PrFix]) -
     // from the moment it fired, where this one is from whenever the analysis last ran.
     // One block still outranks any approval, as in the live reduction.
     let mut fallback = None;
-    for state in pull_requests.iter().filter_map(|f| f.review_state.as_deref()) {
+    for state in pull_requests
+        .iter()
+        .filter_map(|f| f.review_state.as_deref())
+    {
         if state == "changes_requested" {
             return Some(state.to_string());
         }
@@ -318,10 +334,10 @@ pub fn review_state(signals: &[Signal], pull_requests: &[crate::store::PrFix]) -
 /// mystery.
 pub fn upstream_finished(signals: &[Signal]) -> bool {
     // An assigned card that fell out of the listing: off your plate, whatever else is known.
-    if signals
-        .iter()
-        .any(|s| s.external_id.starts_with(crate::store::Store::ASSIGNED_PREFIX))
-    {
+    if signals.iter().any(|s| {
+        s.external_id
+            .starts_with(crate::store::Store::ASSIGNED_PREFIX)
+    }) {
         return true;
     }
     let mut newest: Vec<&Signal> = signals.iter().collect();
@@ -538,14 +554,19 @@ mod tests {
         // `is_user_engaged` on a review-requested signal is what used to make this need
         // attention for ever, regardless of anyone having reviewed it.
         store.insert_signal(&signal).unwrap();
-        store.set_signal_subject(&signal.id, Some(key.as_str())).unwrap();
+        store
+            .set_signal_subject(&signal.id, Some(key.as_str()))
+            .unwrap();
         let subject = Subject::new(key.clone(), &signal, Utc::now());
         store.upsert_subject(&subject).unwrap();
 
         // Unreviewed: it wants you.
         let view = board.view(&key).unwrap().expect("view");
         assert_eq!(view.review_state, None);
-        assert!(view.attention.needed, "an unreviewed PR should want attention");
+        assert!(
+            view.attention.needed,
+            "an unreviewed PR should want attention"
+        );
 
         // Approved: it does not, and it says why.
         store.put_pr_fix(&fix("approved")).unwrap();
@@ -587,14 +608,23 @@ mod tests {
         };
 
         // Still open: read notifications say nothing about whether the work is done.
-        assert!(!upstream_finished(&[read_ci(10, "open"), read_ci(20, "open")]));
+        assert!(!upstream_finished(&[
+            read_ci(10, "open"),
+            read_ci(20, "open")
+        ]));
         // Merged: over, and the board should stop carrying it.
-        assert!(upstream_finished(&[read_ci(10, "open"), read_ci(20, "merged")]));
+        assert!(upstream_finished(&[
+            read_ci(10, "open"),
+            read_ci(20, "merged")
+        ]));
         // A closed issue is equally over.
         assert!(upstream_finished(&[read_ci(30, "closed")]));
 
         // The newest report of state wins — a merge followed by a reopen is open again.
-        assert!(!upstream_finished(&[read_ci(40, "merged"), read_ci(50, "open")]));
+        assert!(!upstream_finished(&[
+            read_ci(40, "merged"),
+            read_ci(50, "open")
+        ]));
 
         // No state recorded is not evidence of anything. Erring here is what made open work
         // disappear, so unknown must read as *not* finished.

@@ -52,6 +52,8 @@ pub async fn serve(
         .bind(workflows::root_cause::RootCause::new(wf.clone()))
         .bind(workflows::issue_triage::IssueTriage::new(wf.clone()))
         .bind(workflows::rest::BrowserRead::new(wf.clone()))
+        .bind(workflows::rest::GrafanaRead::new(wf.clone()))
+        .bind(workflows::rest::ThreadAnalyse::new(wf.clone()))
         .bind(workflows::rest::PrCritique::new(wf.clone()))
         .bind(workflows::rest::PrDiff::new(wf.clone()))
         .bind(workflows::rest::RepoIndex::new(wf.clone()))
@@ -59,6 +61,9 @@ pub async fn serve(
         .bind(workflows::rest::Merge::new(wf.clone()))
         .bind(workflows::explain::Explain::new(wf.clone()))
         .bind(workflows::explain::SecondOpinion::new(wf.clone()))
+        .bind(workflows::persona::PersonaProfile::new(wf.clone()))
+        .bind(workflows::persona::PersonaPredict::new(wf.clone()))
+        .bind(objects::persona::Persona::new(wf.personas.clone()))
         .bind(objects::watcher::Watcher::new(ingest.clone()))
         .bind(objects::scheduler::Scheduler::new(ingest.clone()))
         .bind(objects::repo_indexer::RepoIndexer::new(

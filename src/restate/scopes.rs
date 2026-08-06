@@ -28,6 +28,19 @@ pub const GITHUB: &str = "github";
 /// One Chrome, one investigation at a time. Replaces a claim-a-row worker loop.
 pub const BROWSER: &str = "browser";
 
+/// A thread analysis: two cloud models on one conversation. Its own scope rather than
+/// [`CLOUD_LLM`] because it is *operator-initiated and paired* — a limit of 1 here means two
+/// pasted links queue instead of putting four concurrent model calls on the same subscription,
+/// while leaving the cloud budget free for the work the operator is actually waiting on.
+pub const THREAD: &str = "thread";
+
+/// Grafana HTTP reads. Deliberately *not* [`BROWSER`]: that limit is 1 because there is one
+/// Chrome, and an HTTP read has no such constraint. The bound here is Grafana's own rate
+/// limiting and the fact that one `/api/ds/query` over a wide range is not cheap for the
+/// instance answering it — a handful at a time is polite, and an alert storm queues rather
+/// than arriving as a burst.
+pub const GRAFANA: &str = "grafana";
+
 /// Two clones at once is disk-bound; two clones *of the same repo* is a corrupt
 /// working tree, which is what the per-repo limit key prevents.
 pub const CHECKOUT: &str = "checkout";
@@ -78,6 +91,11 @@ pub async fn apply_rules(cfg: &crate::config::RestateConfig) -> anyhow::Result<(
         rule(GITHUB, l.github, "stay under the API's burst tolerance"),
         rule(BROWSER, l.browser, "one Chrome, one investigation"),
         rule(
+            GRAFANA,
+            l.grafana,
+            "polite to the Grafana instance answering"
+        ),
+        rule(
             CHECKOUT,
             l.checkout,
             "disk-bound; per-repo limit keys prevent a corrupt tree"
@@ -90,11 +108,12 @@ pub async fn apply_rules(cfg: &crate::config::RestateConfig) -> anyhow::Result<(
         Ok(r) if r.status().is_success() => {
             tracing::info!(
                 "restate: concurrency limits applied (local-llm {}, cloud-llm {}, github {}, \
-                 browser {}, checkout {}, repo-index {})",
+                 browser {}, grafana {}, checkout {}, repo-index {})",
                 l.local_llm,
                 l.cloud_llm,
                 l.github,
                 l.browser,
+                l.grafana,
                 l.checkout,
                 l.repo_index
             );

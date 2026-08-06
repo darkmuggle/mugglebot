@@ -378,11 +378,7 @@ impl CodeIndexer {
     /// a 5000/hour budget.
     ///
     /// Returns how many commits were new to the cache.
-    async fn fetch_new(
-        &self,
-        full_name: &str,
-        gh: &crate::github::GithubClient,
-    ) -> Result<usize> {
+    async fn fetch_new(&self, full_name: &str, gh: &crate::github::GithubClient) -> Result<usize> {
         // Nothing cached yet: `fetch_history`'s first page seeds from HEAD, and asking
         // "what's newer than nothing" would mean paging the entire history forwards.
         let Some(since) = self.store.newest_commit_at(full_name)? else {
@@ -673,7 +669,10 @@ mod tests {
             embedder: Arc::new(crate::embed::HashEmbedder),
         };
 
-        assert!(indexer.knows_repo("restatedev/agent"), "the new name is indexed");
+        assert!(
+            indexer.knows_repo("restatedev/agent"),
+            "the new name is indexed"
+        );
         assert!(
             !indexer.knows_repo("restatedev/wip-agent"),
             "the old name is gone from the index, and no later tick can bring it back"
@@ -814,7 +813,8 @@ mod tests {
     /// `ecosystem::detect` and out the other side as an edge to a repo we index.
     #[test]
     fn a_real_manifest_resolves_to_an_edge_end_to_end() {
-        let dir = std::env::temp_dir().join(format!("mugglebot-dep-edge-test-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("mugglebot-dep-edge-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(

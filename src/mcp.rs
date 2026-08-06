@@ -254,11 +254,12 @@ mod tests {
             Duration::from_secs(1800),
         ));
         Arc::new(McpServer::new(Arc::new(Tools {
-            store,
+            store: store.clone(),
             agents: Arc::new(crate::agent::AgentSessions::for_tests()),
-            ingress: Arc::new(crate::restate::ingress::Ingress::new(
-                &crate::config::RestateConfig::default(),
-            )),
+            // Offline: a real ingress here points at 127.0.0.1:8080, which during development
+            // is the operator's own running Restate server — so the suite invoked live handlers
+            // against a database it never touched. See `Ingress::offline`.
+            ingress: Arc::new(crate::restate::ingress::Ingress::offline()),
             scorer: scorer.clone(),
             secrets,
             attributor,
@@ -270,7 +271,11 @@ mod tests {
             investigator,
             repos,
             browser,
-            diffs: Arc::new(crate::prdiff::DiffReader::new(None, reasoner.clone(), "local").unwrap()),
+            threads: Arc::new(crate::thread::Analyser::for_tests(store.clone())),
+            diffs: Arc::new(
+                crate::prdiff::DiffReader::new(None, reasoner.clone(), "local").unwrap(),
+            ),
+            personas: Arc::new(crate::persona::Engine::for_tests(store)),
         })))
     }
 

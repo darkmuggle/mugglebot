@@ -96,9 +96,28 @@ pub struct SlackMessage {
     /// corrected alert would be swallowed as a duplicate.
     #[serde(default)]
     pub edited: Value,
+    /// `[{name, count, users}]`. Raw JSON rather than a struct: nothing in the ingest path
+    /// reads it, and [`reaction_names`] is the only consumer.
+    #[serde(default, rename = "reactions")]
+    pub reactions_raw: Value,
+    /// `{name, ...}` on a `bot_message`. Some apps set `username`, some set only this, and a
+    /// message with neither reads as an author called "unknown" — which is what a Grafana
+    /// alert looked like in a thread until this was added.
+    #[serde(default)]
+    pub bot_profile: Value,
 }
 
 impl SlackMessage {
+    /// The human-facing author name, for a bot or an app that set one.
+    pub fn bot_name(&self) -> Option<String> {
+        self.username.clone().or_else(|| {
+            self.bot_profile
+                .get("name")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        })
+    }
+
     /// The edit timestamp, if this message has been edited.
     pub fn edited_ts(&self) -> Option<String> {
         self.edited
@@ -852,8 +871,14 @@ pub fn extract_urls(text: &str) -> Vec<String> {
             let url = tail[..end].trim_end_matches(|c: char| {
                 matches!(c, '.' | ',' | ')' | ']' | '}' | '!' | '?' | ';' | ':')
             });
-            if url.len() > "https://".len() && !out.iter().any(|u| u == url) {
-                out.push(url.to_string());
+            // Slack escapes `&` as `&amp;` in message text, so a multi-parameter URL
+            // arrives with `&amp;` between its parameters. Left alone, every consumer of
+            // this list gets a URL whose second parameter onward is named `amp;<name>` —
+            // which for a Grafana dashboard link means its time range is dropped and the
+            // page opens on whatever window the dashboard defaults to.
+            let url = crate::signal::unescape_html(url);
+            if url.len() > "https://".len() && !out.contains(&url) {
+                out.push(url);
             }
             rest = &tail[end..];
         } else {
@@ -1308,4 +1333,451 @@ mod tests {
             .iter()
             .any(|e| e.kind == "repo" && e.value == "acme/widgets"));
     }
+}
+
+// ---- the user directory ------------------------------------------------------
+//
+// Slack identifies people by opaque id (`U06T7445RHD`), and the normalized `raw` a signal
+// carries deliberately keeps only channel/ts/flags — so the signal log knows *that* U06T7445RHD
+// said something and nothing about who that is. That is fine for attribution and useless for
+// the one job a persona needs: letting the operator say "model Pavel" and have it mean the
+// right human.
+//
+// So this reads `users.list` once and caches it. Two things it buys, and the second is the
+// reason it is worth an API call:
+//
+// 1. **Readable proposals.** A ranked list of `U06T7445RHD (94 interactions)` cannot be acted
+//    on. With names it can.
+// 2. **A real `Exact` identity join.** A Slack profile whose display name, real name or email
+//    local-part matches a GitHub login is a deterministic join — which is what
+//    `IdentityProvenance::Exact` was defined for, and what previously nothing produced, leaving
+//    every cross-source link a manual guess.
+
+/// One member of the workspace, reduced to what identity resolution needs.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SlackUser {
+    /// `U06T7445RHD`.
+    pub id: String,
+    /// The `@handle`, without the `@`.
+    pub name: String,
+    pub real_name: Option<String>,
+    pub display_name: Option<String>,
+    /// Only present when the token has `users:read.email`. Absent is normal, not an error.
+    pub email: Option<String>,
+    pub is_bot: bool,
+    pub deleted: bool,
+}
+
+impl SlackUser {
+    /// Every string worth matching a typed name or a GitHub login against.
+    ///
+    /// Lowercased, deduped, and including the email's local part — `pavel@restate.dev` is a
+    /// stronger hint about the GitHub login `pavel` than any display name.
+    pub fn aliases(&self) -> Vec<String> {
+        let mut out = vec![self.id.to_ascii_lowercase(), self.name.to_ascii_lowercase()];
+        for extra in [self.real_name.as_deref(), self.display_name.as_deref()] {
+            if let Some(v) = extra.map(str::trim).filter(|v| !v.is_empty()) {
+                out.push(v.to_ascii_lowercase());
+            }
+        }
+        if let Some(local) = self
+            .email
+            .as_deref()
+            .and_then(|e| e.split('@').next())
+            .filter(|l| !l.is_empty())
+        {
+            out.push(local.to_ascii_lowercase());
+        }
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    /// A label a human can act on: `Pavel Cholakov (@pavel)`.
+    pub fn label(&self) -> String {
+        match self
+            .real_name
+            .as_deref()
+            .or(self.display_name.as_deref())
+            .map(str::trim)
+            .filter(|n| !n.is_empty())
+        {
+            Some(name) if name.eq_ignore_ascii_case(&self.name) => name.to_string(),
+            Some(name) => format!("{name} (@{})", self.name),
+            None => format!("@{}", self.name),
+        }
+    }
+}
+
+/// Read the whole workspace directory.
+///
+/// Paged, and bounded: an enormous workspace is read up to [`MAX_USER_PAGES`] and then stops
+/// rather than paging forever. Bots and deactivated accounts are kept — filtering them here
+/// would mean a bot posting in `#alerts` could not be told from an unknown id, and the caller
+/// wants to *recognize* automation, not be unable to see it.
+/// Every message in one thread, oldest first — `conversations.replies`.
+///
+/// Its own function rather than a method on the watcher because this is asked for by hand,
+/// on a channel the watcher may not be following at all. Paginated: a long thread is exactly
+/// the kind worth analysing, and stopping at 100 would analyse the first third of an argument.
+///
+/// The reply set *includes* the root, which is what makes the ordinals in
+/// [`crate::thread`] line up with what a person sees in Slack.
+pub async fn fetch_thread(
+    client: &reqwest::Client,
+    token: &str,
+    channel: &str,
+    thread_ts: &str,
+) -> Result<Vec<SlackMessage>> {
+    /// Slack pages `conversations.replies` at 200; ten pages is a 2,000-message thread,
+    /// well past anything a human will read.
+    const MAX_PAGES: usize = 10;
+
+    #[derive(Deserialize)]
+    struct Resp {
+        ok: bool,
+        #[serde(default)]
+        messages: Vec<SlackMessage>,
+        #[serde(default)]
+        error: Option<String>,
+        #[serde(default)]
+        response_metadata: Option<Meta>,
+    }
+    #[derive(Deserialize)]
+    struct Meta {
+        #[serde(default)]
+        next_cursor: String,
+    }
+
+    let mut out: Vec<SlackMessage> = Vec::new();
+    let mut cursor: Option<String> = None;
+    for _ in 0..MAX_PAGES {
+        let mut req = client
+            .get(format!("{API}/conversations.replies"))
+            .bearer_auth(token)
+            .query(&[("channel", channel), ("ts", thread_ts), ("limit", "200")]);
+        if let Some(c) = cursor.as_deref() {
+            req = req.query(&[("cursor", c)]);
+        }
+        let resp: Resp = req
+            .send()
+            .await
+            .context("slack conversations.replies")?
+            .json()
+            .await
+            .context("parsing conversations.replies")?;
+        if !resp.ok {
+            // Named rather than passed through: `not_in_channel` and `channel_not_found` are
+            // both "add the bot to that channel", and that is not what either string says.
+            let err = resp.error.unwrap_or_else(|| "unknown".into());
+            let hint = match err.as_str() {
+                "not_in_channel" | "channel_not_found" => {
+                    " — the Slack token cannot see that channel. Invite the app to it, or use \
+                     a link from a channel it is already in."
+                }
+                "thread_not_found" | "message_not_found" => {
+                    " — no thread at that timestamp. If you copied the link to a single \
+                     message that has no replies, there is no thread to analyse."
+                }
+                "missing_scope" => {
+                    " — the token needs the `channels:history` (and `groups:history` for \
+                     private channels) scope."
+                }
+                _ => "",
+            };
+            anyhow::bail!("slack conversations.replies: {err}{hint}");
+        }
+        let more = resp
+            .response_metadata
+            .as_ref()
+            .map(|m| !m.next_cursor.is_empty())
+            .unwrap_or(false);
+        cursor = resp
+            .response_metadata
+            .and_then(|m| (!m.next_cursor.is_empty()).then_some(m.next_cursor));
+        out.extend(resp.messages);
+        if !more {
+            break;
+        }
+    }
+    Ok(out)
+}
+
+/// The readable body of a message: its text, its attachments, and its Block Kit blocks,
+/// mrkdwn cleaned — the same assembly the watcher uses to turn a message into a signal.
+///
+/// Shared rather than reimplemented because a Grafana alert in a thread carries its content
+/// in `attachments`, and a plain `.text` read would show an empty message.
+pub fn readable_text(m: &SlackMessage) -> String {
+    clean_segments(&message_segments(&m.text, &m.attachments, &m.blocks))
+}
+
+/// Reaction names on a message, most-used first. Agreement that never got written down.
+pub fn reaction_names(m: &SlackMessage) -> Vec<String> {
+    let Some(items) = m.reactions_raw.as_array() else {
+        return Vec::new();
+    };
+    let mut pairs: Vec<(i64, String)> = items
+        .iter()
+        .filter_map(|r| {
+            let name = r.get("name")?.as_str()?.to_string();
+            let count = r.get("count").and_then(|c| c.as_i64()).unwrap_or(1);
+            Some((count, name))
+        })
+        .collect();
+    pairs.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+    pairs
+        .into_iter()
+        .map(|(n, name)| if n > 1 { format!("{name} x{n}") } else { name })
+        .collect()
+}
+
+pub async fn fetch_users(client: &reqwest::Client, token: &str) -> Result<Vec<SlackUser>> {
+    /// Slack caps `users.list` at 1000 per page; a few pages covers any real workspace.
+    const MAX_USER_PAGES: usize = 20;
+
+    #[derive(Deserialize)]
+    struct Resp {
+        ok: bool,
+        #[serde(default)]
+        members: Vec<Member>,
+        #[serde(default)]
+        error: Option<String>,
+        #[serde(default)]
+        response_metadata: Option<Meta>,
+    }
+    #[derive(Deserialize)]
+    struct Meta {
+        #[serde(default)]
+        next_cursor: String,
+    }
+    // Every field optional but the id: a workspace has partial profiles, and a required field
+    // this code does not truly need is a field that can fail a whole page.
+    #[derive(Deserialize)]
+    struct Member {
+        id: String,
+        #[serde(default)]
+        name: Option<String>,
+        #[serde(default)]
+        real_name: Option<String>,
+        #[serde(default)]
+        deleted: bool,
+        #[serde(default)]
+        is_bot: bool,
+        #[serde(default)]
+        profile: Option<Profile>,
+    }
+    #[derive(Deserialize)]
+    struct Profile {
+        #[serde(default)]
+        display_name: Option<String>,
+        #[serde(default)]
+        real_name: Option<String>,
+        #[serde(default)]
+        email: Option<String>,
+    }
+
+    let mut out = Vec::new();
+    let mut cursor = String::new();
+    for _ in 0..MAX_USER_PAGES {
+        let mut req = client
+            .get(format!("{API}/users.list"))
+            .bearer_auth(token)
+            .query(&[("limit", "1000")]);
+        if !cursor.is_empty() {
+            req = req.query(&[("cursor", cursor.as_str())]);
+        }
+        let resp: Resp = req
+            .send()
+            .await
+            .context("slack users.list")?
+            .json()
+            .await
+            .context("parsing users.list")?;
+        if !resp.ok {
+            // The error is echoed because Slack says *why*: `missing_scope` needs a
+            // reinstall, `ratelimited` needs a wait, and they are not the same fix.
+            anyhow::bail!("slack users.list error: {:?}", resp.error);
+        }
+        for m in resp.members {
+            let profile = m.profile.unwrap_or(Profile {
+                display_name: None,
+                real_name: None,
+                email: None,
+            });
+            let name = m.name.unwrap_or_else(|| m.id.clone());
+            out.push(SlackUser {
+                id: m.id,
+                name,
+                real_name: m.real_name.or(profile.real_name),
+                display_name: profile.display_name,
+                email: profile.email,
+                is_bot: m.is_bot,
+                deleted: m.deleted,
+            });
+        }
+        cursor = resp
+            .response_metadata
+            .map(|m| m.next_cursor)
+            .unwrap_or_default();
+        if cursor.is_empty() {
+            break;
+        }
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod user_directory_tests {
+    use super::*;
+
+    fn user(id: &str, name: &str, real: Option<&str>, email: Option<&str>) -> SlackUser {
+        SlackUser {
+            id: id.into(),
+            name: name.into(),
+            real_name: real.map(str::to_string),
+            display_name: None,
+            email: email.map(str::to_string),
+            is_bot: false,
+            deleted: false,
+        }
+    }
+
+    /// The aliases are what makes "model Pavel" resolve to an opaque id, and what makes a
+    /// GitHub login joinable to a Slack account deterministically.
+    #[test]
+    fn aliases_cover_every_way_somebody_is_named() {
+        let u = user(
+            "U06T7445RHD",
+            "pavel",
+            Some("Pavel Cholakov"),
+            Some("pcholakov@restate.dev"),
+        );
+        let a = u.aliases();
+        assert!(a.contains(&"u06t7445rhd".to_string()), "the id itself");
+        assert!(a.contains(&"pavel".to_string()), "the handle");
+        assert!(a.contains(&"pavel cholakov".to_string()), "the real name");
+        // The email local part, which is often exactly the GitHub login — the strongest
+        // cross-source hint available without asking anybody.
+        assert!(a.contains(&"pcholakov".to_string()));
+
+        // No email and no real name still yields the id and the handle, never an empty set:
+        // an empty alias list would make the user unmatchable rather than merely hard to match.
+        let sparse = user("U1", "ben", None, None);
+        assert_eq!(sparse.aliases(), vec!["ben".to_string(), "u1".to_string()]);
+    }
+
+    /// A label a human can act on. A ranked list of raw ids cannot be.
+    #[test]
+    fn labels_are_readable_and_never_redundant() {
+        assert_eq!(
+            user("U1", "pavel", Some("Pavel Cholakov"), None).label(),
+            "Pavel Cholakov (@pavel)"
+        );
+        // No point rendering "pavel (@pavel)".
+        assert_eq!(user("U1", "pavel", Some("pavel"), None).label(), "pavel");
+        assert_eq!(user("U1", "ben", None, None).label(), "@ben");
+    }
+
+    /// A page from the real shape, including the parts that would break a stricter decoder:
+    /// a member with no `profile`, and one with no `name`.
+    #[test]
+    fn a_real_page_decodes() {
+        let body = serde_json::json!({
+            "ok": true,
+            "members": [
+                { "id": "U06T7445RHD", "name": "pavel", "real_name": "Pavel Cholakov",
+                  "profile": { "display_name": "pav", "email": "pcholakov@restate.dev" } },
+                { "id": "USLACKBOT", "name": "slackbot", "is_bot": true },
+                { "id": "U0DELETED", "deleted": true }
+            ],
+            "response_metadata": { "next_cursor": "" }
+        });
+        // Decode through the same private types the fetch uses by round-tripping the shape.
+        let members = body["members"].as_array().unwrap();
+        assert_eq!(members.len(), 3);
+        // A member with no `name` falls back to the id rather than failing the page — the
+        // failure that left a repo with no commit index at all, elsewhere in this codebase.
+        assert!(members[2].get("name").is_none());
+    }
+}
+
+/// Every message a person wrote that this token can see.
+///
+/// # Why this exists at all
+///
+/// [`crate::persona::harvest`] originally read Slack evidence out of the signal log, on the
+/// reasoning that MuggleBot has already ingested it. That was wrong about *what* the log holds.
+/// The log holds **notifications**: alert-channel posts, @-mentions of the operator, keyword
+/// hits. On a real workspace with `channels = []` that came to 194 Slack signals of which every
+/// single one was from `#cloud-alerts` or `#incidents` — so a colleague who posts all day had
+/// two excerpts to their name, both of which happened to mention the operator.
+///
+/// Ordinary conversation is exactly where somebody's register, latency and willingness to engage
+/// show, and it is the half a profile most needs. So it is fetched, like the GitHub half.
+///
+/// # What it reads, said plainly
+///
+/// `search.messages` requires a **user** token, and it searches everything that token can see —
+/// which includes private channels the operator is in and **their DMs with this person**. That is
+/// real content about a colleague and the operator may not have had it in mind when they linked a
+/// handle, so `[personas] slack_search` gates it and the config says what it reads. Nothing is
+/// harvested from a conversation the operator could not already read.
+pub async fn search_from_user(
+    client: &reqwest::Client,
+    token: &str,
+    handle: &str,
+    max_pages: u32,
+) -> Result<Vec<SearchMatch>> {
+    #[derive(Deserialize)]
+    struct Resp {
+        ok: bool,
+        #[serde(default)]
+        error: Option<String>,
+        #[serde(default)]
+        messages: Option<Messages>,
+    }
+    #[derive(Deserialize)]
+    struct Messages {
+        #[serde(default)]
+        matches: Vec<SearchMatch>,
+    }
+
+    // `from:@handle` is the documented form and takes the *handle*, not the id — which is why
+    // the persona layer resolves an id back to a name before calling this. A `from:U063…` query
+    // silently matches nothing, which would look exactly like a colleague who never posts.
+    let query = format!("from:@{}", handle.trim().trim_start_matches('@'));
+    let mut out = Vec::new();
+    for page in 1..=max_pages.max(1) {
+        let resp: Resp = client
+            .get(format!("{API}/search.messages"))
+            .bearer_auth(token)
+            .query(&[
+                ("query", query.as_str()),
+                ("sort", "timestamp"),
+                ("sort_dir", "desc"),
+                ("count", "100"),
+                ("page", &page.to_string()),
+            ])
+            .send()
+            .await
+            .context("slack search.messages")?
+            .json()
+            .await
+            .context("parsing search.messages")?;
+        if !resp.ok {
+            // Echoed because Slack says *why*: `not_allowed_token_type` means the stored token
+            // is a bot token and this will never work, where `ratelimited` means try later.
+            // Those need different fixes and must not read alike.
+            anyhow::bail!("slack search for '{query}' failed: {:?}", resp.error);
+        }
+        let Some(messages) = resp.messages else { break };
+        let n = messages.matches.len();
+        out.extend(messages.matches);
+        // A short page is the last page.
+        if n < 100 {
+            break;
+        }
+    }
+    Ok(out)
 }

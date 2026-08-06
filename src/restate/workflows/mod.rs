@@ -34,6 +34,7 @@
 //! execution is for, and it is why a failed investigation is retried rather than
 //! silently dropped.
 
+use anyhow::Context as _;
 use std::sync::Arc;
 
 use crate::correlation::Analyst;
@@ -43,6 +44,7 @@ use crate::triage::Triager;
 
 pub mod explain;
 pub mod issue_triage;
+pub mod persona;
 pub mod rest;
 pub mod root_cause;
 
@@ -71,11 +73,25 @@ pub struct WorkflowOps {
     pub analyst: Arc<Analyst>,
     pub repos: Arc<crate::repos::RepoIndex>,
     pub browser: Arc<crate::browser::BrowserDriver>,
+    /// Reads the *numbers* behind an alert over Grafana's HTTP API, and checks the
+    /// conclusion against them. Tried before [`Self::browser`], which reads a rendered
+    /// page and cannot be verified; see [`crate::grafana`].
+    pub grafana: Arc<crate::grafana::Reader>,
+    /// Reads a hand-pasted Slack thread with two models. See [`crate::thread`].
+    pub threads: Arc<crate::thread::Analyser>,
+    /// `[grafana].fallback_to_browser`. Held as a flag rather than re-read from config
+    /// here so the decision is testable without a config file.
+    pub grafana_fallback_enabled: bool,
     pub context: Arc<crate::context::ContextManager>,
     /// Reads pull request diffs and summarizes them on-device. Built once at boot with the
     /// token as it stood; a token added later is picked up on the next restart, same as
     /// every other GitHub-reading component here.
     pub diffs: Arc<crate::prdiff::DiffReader>,
+    /// Harvests, profiles and predicts personas — the "who is this work with" axis.
+    ///
+    /// Held here rather than assembled per handler because all three persona handlers need the
+    /// same four collaborators; see [`crate::persona::Engine`].
+    pub personas: Arc<crate::persona::Engine>,
     /// Build a reasoner for a provider and model the **operator** named.
     ///
     /// A factory rather than a set of handles because the point is that the choice isn't
@@ -120,6 +136,78 @@ impl WorkflowOps {
             .store
             .complete_browser_investigation(id, &findings.text)?;
         Ok(serde_json::to_value(&done)?)
+    }
+
+    /// Read one Slack thread with two models and record the verdict.
+    pub async fn thread_analyse(&self, id: &str) -> anyhow::Result<serde_json::Value> {
+        let done = self.threads.run(id).await?;
+        Ok(serde_json::to_value(&done)?)
+    }
+
+    /// Read Grafana for one alert: resolve the rule, run its queries over the alert's
+    /// window, and draw a conclusion whose every figure is checked against the series.
+    ///
+    /// When Grafana cannot answer — no readable rule, no dashboard queries, no points in
+    /// the window — this does **not** fail. It hands the same investigation to the browser
+    /// tier and returns, because "Grafana had nothing" is a normal outcome for an alert
+    /// whose graph lives on a panel the token cannot query, and retrying an HTTP read four
+    /// times will not change it.
+    pub async fn grafana_read(&self, id: &str) -> anyhow::Result<serde_json::Value> {
+        let Some(job) = self.store.get_browser_investigation(id)? else {
+            anyhow::bail!("no such investigation {id}");
+        };
+        let links: crate::grafana::Links = serde_json::from_str(&job.prompt)
+            .with_context(|| format!("investigation {id} has no parsed Grafana links"))?;
+        let alert = self
+            .store
+            .get_signal(&job.signal_id)?
+            .map(|s| {
+                let body = s.body.unwrap_or_default();
+                format!("{}\n{body}", s.title).trim().to_string()
+            })
+            .unwrap_or_else(|| job.url.clone());
+
+        let outcome = self.grafana.read(&alert, &links).await?;
+        if outcome.insufficient {
+            return self.hand_to_browser(id, &links, &alert, &outcome.conclusion);
+        }
+        let evidence = serde_json::to_string(&outcome.evidence)?;
+        let done =
+            self.store
+                .complete_investigation_with_evidence(id, &outcome.conclusion, &evidence)?;
+        Ok(serde_json::to_value(&done)?)
+    }
+
+    /// The fallback. Re-points the investigation at the dashboard link — the `/d/` one, not
+    /// the rule page and never the silence form — and lets the scheduler pick it up on the
+    /// browser tier's next pass.
+    fn hand_to_browser(
+        &self,
+        id: &str,
+        links: &crate::grafana::Links,
+        alert: &str,
+        why: &str,
+    ) -> anyhow::Result<serde_json::Value> {
+        let fallback_wanted = self.grafana_fallback_enabled;
+        let Some(url) = links.dashboard_url.clone().filter(|_| fallback_wanted) else {
+            // Nothing to escalate to: record why and stop. A completed investigation that
+            // says "Grafana had no series and there is no dashboard link" is a real answer;
+            // leaving it pending forever is not.
+            let done = self.store.complete_browser_investigation(id, why)?;
+            return Ok(serde_json::to_value(&done)?);
+        };
+        if !self.browser.enabled() {
+            let done = self.store.complete_browser_investigation(
+                id,
+                &format!("{why}\n\n_The browser tier is disabled, so {url} was not read._"),
+            )?;
+            return Ok(serde_json::to_value(&done)?);
+        }
+        let brief = self.browser.brief(&url, alert);
+        let handed = self
+            .store
+            .escalate_investigation_to_browser(id, &url, &brief, why)?;
+        Ok(serde_json::to_value(&handed)?)
     }
 
     /// Judge the open PRs that may already fix an assigned issue.

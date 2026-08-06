@@ -42,7 +42,10 @@ const MAX_PAGES: usize = 10;
 /// not, and that is precisely the window in which mapping the incident to code is most
 /// useful. `paused` deliberately does not: somebody has said "not now".
 pub fn is_open(category: &str) -> bool {
-    matches!(category, "triage" | "active" | "post_incident" | "post-incident")
+    matches!(
+        category,
+        "triage" | "active" | "post_incident" | "post-incident"
+    )
 }
 
 /// One incident, reduced to what the board and the analysis need.
@@ -159,10 +162,14 @@ impl IncidentClient {
                 crate::tools::truncate_for_prompt(&body, 400)
             );
         }
-        let page: IncidentsPage = serde_json::from_str(&body)
-            .with_context(|| format!("decoding {}", crate::tools::truncate_for_prompt(&body, 200)))?;
+        let page: IncidentsPage = serde_json::from_str(&body).with_context(|| {
+            format!("decoding {}", crate::tools::truncate_for_prompt(&body, 200))
+        })?;
         let next = page.pagination_meta.and_then(|p| p.after);
-        Ok((page.incidents.into_iter().map(Incident::from).collect(), next))
+        Ok((
+            page.incidents.into_iter().map(Incident::from).collect(),
+            next,
+        ))
     }
 }
 
@@ -325,7 +332,9 @@ mod tests {
         assert!(!closed.is_open(), "closed is not open");
         // A valueless named timestamp is dropped rather than carried as an empty date.
         assert_eq!(closed.timestamps.len(), 2);
-        assert!(closed.symptom_text().starts_with("TenantPodOOMKillLoop\n\n"));
+        assert!(closed
+            .symptom_text()
+            .starts_with("TenantPodOOMKillLoop\n\n"));
 
         let open = &incidents[1];
         assert!(open.is_open());

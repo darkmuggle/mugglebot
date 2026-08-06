@@ -8,6 +8,12 @@ import type {
   ChatTurn,
   Handled,
   IndexStatus,
+  Persona,
+  PersonaCandidate,
+  PersonaDetail,
+  PersonaList,
+  PersonaPrediction,
+  PredictionKind,
   PrDiffReport,
   RepoIndexDetail,
   RepoKind,
@@ -189,17 +195,172 @@ export const api = {
     }).then(unwrap);
   },
 
+  /**
+   * Send a chat turn.
+   *
+   * `persona` talks to a simulated colleague instead of to MuggleBot: same transport, a
+   * different framing and grounding server-side. The reply comes back with `persona` set
+   * so the pane can label it as a prediction rather than as an answer.
+   */
   chat(
     messages: ChatTurn[],
     provider?: string,
     model?: string,
     tags?: string[],
+    persona?: string,
   ): Promise<ChatResponse> {
     return fetch(`${API}/api/chat`, {
       method: "POST",
       headers: JSON_HEADERS,
-      body: JSON.stringify({ messages, provider, model, tags }),
+      body: JSON.stringify({ messages, provider, model, tags, persona }),
     }).then(unwrap);
+  },
+
+  // ---- personas --------------------------------------------------------------
+
+  /** The modelled people, with how much evidence is behind each and how fresh it is. */
+  listPersonas(): Promise<PersonaList> {
+    return api.tool<PersonaList>("list_personas");
+  },
+
+  /** One persona in full: traits with citations, what was refused, evidence, predictions. */
+  getPersona(slug: string, evidenceLimit = 60): Promise<PersonaDetail> {
+    return api.tool<PersonaDetail>("get_persona", {
+      slug,
+      evidence_limit: evidenceLimit,
+    });
+  },
+
+  /** People seen in the signal log who are not modelled yet, most-dealt-with first. */
+  proposePersonas(limit?: number): Promise<{ candidates: PersonaCandidate[] }> {
+    return api.tool("propose_personas", limit ? { limit } : {});
+  },
+
+  createPersona(body: {
+    display_name: string;
+    slug?: string;
+    role?: string;
+    notes?: string;
+    identities?: { source: string; handle: string; provenance?: string; rationale?: string }[];
+  }): Promise<{ persona: Persona; armed: boolean }> {
+    return api.tool("create_persona", body);
+  },
+
+  updatePersona(body: {
+    slug: string;
+    display_name?: string;
+    role?: string;
+    notes?: string;
+  }): Promise<Persona> {
+    return api.tool("update_persona", body);
+  },
+
+  deletePersona(slug: string): Promise<{ deleted: boolean }> {
+    return api.tool("delete_persona", { slug });
+  },
+
+  linkPersonaIdentity(
+    slug: string,
+    source: string,
+    handle: string,
+  ): Promise<{ harvesting: boolean }> {
+    return api.tool("link_persona_identity", { slug, source, handle });
+  },
+
+  unlinkPersonaIdentity(source: string, handle: string): Promise<{ unlinked: boolean }> {
+    return api.tool("unlink_persona_identity", { source, handle });
+  },
+
+  /** Harvest now rather than waiting for the loop's next tick. */
+  harvestPersona(slug: string): Promise<{ harvesting: boolean }> {
+    return api.tool("harvest_persona", { slug });
+  },
+
+  /**
+   * Re-distil a persona's traits.
+   *
+   * `submitted: false` means the profile is already current for everything harvested — a
+   * success, not a failure. `force` redoes it anyway.
+   */
+  refreshPersonaProfile(
+    slug: string,
+    force = false,
+  ): Promise<{ submitted: boolean; workflow: string; note: string }> {
+    return api.tool("refresh_persona_profile", { slug, force });
+  },
+
+  /**
+   * Predict what personas would do about a subject.
+   *
+   * Takes a list, because the question is "how will this land" and the answer is the set of
+   * reactions — a reviewer who will block and one who will not care are one answer together.
+   * Nothing is posted anywhere.
+   */
+  predictPersonas(
+    subjectKey: string,
+    personas: string[],
+    opts: { kind?: PredictionKind; provider?: string; model?: string } = {},
+  ): Promise<{
+    subject_key: string;
+    kind: PredictionKind;
+    predictions: { persona: string; submitted: boolean; workflow: string }[];
+    stored: PersonaPrediction[];
+  }> {
+    return api.tool("predict_persona", {
+      subject_key: subjectKey,
+      personas,
+      ...opts,
+    });
+  },
+
+  /** Where a persona's review activity concentrates, and who to ask about an area. */
+  whoKnows(area: string): Promise<{
+    area: string;
+    candidates: {
+      persona: string;
+      display_name: string;
+      role: string | null;
+      area: string;
+      kind: string;
+      excerpts: number;
+      reviews: number;
+      share: number;
+      established_expertise: boolean;
+      depth: string | null;
+    }[];
+    personas_considered: number;
+    note: string;
+  }> {
+    return api.tool("who_knows", { area });
+  },
+
+  /**
+   * Attach something you know about a person. Text is verbatim; a URL is fetched and
+   * summarized. Re-profiles, so the fact takes effect immediately.
+   */
+  addPersonaContext(slug: string, content: string): Promise<{ id: string; reprofiling: boolean }> {
+    return api.tool("add_persona_context", { slug, content });
+  },
+
+  removePersonaContext(id: string): Promise<{ removed: boolean }> {
+    return api.tool("remove_persona_context", { id });
+  },
+
+  /** Stored predictions for one subject. */
+  predictionsFor(subjectKey: string): Promise<PersonaPrediction[]> {
+    return api.tool<PersonaPrediction[]>("list_predictions", {
+      subject_key: subjectKey,
+    });
+  },
+
+  /**
+   * Every stored prediction *by* one persona.
+   *
+   * One call for the whole board rather than one per row: the board is a hundred rows and
+   * asking per row would be a hundred round trips to render a chip.
+   */
+  predictionsBy(slug: string): Promise<PersonaPrediction[]> {
+    return api.tool<PersonaPrediction[]>("list_predictions", { slug });
   },
 
   /** Persisted agent chats (metadata only), newest activity first. */

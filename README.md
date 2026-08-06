@@ -56,6 +56,13 @@ See [AGENTS.md](AGENTS.md) for the full design and roadmap.
   concurrency limit, running, done, refused as a duplicate because the same key
   already ran, or failed with its message. Pushed live, so a button press has a
   visible consequence even when the right answer is "nothing needed to happen".
+- **Personas** — a candid behavioural model of one colleague, built from things they
+  actually wrote: their GitHub reviews, their Slack messages, the lines attributed to them in
+  meetings. Select personas against an issue or pull request and get a prediction — the review
+  they would leave, the comment they would write, or that they would not engage at all — and
+  talk to one in the chat pane to rehearse before you ask. Opt-in per person, every claim
+  cited or dropped, local models, never posted anywhere. See
+  [Personas](#personas--who-the-work-is-with).
 - **Attention + AI-decoration indicators** — the board leads with *does this need
   you* and *has the AI been over it* (per-facet, filled or hollow), with work
   attributed `⌂` on-device vs `☁` metered. The unseen/ack state machine is still
@@ -180,6 +187,102 @@ nothing here commits, pushes, opens a PR, or comments on somebody else's, and pa
 the model wasn't actually shown are dropped so a confident-looking citation can't send you hunting for a
 file that doesn't exist. Every triage records the commit it read, so you can tell
 when the analysis has gone stale. Needs `git` on `PATH`.
+
+## Personas — who the work is with
+
+Everything else here models *what* the work is. A persona models **who it is with**: one
+colleague, candidly, from things they actually wrote — so that before you ask them, you can
+ask what they will probably say.
+
+Turn it on with `[personas] enabled = true`. It is off by default, because this is the one
+feature here that models *people* rather than work.
+
+**Opt-in, one person at a time.** There is no setting that models everybody who has ever
+posted. MuggleBot proposes candidates ranked by how much you actually deal with them, and
+creating each persona is a decision — several hundred profiles of near strangers would bury
+the handful that matter, and would be doing it to real people without anyone asking.
+
+**Link both handles.** The create form has a field per source, not a dropdown: the same person
+is terse on GitHub and chatty in Slack, and the profile tracks each register separately, so a
+persona with one source predicts one register. Type a Slack **name** or `@handle` — it resolves
+against the workspace directory, so you never need to go and find the `U…` id. Evidence is only
+ever harvested through a handle you confirmed, because a wrong join builds a profile from two
+people's writing and nothing about the output looks wrong. If you only fill in one field, fill
+in Slack: it lands immediately.
+
+**Evidence, then traits.** Slack and meeting evidence is a SQL query over signals already
+ingested — free, and uncapped. GitHub evidence is a couple of searches plus a handful of comment
+reads per pass, walked backwards over the last `history_days` (90 by default) a page at a time:
+their last three reviews are a sample of three, three months of them are a pattern. When *you*
+ask — creating, linking, pressing harvest — that runs at interactive priority and is never
+refused; the background backfill defers to the watchers. Then one local model pass per facet
+distils it into **traits** — one falsifiable sentence each, carrying the verbatim excerpts it
+came from.
+
+**It keeps up on its own.** When somebody you model is seen being active, their persona
+refreshes — debounced, so a burst of nine messages is one pass. A profile that only refreshed
+twice a day would be stale exactly when it matters: right before you ask them about the thing
+they were talking about ten minutes ago.
+
+**Candid means falsifiable, not speculative.** "Blocks on missing tests for anything touching
+storage" is a claim you can check against their next review, and the profile will say it when
+the evidence supports it. "A great engineer who cares about quality" is true of everyone and
+predicts nothing, so it is dropped — as is anything inferred about somebody's health,
+politics, or personal life, none of which is in the excerpts and none of which bears on how
+they review a pull request. What was dropped is shown to you, because on a first pass that
+list is usually longer than the profile. Claims their own evidence contradicts are marked
+**contested** rather than flattened, and confidence is capped by how much is behind it — one
+excerpt can never exceed 50%.
+
+Counted facts — approval rate, median comment length, how much of their review activity is
+inline on a line of the diff — are computed, never modelled. A model asked for an approval
+rate invents a plausible number, and on screen that is indistinguishable from a real one.
+
+**Who to ask.** Alongside *how* somebody reviews, a persona tracks *what* they review — the
+areas their review activity concentrates in, counted from the repos and file paths their comments
+land on. `who_knows("storage")` ranks that across everyone you model. Three bars keep it honest,
+because the person with the most comments on a repo is frequently the one *learning* it: sustained
+activity, **reviewing rather than just commenting**, and concentration. And an area is only called
+expertise when the model has also found their comments there specific — otherwise it says
+*presence only*, because "ask them" and "they are around" are different answers.
+
+**What you know about them.** Not everything useful is in the evidence. "Owns the release
+process", "prefers async review", a link to their team charter — attach it and it is used
+verbatim, never filtered, and it re-profiles immediately so it takes effect. This is the one part
+of a profile that hasn't been through verification, and the UI says so: the filter exists to stop
+the *model* making unfalsifiable claims, not to second-guess you.
+
+**Review the board as somebody.** Pick a persona in the board header and every issue and pull
+request gets a `review as` action, then a compact verdict — `request changes`, `approve`,
+`wouldn't engage` — with the note they'd write on hover. Chosen once in the header rather than per
+card, because the question is about a lane: *where would Pavel push back?*
+
+**Predictions.** On any issue or pull request, select personas and press PREDICT: the review
+they would leave, the comment they would write, or **that they would not engage at all** —
+which is often the most useful answer and the one a predictor is most tempted to skip. Every
+predicted point names the trait it follows from; a point citing none is dropped, because
+otherwise the output is just the base model's own review of the diff with a colleague's name
+on it. A predicted `request changes` against somebody who approves most of what they see gets
+demoted unless a trait explains why this change is different.
+
+**Talking to one.** The chat pane's persona picker switches the conversation to a simulated
+colleague — "how will Pavel react if I propose putting this behind a flag?" is worth an answer
+before the meeting. It never fabricates a quotation: it can say what they would probably think,
+and quote a harvested excerpt, and nothing else. Replies are labelled `<name> · predicted`,
+always.
+
+**Nothing is ever posted.** A prediction is a private rehearsal, on the same footing as every
+other critique here.
+
+**Claude forms the opinion**, and this is the one default in MuggleBot that isn't on-device. It
+was earned rather than chosen: the local 33B model produced sensible claims and then mangled the
+citation ids so verification dropped every one, and once that was fixed it asserted 100%
+confidence, duplicated claims across facets, and returned nothing usable for half the facets. Every
+safeguard still applies whichever tier answers — a stronger model just clears the bar more often.
+The cost is real: **on any tier but `local`, harvested excerpts of your colleagues' writing leave
+the machine** (via the subscription CLI bridge, so nothing is metered — but "unmetered" is not
+"on-device"). Set `profile_tier = "local"` under `[personas]` to keep it on the Mac and accept a
+thinner profile.
 
 ## Investigation & browser control
 

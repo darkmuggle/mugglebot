@@ -61,6 +61,13 @@ pub struct ToolCall {
 pub struct ChatResponse {
     pub answer: String,
     pub tool_calls: Vec<ToolCall>,
+    /// The persona this turn was answered *as*, if any.
+    ///
+    /// Returned so the UI can label the bubble. A simulated colleague rendered as an ordinary
+    /// assistant reply is the one presentation this feature must not have — the answer is a
+    /// prediction, and a prediction that looks like a quotation is worse than no prediction.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub persona: Option<String>,
 }
 
 impl ChatAgent {
@@ -87,6 +94,61 @@ impl ChatAgent {
         self.respond_with(history, tags, reasoner).await
     }
 
+    /// The local text model — what a turn runs on when the operator has not picked one.
+    pub fn default_reasoner(&self) -> Arc<dyn Reasoner> {
+        self.reasoner.clone()
+    }
+
+    /// Respond **as a persona** — talk to a simulated colleague.
+    ///
+    /// The point is rehearsal: "how will Pavel react if I propose moving this behind a flag?"
+    /// is a question worth having an answer to before the meeting, and the honest answer is
+    /// sometimes "the profile does not say".
+    ///
+    /// Three properties keep it honest, and they are the same three the prediction path has:
+    ///
+    /// - **It is grounded in the profile.** The system prompt is the profile, cited by trait
+    ///   id. An empty profile refuses rather than improvising a person.
+    /// - **It never fabricates a quotation.** Asked whether they said something, it answers
+    ///   from the harvested excerpts or says it does not know. A model producing a plausible
+    ///   quote from a real colleague is the worst output this feature can have.
+    /// - **It is labelled.** [`ChatResponse::persona`] comes back set, so the pane renders it
+    ///   as a simulation rather than as a reply.
+    ///
+    /// The tool loop is kept, deliberately: asked about a pull request, the simulation should
+    /// go and read it rather than reacting to the title. What changes is the framing, not the
+    /// grounding.
+    pub async fn respond_as(
+        &self,
+        history: &[ChatTurn],
+        tags: &[String],
+        reasoner: &Arc<dyn Reasoner>,
+        persona: &str,
+    ) -> Result<ChatResponse> {
+        let Some(profile) = self.tools.store.persona_profile(persona)? else {
+            anyhow::bail!("no persona '{persona}'");
+        };
+        if profile.traits.is_empty() {
+            // Refused rather than improvised. A model handed a name and no profile writes a
+            // confident colleague out of its own priors, and the operator has no way to tell
+            // that from a grounded one.
+            return Ok(ChatResponse {
+                answer: format!(
+                    "Nothing is established about {} yet, so there is no profile to speak from. \
+                     Harvest their activity and run a profile pass first — talking to an empty \
+                     persona would just be me making somebody up.",
+                    profile.persona.display_name
+                ),
+                tool_calls: Vec::new(),
+                persona: Some(persona.to_string()),
+            });
+        }
+        let system = self.persona_prompt(&profile, tags);
+        let mut resp = self.run_loop(history, reasoner, system).await?;
+        resp.persona = Some(persona.to_string());
+        Ok(resp)
+    }
+
     /// Respond to a conversation (the full turn history, last turn = the new user
     /// message, which may carry images), driving the given `reasoner`. The chat
     /// pane picks the provider/model, so the server builds a reasoner per request
@@ -98,6 +160,21 @@ impl ChatAgent {
         history: &[ChatTurn],
         tags: &[String],
         reasoner: &Arc<dyn Reasoner>,
+    ) -> Result<ChatResponse> {
+        let system = self.system_prompt(tags);
+        self.run_loop(history, reasoner, system).await
+    }
+
+    /// The tool-use loop, driven by whichever system prompt the caller built.
+    ///
+    /// Extracted so [`Self::respond_as`] can reuse it: talking to a persona changes the
+    /// *framing* and nothing about how tools are called, and a second copy of the loop would
+    /// be a second place for the step budget and the tool-result truncation to drift.
+    async fn run_loop(
+        &self,
+        history: &[ChatTurn],
+        reasoner: &Arc<dyn Reasoner>,
+        system: String,
     ) -> Result<ChatResponse> {
         let mut messages: Vec<Message> = history
             .iter()
@@ -121,7 +198,6 @@ impl ChatAgent {
             })
             .collect();
 
-        let system = self.system_prompt(tags);
         let mut tool_calls = Vec::new();
 
         for _ in 0..MAX_STEPS {
@@ -144,6 +220,7 @@ impl ChatAgent {
                 return Ok(ChatResponse {
                     answer: text,
                     tool_calls,
+                    persona: None,
                 });
             };
             match action.get("action").and_then(|a| a.as_str()) {
@@ -180,14 +257,97 @@ impl ChatAgent {
                         .and_then(|a| a.as_str())
                         .map(str::to_string)
                         .unwrap_or(text);
-                    return Ok(ChatResponse { answer, tool_calls });
+                    return Ok(ChatResponse {
+                        answer,
+                        tool_calls,
+                        persona: None,
+                    });
                 }
             }
         }
         Ok(ChatResponse {
             answer: "I ran out of steps before finishing — try narrowing the question.".into(),
             tool_calls,
+            persona: None,
         })
+    }
+
+    /// The framing for talking *as* a persona.
+    ///
+    /// Written to make the two failure modes hard rather than merely discouraged:
+    ///
+    /// **Fabricated quotation.** The single worst output available here is a plausible
+    /// sentence attributed to a real colleague. So the rule is absolute — paraphrase a
+    /// predicted position freely, never present anything as something they said unless it is
+    /// one of the harvested excerpts, quoted with its id.
+    ///
+    /// **Improvised personality.** A model handed a name fills in the rest from its priors,
+    /// which is how you get a confident answer about somebody the profile says nothing about.
+    /// So "the profile does not cover this" is named as a *good* answer, the same way
+    /// `would_engage: false` is named as one in the prediction prompt. [`Self::respond_as`]
+    /// refuses outright when the profile is empty, so by the time this prompt is used there is
+    /// at least something real behind it.
+    fn persona_prompt(&self, profile: &crate::persona::Profile, tags: &[String]) -> String {
+        let tool_list = tools::definitions()
+            .into_iter()
+            // Read tools only. A simulated colleague has no business creating memories,
+            // merging subjects, or dispatching workflows on the operator's behalf — and a
+            // write executed "as Pavel" would be indistinguishable in the audit log from one
+            // the operator asked for.
+            .filter(|d| d.read_only)
+            .map(|d| format!("- {} — {}", d.name, d.description))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let grounding = self.tag_grounding(tags);
+        let grounding_block = if grounding.trim().is_empty() {
+            String::new()
+        } else {
+            format!("\n\nBackground the engineer attached:\n{grounding}")
+        };
+        format!(
+            "You are simulating a specific colleague, {name}, so that the engineer can rehearse \
+             a conversation before having it. Answer in the first person, as {name} would.\n\n\
+             This is a prediction, not a person. Four rules:\n\
+             1. **Never fabricate a quotation.** You may say what {name} would probably think or \
+                ask. You may NOT present anything as something they actually said, unless it is \
+                one of the excerpts below, quoted with its [ev:ID]. If the engineer asks \
+                \"did they say X?\", answer from the excerpts or say you do not know.\n\
+             2. **Stay inside the profile.** When something is not covered by it, say so as \
+                yourself — \"the profile doesn't cover how they'd feel about that\" — rather \
+                than inventing a reaction. That is a good answer, not a failure.\n\
+             3. **Keep their register.** Their median message is {median} characters. Do not \
+                write a considered essay for somebody who writes two lines.\n\
+             4. **Be candid, and stay on behaviour.** If the profile says they will push back \
+                hard, push back hard. Never speculate about their health, politics, personal \
+                life, or worth as a colleague — none of it is in the evidence.\n\n\
+             You can look things up before reacting, and should: react to the actual diff or \
+             thread, not to its title. Each turn, respond with ONE JSON object and nothing \
+             else:\n\
+             - to use a tool: {{\"action\":\"tool\",\"tool\":\"<name>\",\"arguments\":{{...}}}}\n\
+             - to answer: {{\"action\":\"final\",\"answer\":\"<markdown, in their voice>\"}}\n\n\
+             THE PROFILE\n{profile_block}\n\n\
+             THEIR OWN WORDS (the only quotable material — cite as [ev:ID])\n{excerpts}\n\n\
+             Tools:\n{tool_list}{grounding_block}",
+            name = profile.persona.display_name,
+            median = profile.stats.median_excerpt_chars.max(1),
+            profile_block = profile.render(),
+            excerpts = self.persona_excerpts(&profile.persona.slug),
+        )
+    }
+
+    /// A bounded block of the persona's own words, which is the only material the simulation
+    /// may quote. Best-effort: a read failure degrades to "nothing quotable", which the prompt
+    /// already handles, rather than failing the turn.
+    fn persona_excerpts(&self, slug: &str) -> String {
+        const MAX: usize = 25;
+        match self.tools.store.persona_evidence(slug, Some(MAX)) {
+            Ok(evidence) if !evidence.is_empty() => evidence
+                .iter()
+                .map(|e| e.render())
+                .collect::<Vec<_>>()
+                .join("\n"),
+            _ => "(none harvested)".to_string(),
+        }
     }
 
     fn system_prompt(&self, tags: &[String]) -> String {
@@ -310,11 +470,12 @@ mod tests {
             Duration::from_secs(1800),
         ));
         Arc::new(Tools {
-            store,
+            store: store.clone(),
             agents: Arc::new(crate::agent::AgentSessions::for_tests()),
-            ingress: Arc::new(crate::restate::ingress::Ingress::new(
-                &crate::config::RestateConfig::default(),
-            )),
+            // Offline: a real ingress here points at 127.0.0.1:8080, which during development
+            // is the operator's own running Restate server — so the suite invoked live handlers
+            // against a database it never touched. See `Ingress::offline`.
+            ingress: Arc::new(crate::restate::ingress::Ingress::offline()),
             scorer: scorer.clone(),
             secrets,
             attributor,
@@ -326,7 +487,11 @@ mod tests {
             investigator,
             repos,
             browser,
-            diffs: Arc::new(crate::prdiff::DiffReader::new(None, reasoner.clone(), "local").unwrap()),
+            threads: Arc::new(crate::thread::Analyser::for_tests(store.clone())),
+            diffs: Arc::new(
+                crate::prdiff::DiffReader::new(None, reasoner.clone(), "local").unwrap(),
+            ),
+            personas: Arc::new(crate::persona::Engine::for_tests(store)),
         })
     }
 

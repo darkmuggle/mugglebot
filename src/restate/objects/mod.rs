@@ -28,6 +28,8 @@ use crate::subject::{SubjectKey, SubjectRank};
 pub mod debounce;
 pub mod incident;
 pub mod issue;
+/// One modelled person, owning their harvest loop. Not a subject — see [`crate::persona`].
+pub mod persona;
 pub mod pull_request;
 pub mod repo_indexer;
 pub mod scheduler;

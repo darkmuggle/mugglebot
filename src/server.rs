@@ -358,25 +358,47 @@ struct ChatBody {
     /// context are folded in as grounding for the agent.
     #[serde(default)]
     tags: Vec<String>,
+    /// Talk to a simulated colleague instead of to MuggleBot.
+    ///
+    /// The slug of a persona. Changes the framing and the grounding, not the transport: the
+    /// reply comes back with [`crate::chat::ChatResponse::persona`] set so the pane can label
+    /// it as a prediction rather than rendering it as an ordinary answer.
+    #[serde(default)]
+    persona: Option<String>,
 }
 
 use crate::reasoner::provider_label;
 
 async fn chat(AxumState(st): AxumState<AppState>, Json(body): Json<ChatBody>) -> impl IntoResponse {
-    let result = match (&body.provider, &body.model) {
-        (Some(provider), Some(model)) if !model.trim().is_empty() => {
-            let ollama_key = st.tools.secrets.get_opt("ollama");
-            let reasoner = reasoner::build(
-                provider_label(provider),
-                model,
-                &st.tools.config.reasoner,
-                ollama_key,
-            );
+    // The operator's model choice, if they made one. Resolved first, because a persona turn
+    // and an ordinary turn both honour it — talking to a simulated colleague on a cloud model
+    // is the operator asking, by name, exactly as everywhere else.
+    let picked = match (&body.provider, &body.model) {
+        (Some(provider), Some(model)) if !model.trim().is_empty() => Some(reasoner::build(
+            provider_label(provider),
+            model,
+            &st.tools.config.reasoner,
+            st.tools.secrets.get_opt("ollama"),
+        )),
+        _ => None,
+    };
+    let result = match body.persona.as_deref().filter(|p| !p.trim().is_empty()) {
+        Some(persona) => {
+            // No vision fallback: a persona turn is grounded in a text profile, and a
+            // screenshot dropped into one is context for the *question*, not for the person.
+            let reasoner = picked.unwrap_or_else(|| st.chat.default_reasoner());
             st.chat
-                .respond_with(&body.messages, &body.tags, &reasoner)
+                .respond_as(&body.messages, &body.tags, &reasoner, persona)
                 .await
         }
-        _ => st.chat.respond(&body.messages, &body.tags).await,
+        None => match picked {
+            Some(reasoner) => {
+                st.chat
+                    .respond_with(&body.messages, &body.tags, &reasoner)
+                    .await
+            }
+            None => st.chat.respond(&body.messages, &body.tags).await,
+        },
     };
     match result {
         Ok(resp) => Json(resp).into_response(),

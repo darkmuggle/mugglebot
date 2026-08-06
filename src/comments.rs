@@ -343,7 +343,9 @@ mod tests {
             kind: "discussion".into(),
             path: None,
             state: None,
-            url: Some(format!("https://github.com/o/r/issues/1#issuecomment-{author}")),
+            url: Some(format!(
+                "https://github.com/o/r/issues/1#issuecomment-{author}"
+            )),
         }
     }
 

@@ -241,6 +241,35 @@ export interface BrowserInvestigation {
   attempts: number;
   created_at: string;
   updated_at: string;
+  /// Which tier answered: `grafana` read the series over the HTTP API, `browser` read a
+  /// rendered page in the operator's Chrome. The distinction is not cosmetic — only a
+  /// `grafana` reading carries series its figures were checked against.
+  method: "grafana" | "browser";
+  /// The series behind a `grafana` reading, as JSON. Null for a browser reading.
+  evidence: string | null;
+}
+
+/// The shape stored in `BrowserInvestigation.evidence` — see `src/grafana.rs`.
+export interface GrafanaEvidence {
+  rule: {
+    title: string;
+    thresholds: number[];
+    pending_for: string | null;
+  } | null;
+  series: {
+    ref_id: string;
+    labels: Record<string, string>;
+    points: [number, number][];
+    min: number;
+    max: number;
+    mean: number;
+    last: number;
+    first: number;
+  }[];
+  from_ms: number;
+  to_ms: number;
+  series_omitted: number;
+  shortfall: string | null;
 }
 
 // How a candidate relates to the incident. `cause` is still a hypothesis with a
@@ -475,6 +504,13 @@ export interface ToolCall {
 export interface ChatResponse {
   answer: string;
   tool_calls: ToolCall[];
+  /**
+   * The persona this turn was answered *as*.
+   *
+   * Set when talking to a simulated colleague. The pane must label it: the answer is a
+   * prediction, and a prediction rendered as an ordinary reply reads as a quotation.
+   */
+  persona?: string;
 }
 export interface ChatImage {
   media_type: string;
@@ -493,6 +529,8 @@ export interface ChatBubble {
   content: string;
   images: ChatImage[];
   tools?: ToolCall[];
+  /** Answered as this persona — rendered as a labelled simulation, not as a reply. */
+  persona?: string;
 }
 
 // Metadata row for the chat list (no messages).
@@ -752,4 +790,326 @@ export interface PrDiffReport {
    * request here" — which look identical from an empty `diffs`.
    */
   target_count: number;
+}
+
+// ---- personas ----------------------------------------------------------------
+//
+// The second axis: subjects are what work is about, personas are who it is with. A
+// persona never appears on the board — it is a lens read on request, against a subject
+// you picked.
+
+/**
+ * How an identity came to be attached to a persona.
+ *
+ * `proposed` matters to the UI: an unconfirmed guess contributes **no evidence** until
+ * it is confirmed, so it renders as a pending join rather than as a fact. A wrong join
+ * builds a profile from two people's writing and nothing in the output looks wrong.
+ */
+export type IdentityProvenance = "operator" | "exact" | "proposed";
+
+export interface PersonaIdentity {
+  source: string;
+  handle: string;
+  provenance: IdentityProvenance;
+  rationale: string | null;
+}
+
+export interface Persona {
+  slug: string;
+  display_name: string;
+  /** Your words, used verbatim by the model. */
+  role: string | null;
+  notes: string | null;
+  identities: PersonaIdentity[];
+  created_at: string;
+  updated_at: string;
+  harvested_at: string | null;
+  profiled_at: string | null;
+  evidence_watermark: string | null;
+}
+
+/** Counted from the evidence rows, never modelled — see `persona::Stats`. */
+export interface PersonaStats {
+  evidence: number;
+  by_source: [string, number][];
+  by_kind: [string, number][];
+  reviews: number;
+  approvals: number;
+  changes_requested: number;
+  commented: number;
+  median_excerpt_chars: number;
+  question_ratio: number;
+  inline_ratio: number;
+  first_seen: string | null;
+  last_seen: string | null;
+}
+
+/** One falsifiable claim about behaviour, with the excerpts behind it. */
+export interface PersonaTrait {
+  id: string;
+  persona: string;
+  facet: string;
+  claim: string;
+  confidence: number;
+  evidence: string[];
+  /**
+   * Excerpts that contradict the claim. Kept and shown rather than resolved: a claim
+   * contradicted a third of the time is *contested*, which is a different answer from a
+   * clean one and the more useful of the two.
+   */
+  counter_evidence: string[];
+  created_at: string;
+}
+
+/** Something the person actually wrote — the citation for a trait. */
+export interface PersonaEvidence {
+  id: string;
+  persona: string;
+  source: string;
+  kind: string;
+  subject_key: string | null;
+  url: string | null;
+  excerpt: string;
+  context: string | null;
+  state: string | null;
+  occurred_at: string;
+  ingested_at: string;
+}
+
+/**
+ * A claim verification refused, and why.
+ *
+ * Shown, not hidden: on a first pass this list is routinely longer than the profile, and
+ * a filter nobody can see is a filter nobody can debug.
+ */
+export interface PersonaRemoved {
+  facet: string;
+  claim: string;
+  why: string;
+}
+
+export interface PredictedPoint {
+  text: string;
+  path: string | null;
+  /** The line, copied verbatim from the patch. */
+  line: string | null;
+  /** Trait ids. A point citing none is dropped before it reaches here. */
+  because: string[];
+}
+
+export type PredictionKind = "code_review" | "issue_response" | "slack_engagement";
+
+export interface PersonaPrediction {
+  persona: string;
+  subject_key: string;
+  kind: PredictionKind;
+  /** The subject watermark this was built from, so a stale prediction is visibly stale. */
+  watermark: string;
+  /**
+   * Whether they would engage at all.
+   *
+   * The most useful field. "They will not look at this" is a real answer, and a predictor
+   * that always produces a review tells you nothing about who to ask.
+   */
+  would_engage: boolean;
+  confidence: number;
+  /** `approve` | `comment` | `request_changes` — a predicted code review only. */
+  recommendation: string | null;
+  summary: string;
+  points: PredictedPoint[];
+  /** Where the profile was too thin to support this. */
+  caveats: string[];
+  produced_by: string;
+  created_at: string;
+}
+
+/** A row in the personas list. */
+export interface PersonaSummary {
+  slug: string;
+  display_name: string;
+  role: string | null;
+  identities: PersonaIdentity[];
+  harvested_at: string | null;
+  profiled_at: string | null;
+  traits: number;
+  stats: PersonaStats;
+  walked_back_to: string | null;
+  backfill_complete: boolean;
+  /** The top few areas, for the row. */
+  sme?: SmeArea[];
+  /**
+   * Why the last harvest came back thin — a deferred GitHub budget, an unset org, items that
+   * could not be read. `null` is the good case.
+   *
+   * Rendered prominently, because "0 excerpts because they are quiet" and "0 excerpts because
+   * nothing was ever requested" are the same row without it.
+   */
+  harvest_note: string | null;
+}
+
+export interface PersonaList {
+  enabled: boolean;
+  personas: PersonaSummary[];
+}
+
+/** Everything one persona page renders. */
+export interface PersonaDetail {
+  persona: Persona;
+  traits: PersonaTrait[];
+  removed: PersonaRemoved[];
+  stats: PersonaStats;
+  caveats: string[];
+  /** See {@link PersonaSummary.harvest_note}. */
+  harvest_note: string | null;
+  /** Where their review activity concentrates, strongest first. */
+  sme: SmeArea[];
+  /** What you have told MuggleBot about them. Verbatim, never filtered. */
+  context: PersonaContextEntry[];
+  evidence: PersonaEvidence[];
+  predictions: PersonaPrediction[];
+}
+
+/**
+ * An area somebody's review activity concentrates in — the "who do I ask" axis.
+ *
+ * `depth === null` is **presence only**: they are demonstrably active here and nothing has
+ * established that their comments are specific. That must not render like established
+ * expertise — one says "ask them", the other says "they are around".
+ */
+/**
+ * Something you know about a person that no excerpt could supply.
+ *
+ * Asserted, not inferred — so it bypasses trait verification entirely and reaches the model
+ * verbatim. Distinct from `role`/`notes`: these accumulate and are individually removable.
+ */
+export interface PersonaContextEntry {
+  id: string;
+  persona: string;
+  kind: "text" | "url";
+  content: string;
+  /** For a URL, what was read from it. */
+  summary: string | null;
+  created_at: string;
+}
+
+export interface SmeArea {
+  area: string;
+  kind: "repo" | "component";
+  excerpts: number;
+  /** Of which review actions — the bar separating judging from talking. */
+  reviews: number;
+  share: number;
+  /** The `expertise` claim covering this area, when the model established one. */
+  depth: string | null;
+  depth_trait: string | null;
+  evidence: string[];
+}
+
+/** Somebody the signal log has seen who is not modelled yet. */
+export interface PersonaCandidate {
+  source: string;
+  handle: string;
+  /**
+   * A readable name from the Slack workspace directory — `Pavel Cholakov (@pavel)`.
+   *
+   * Absent for GitHub (the login already is the name) and when no directory is cached. A
+   * ranked list of opaque `U06T7445RHD` rows cannot be acted on, which is what this fixes.
+   */
+  label?: string;
+  is_bot?: boolean;
+  /** Every string this person is known by — used to pre-guess their handle on other sources. */
+  aliases?: string[];
+  /** How much you deal with them — the ranking key. */
+  interactions: number;
+  last_seen: string | null;
+  sample: string | null;
+  suggested_slug: string;
+}
+
+
+// ---- Slack thread analysis (src/thread.rs) ----------------------------------
+
+/// A queued or finished thread analysis. `verdict` is a JSON-encoded `ThreadVerdict`.
+export interface ThreadAnalysis {
+  id: string;
+  channel: string;
+  thread_ts: string;
+  url: string;
+  reply_count: number;
+  status: "pending" | "running" | "completed" | "failed";
+  verdict: string | null;
+  error: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface ThreadMessage {
+  id: string;
+  ts: string;
+  author: string;
+  user: string | null;
+  text: string;
+  is_you: boolean;
+  reactions: string[];
+}
+
+export interface ThreadParticipant {
+  handle: string;
+  display_name: string;
+  messages: number;
+  is_you: boolean;
+  /// Persona slug, or null when the engine has never modelled them — in which case no
+  /// claim about how they *usually* behave is supportable.
+  persona: string | null;
+  traits: string[];
+  role: string | null;
+}
+
+export interface ThreadFinding {
+  /// Participant handle, `__you__` for the operator, or null for the thread as a whole.
+  about: string | null;
+  stance: "credit" | "criticism" | "observation";
+  claim: string;
+  /// Message ids (`m3`), resolved server-side from whatever ordinals the model wrote.
+  cites: string[];
+  /// Persona trait ids the claim leaned on, lifted out of the prose. Their presence is the
+  /// difference between "he did this once" and "this is how he works".
+  from_traits: string[];
+  /// `claude` or `chatgpt`.
+  source: string;
+}
+
+/// A finding plus the other model's matching one, when both reached it independently.
+export interface Corroborated {
+  finding: ThreadFinding;
+  also: ThreadFinding | null;
+}
+
+export interface ThreadModelAnalysis {
+  model: string;
+  provider: string;
+  summary: string;
+  outcome: string | null;
+  findings: ThreadFinding[];
+  /// What the checker threw out, and why — an invented quote or a citation that resolved
+  /// to nothing.
+  dropped: { claim: string; why: string }[];
+}
+
+export interface ThreadVerdict {
+  thread: {
+    reference: { channel: string; thread_ts: string; focus_ts: string | null };
+    channel_name: string | null;
+    messages: ThreadMessage[];
+    participants: ThreadParticipant[];
+    truncated: number;
+  };
+  analyses: ThreadModelAnalysis[];
+  about_you: Corroborated[];
+  about_others: Corroborated[];
+  /// Findings exactly one model raised. Not noise, but not corroborated either.
+  contested: number;
+  /// Models that were asked and did not answer. Non-empty means nothing on the page could
+  /// have been corroborated, so the absence of "both models" says nothing about the findings.
+  failures: string[];
 }

@@ -76,6 +76,159 @@ impl BrowserRead {
     }
 }
 
+// ---- ThreadAnalyse -----------------------------------------------------------
+
+/// Read one Slack thread with two models and record what they said.
+///
+/// Keyed `{analysis id}` — the store row is already unique per `(channel, thread_ts)`, so the
+/// duplicate-suppression the key would give is where it belongs: in the table. Re-pasting a
+/// link whose thread has grown updates that row's reply count and re-queues it, which is the
+/// one case where re-running *should* cost something.
+pub struct ThreadAnalyse {
+    ops: Arc<WorkflowOps>,
+}
+
+impl ThreadAnalyse {
+    pub fn new(ops: Arc<WorkflowOps>) -> Self {
+        Self { ops }
+    }
+    pub const SCOPE: &'static str = scopes::THREAD;
+}
+
+#[restate_sdk::workflow]
+impl ThreadAnalyse {
+    /// Two attempts, not four. Each retry is two more metered model calls on a question the
+    /// operator asked once, and the failures worth retrying here (a Slack blip) recover on
+    /// the second go or not at all.
+    #[handler(invocation_retry_policy(max_attempts = 2))]
+    async fn run(&self, ctx: WorkflowContext<'_>) -> HandlerResult<Json<serde_json::Value>> {
+        let key = ctx.key().to_string();
+        super::tracked("ThreadAnalyse", &key, self.read(ctx)).await
+    }
+}
+
+impl ThreadAnalyse {
+    async fn read(&self, ctx: WorkflowContext<'_>) -> HandlerResult<Json<serde_json::Value>> {
+        let id = ctx.key().to_string();
+        let ops = self.ops.clone();
+        let value = ctx
+            .run(|| {
+                let ops = ops.clone();
+                let id = id.clone();
+                async move {
+                    let out = ops.thread_analyse(&id).await.map_err(thread_classify)?;
+                    Ok(Json(out))
+                }
+            })
+            .await?
+            .into_inner();
+        Ok(Json(value))
+    }
+}
+
+/// A channel the token cannot see, a thread that does not exist, or a missing scope will not
+/// start working on a retry — and the analyser has already written the reason onto the row,
+/// so the operator can read it. A model timing out is worth one more go.
+fn thread_classify(e: anyhow::Error) -> HandlerError {
+    let msg = format!("{e:#}");
+    let lower = msg.to_ascii_lowercase();
+    let terminal = [
+        "no such thread analysis",
+        "not_in_channel",
+        "channel_not_found",
+        "thread_not_found",
+        "message_not_found",
+        "missing_scope",
+        "no slack token",
+        "no models configured",
+        "does not look like a slack link",
+    ]
+    .iter()
+    .any(|m| lower.contains(m));
+    if terminal {
+        HandlerError::from(TerminalError::new(msg))
+    } else {
+        HandlerError::from(anyhow::anyhow!(msg))
+    }
+}
+
+// ---- GrafanaRead -------------------------------------------------------------
+
+/// Read the *numbers* behind an alert over Grafana's HTTP API.
+///
+/// Keyed by investigation id, like [`BrowserRead`], and sharing its queue — but in the
+/// `grafana` scope rather than `browser`, because the concurrency-1 limit there exists for
+/// the single Chrome and has nothing to say about an HTTP read.
+///
+/// This workflow does not fail when Grafana has nothing to show. That case escalates the
+/// same investigation to the browser tier and returns successfully, so an alert whose panel
+/// the token cannot query ends up read rather than retried four times and abandoned.
+pub struct GrafanaRead {
+    ops: Arc<WorkflowOps>,
+}
+
+impl GrafanaRead {
+    pub fn new(ops: Arc<WorkflowOps>) -> Self {
+        Self { ops }
+    }
+    pub const SCOPE: &'static str = scopes::GRAFANA;
+}
+
+#[restate_sdk::workflow]
+impl GrafanaRead {
+    #[handler(invocation_retry_policy(max_attempts = 4))]
+    async fn run(&self, ctx: WorkflowContext<'_>) -> HandlerResult<Json<serde_json::Value>> {
+        let key = ctx.key().to_string();
+        super::tracked("GrafanaRead", &key, self.read(ctx)).await
+    }
+}
+
+impl GrafanaRead {
+    async fn read(&self, ctx: WorkflowContext<'_>) -> HandlerResult<Json<serde_json::Value>> {
+        let id = ctx.key().to_string();
+        let ops = self.ops.clone();
+        let value = ctx
+            .run(|| {
+                let ops = ops.clone();
+                let id = id.clone();
+                async move {
+                    let out = ops.grafana_read(&id).await.map_err(grafana_classify)?;
+                    Ok(Json(out))
+                }
+            })
+            .await?
+            .into_inner();
+        Ok(Json(value))
+    }
+}
+
+/// A 5xx, a timeout, or a rate limit is **transient**: Grafana Cloud has bad minutes and
+/// retrying is exactly right. A 401/403/404 is terminal — a revoked token, a datasource the
+/// Viewer cannot see, or a rule that has since been deleted will not start working on the
+/// second attempt, and the operator needs to see the reason rather than four copies of it.
+///
+/// Note what is *absent*: "no series in the window" is not classified here at all, because
+/// it never reaches this function. That is an outcome, and it escalates to the browser.
+fn grafana_classify(e: anyhow::Error) -> HandlerError {
+    let msg = format!("{e:#}");
+    let lower = msg.to_ascii_lowercase();
+    let terminal = [
+        "grafana 401",
+        "grafana 403",
+        "grafana 404",
+        "no such investigation",
+        "has no parsed grafana links",
+        "is not configured",
+    ]
+    .iter()
+    .any(|m| lower.contains(m));
+    if terminal {
+        HandlerError::from(TerminalError::new(msg))
+    } else {
+        HandlerError::from(anyhow::anyhow!(msg))
+    }
+}
+
 /// No Chrome on the port, no `npx`, or an unparseable response is **transient** — the
 /// operator may simply not have started Chrome with `--remote-debugging-port` yet, and
 /// retrying is exactly right. A 404 or an auth wall is terminal: that link will never

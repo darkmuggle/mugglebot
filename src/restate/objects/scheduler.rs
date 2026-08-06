@@ -228,8 +228,21 @@ async fn dispatch(ops: &IngestOps, task: &str) -> u64 {
             }
         }
         BROWSER_QUEUE => {
-            for id in ops.pending_browser_investigations() {
-                started += submit(ops, "BrowserRead", &id, scopes::BROWSER).await;
+            // One queue, two tiers. Which workflow reads an investigation is a property of
+            // the row, so a Grafana read escalated to the browser is picked up here on the
+            // next pass without anything having to remember it.
+            for (id, method) in ops.pending_browser_investigations() {
+                started += if method == "grafana" {
+                    submit(ops, "GrafanaRead", &id, scopes::GRAFANA).await
+                } else {
+                    submit(ops, "BrowserRead", &id, scopes::BROWSER).await
+                };
+            }
+            // Hand-requested thread analyses ride the same sweep. They are operator-initiated
+            // so the latency that matters is seconds, and this queue already ticks at 15s —
+            // a separate scheduler for one more list would be a second thing to keep armed.
+            for id in ops.pending_thread_analyses() {
+                started += submit(ops, "ThreadAnalyse", &id, scopes::THREAD).await;
             }
         }
         COMMIT_POLL => {

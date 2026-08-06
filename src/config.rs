@@ -21,7 +21,10 @@ pub struct Config {
     pub reasoner: Reasoner,
     pub investigation: Investigation,
     pub assigned: Assigned,
+    pub personas: Personas,
     pub browser: Browser,
+    pub grafana: Grafana,
+    pub threads: Threads,
     pub mcp: Mcp,
     pub ui: Ui,
 }
@@ -128,6 +131,10 @@ pub struct RestateLimits {
     pub github: u32,
     /// One Chrome.
     pub browser: u32,
+    /// Grafana HTTP reads. Not the browser's 1 — that bound is about the single Chrome.
+    pub grafana: u32,
+    /// Thread analyses. One at a time: each is already two concurrent cloud calls.
+    pub thread: u32,
     pub checkout: u32,
     /// **One org crawl at a time.** Two would enumerate the same repos, pick the same
     /// uncarded ones in the same order, and clone them into the same directory — a corrupt
@@ -142,6 +149,8 @@ impl Default for RestateLimits {
             cloud_llm: 3,
             github: 4,
             browser: 1,
+            grafana: 3,
+            thread: 1,
             checkout: 2,
             repo_index: 1,
         }
@@ -434,6 +443,118 @@ impl Default for Assigned {
     }
 }
 
+/// Personas — the "who is this work with" axis.
+///
+/// A persona is a candid behavioural model of one colleague, built from things they actually
+/// wrote on GitHub, in Slack and in meetings, used to predict how they will respond to a pull
+/// request or an issue *before* you ask them. See [`crate::persona`] for the design, and in
+/// particular for why a persona is never a board subject.
+///
+/// Two things worth knowing before turning this on:
+///
+/// - **Personas are opt-in per person.** There is no setting that models everybody who has
+///   ever posted; you name the people you want modelled and MuggleBot proposes candidates
+///   ranked by how much you actually deal with them. Several hundred profiles of near
+///   strangers would bury the handful that matter.
+/// - **Nothing is ever posted.** A predicted review is a private rehearsal, on the same
+///   footing as every other critique here — see AGENTS.md → *Nothing is ever written back to
+///   GitHub*.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Personas {
+    /// Off by default. This is the one feature here that models *people* rather than work,
+    /// and it should be a decision rather than something that happens because the daemon
+    /// started.
+    pub enabled: bool,
+    /// How often a persona whose history walk has finished is re-harvested for new activity.
+    pub harvest_interval: String,
+    /// How often a persona still walking its history takes another step. Shorter than
+    /// `harvest_interval` because each step is one bounded page and the point is to finish;
+    /// the GitHub cost per step is a couple of searches plus a handful of comment reads.
+    pub backfill_interval: String,
+    /// Re-profile automatically when a harvest pass finds new material. Off means the profile
+    /// only refreshes when you press the button — which costs one local model pass per facet,
+    /// so it is a real choice on a busy machine.
+    pub auto_profile: bool,
+    /// Candidates offered by the "propose" pass. Ranked by how much you interact with them.
+    pub max_proposals: usize,
+    /// How far back to read somebody's GitHub history, in days.
+    ///
+    /// Three months is a pattern and finishes in a handful of passes. Two years was the first
+    /// value and it was wrong in a way that mattered: the backfill never visibly completed, so
+    /// a profile looked permanently half-built.
+    pub history_days: i64,
+    /// Refresh a persona when they are seen being active, rather than only on the timer.
+    ///
+    /// A profile that only refreshes twice a day is stale exactly when it matters — you are
+    /// about to ask somebody about the thing they were talking about ten minutes ago. Debounced,
+    /// and the Slack half it mostly picks up is a SQL query, so this is cheap.
+    pub refresh_on_engagement: bool,
+    /// Quiet period after their last observed activity before an engagement refresh runs.
+    pub engagement_debounce: String,
+    /// Which tier forms the opinion — distils the traits, **and predicts**.
+    ///
+    /// One setting for both, because they are the same contract and fail the same way: cited
+    /// claims in a fixed JSON shape. Leaving prediction on the local model while profiling moved
+    /// to Claude meant a profile built by a capable model was read by one that could not cite it.
+    ///
+    /// `cloud` (Claude, the default) | `code` (the triage tier) | `local` (on-device).
+    ///
+    /// This is the one place in MuggleBot where the default is **not** on-device, and it is a
+    /// deliberate reversal. Two reasons, in order:
+    ///
+    /// 1. **It has to be right to be worth anything.** A profile is a set of falsifiable claims
+    ///    each carrying citations, and the local 33B model could not hold that contract — it
+    ///    produced sensible claims and then mangled the citation ids, so verification correctly
+    ///    dropped every one. Every safeguard here (falsifiability, citation, counter-evidence,
+    ///    the removal report) still applies whichever tier answers; a stronger model simply
+    ///    clears the bar more often.
+    /// 2. **The single local lane is the wrong queue for it.** Ten facet passes over months of
+    ///    somebody's writing, behind the same permit the code index uses, is tens of minutes —
+    ///    and three of them stack when a force and an auto-refresh coincide.
+    ///
+    /// The privacy cost is real and worth stating plainly: **on any tier but `local`, harvested
+    /// excerpts of your colleagues' writing leave the machine.** They ride the subscription CLI
+    /// bridge, so nothing is metered, but "unmetered" is not "on-device". Set `local` to keep it
+    /// on the Mac and accept a thinner profile.
+    pub profile_tier: String,
+    /// Fetch a person's own Slack messages, rather than only re-reading the signal log.
+    ///
+    /// The log holds **notifications** — alert-channel posts, @-mentions of you, keyword hits.
+    /// Measured on a real workspace with `channels = []`: 194 Slack signals, every one from
+    /// `#cloud-alerts` or `#incidents`, so a colleague who posts all day had two excerpts to
+    /// their name. Ordinary conversation is where somebody's register and willingness to engage
+    /// actually show, and without this the Slack half of a profile is empty.
+    ///
+    /// **What it reads, plainly.** `search.messages` needs a *user* token (the same one
+    /// `[sources.slack] search_mentions` needs) and searches everything that token can see —
+    /// including private channels you are in and **your DMs with that person**. Nothing is read
+    /// that you could not already read, but a profile built from your DMs is a different thing
+    /// from one built from `#eng`, and that should be a choice. On with a user token stored;
+    /// harmless without one, since a bot token cannot search and the pass reports why.
+    pub slack_search: bool,
+    /// Pages of Slack search per pass; 100 matches a page.
+    pub slack_pages: u32,
+}
+
+impl Default for Personas {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            harvest_interval: "12h".into(),
+            backfill_interval: "10m".into(),
+            auto_profile: true,
+            max_proposals: 25,
+            history_days: 90,
+            refresh_on_engagement: true,
+            engagement_debounce: "2m".into(),
+            profile_tier: "cloud".into(),
+            slack_search: true,
+            slack_pages: 3,
+        }
+    }
+}
+
 /// Authenticated browser control. MuggleBot drives the operator's *existing*
 /// signed-in Chrome over the DevTools Protocol, through an agent CLI that has a
 /// browser MCP server attached — the only genuinely scriptable way to reach a
@@ -485,6 +606,75 @@ impl Default for Browser {
             url_patterns: vec!["grafana".into()],
             timeout: "5m".into(),
             max_attempts: 3,
+        }
+    }
+}
+
+/// Grafana as an evidence source: the numbers behind an alert, over the HTTP API.
+///
+/// Separate from [`Browser`] on purpose. The browser tier reads whatever the operator's
+/// SSO session can see and reports on a *rendered* page; this one asks Grafana for the
+/// series and reasons over figures that can be checked. They compose — see
+/// [`crate::grafana`] — with this tier tried first and the browser used when it comes up
+/// short.
+///
+/// The credential is the `grafana` secret, and it should be a **Viewer** service-account
+/// token: a Viewer cannot silence an alert or save a dashboard, so read-only is a property
+/// of the token rather than of an allowlist.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Grafana {
+    pub enabled: bool,
+    /// Root URL of the Grafana instance, e.g. `https://acme.grafana.net`. Also used to
+    /// recognise which links in an alert are worth parsing.
+    pub base_url: String,
+    /// How far back to look when the alert's own link carries no time range.
+    pub lookback: String,
+    /// Per-request timeout. A `/api/ds/query` over a wide range is the slow one.
+    pub timeout: String,
+    /// Hand the alert to the browser tier when Grafana cannot answer — no readable rule,
+    /// no dashboard queries, or no points in the window. Off means an unanswerable alert
+    /// simply records why.
+    pub fallback_to_browser: bool,
+}
+
+impl Default for Grafana {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            base_url: String::new(),
+            lookback: "6h".into(),
+            timeout: "60s".into(),
+            fallback_to_browser: true,
+        }
+    }
+}
+
+/// Slack thread analysis — asked for by hand, answered by two models.
+///
+/// Both are cloud tiers, which breaks the local-by-default rule on purpose: this only ever
+/// runs because the operator pasted a link, and the whole value is that two *different*
+/// models read the thread independently. One local model twice is one opinion twice.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Threads {
+    pub enabled: bool,
+    /// Set either to empty to drop that model from the panel. With one model everything
+    /// comes back uncorroborated, which is honest but much weaker.
+    pub claude_model: String,
+    pub chatgpt_model: String,
+}
+
+impl Default for Threads {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            claude_model: "claude-opus-5".into(),
+            // `gpt-5.6-sol`, not `gpt-5.6`: the plain name is rejected by Codex on a
+            // ChatGPT account ("model is not supported when using Codex with a ChatGPT
+            // account"), which the first live run found the hard way — the panel silently
+            // dropped to one model.
+            chatgpt_model: "gpt-5.6-sol".into(),
         }
     }
 }

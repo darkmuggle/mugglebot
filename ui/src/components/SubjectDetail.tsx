@@ -5,6 +5,7 @@ import {
   createSignal,
   For,
   onCleanup,
+  onMount,
   Show,
 } from "solid-js";
 import { api } from "../api";
@@ -19,6 +20,7 @@ import {
 } from "../state";
 import type {
   BrowserInvestigation,
+  GrafanaEvidence,
   Edge,
   IssueTriage,
   Memory,
@@ -28,6 +30,7 @@ import type {
   Signal,
 } from "../types";
 import { AttentionBadge } from "./Attention";
+import PersonaPredict from "./PersonaPredict";
 import Attempt, { prKey } from "./Attempt";
 import { displayTitle, KIND_LABEL, ref } from "./Board";
 import DiffPane from "./DiffPane";
@@ -52,6 +55,83 @@ const BROWSER_STATE: Record<BrowserInvestigation["status"], string> = {
   completed: "resolved",
   failed: "unseen",
 };
+
+/// The series behind a Grafana reading, folded.
+///
+/// Not a chart. A chart would put us back where the browser tier is — a picture you have
+/// to interpret — and the point of this tier is that the figures in the conclusion above
+/// were *checked* against these numbers. So this shows the numbers: what each series is,
+/// where it ran, and its sparkline as text. The alert threshold is called out, because
+/// "how far past it went" is the question, and any series that touched it is marked.
+function GrafanaSeries(props: { raw: string | null }) {
+  const parsed = createMemo<GrafanaEvidence | null>(() => {
+    if (!props.raw) return null;
+    try {
+      return JSON.parse(props.raw) as GrafanaEvidence;
+    } catch {
+      // Stored evidence that won't parse is a bug worth seeing, not worth crashing the
+      // page over — the conclusion above still stands on its own.
+      return null;
+    }
+  });
+  const threshold = () => parsed()?.rule?.thresholds?.[0] ?? null;
+  // Three significant figures, matching `grafana::num` — a figure shown differently here
+  // than in the conclusion would read as a discrepancy where there is none.
+  const fmt = (v: number) => {
+    if (!Number.isFinite(v)) return "n/a";
+    if (v === 0) return "0";
+    const mag = Math.abs(v);
+    const dp = mag >= 100 ? 0 : mag >= 10 ? 1 : mag >= 1 ? 2 : Math.min(6, Math.max(2, 2 - Math.floor(Math.log10(mag))));
+    return String(Number(v.toFixed(dp)));
+  };
+  const breached = (s: GrafanaEvidence["series"][number]) => {
+    const t = threshold();
+    return t !== null && s.max >= t;
+  };
+
+  return (
+    <Show when={parsed()?.series?.length}>
+      <details class="grafana-evidence">
+        <summary>
+          {parsed()!.series.length} series read from Grafana
+          <Show when={threshold() !== null}>
+            <span class="muted"> · threshold {fmt(threshold()!)}</span>
+          </Show>
+          <Show when={parsed()!.series_omitted > 0}>
+            <span class="muted"> · {parsed()!.series_omitted} more not read</span>
+          </Show>
+        </summary>
+        <For each={parsed()!.series}>
+          {(s) => (
+            <div class="series" classList={{ breached: breached(s) }}>
+              <div class="series-head">
+                <span class="series-ref">{s.ref_id}</span>
+                <span class="series-labels">
+                  {Object.entries(s.labels)
+                    .map(([k, v]) => `${k}=${v}`)
+                    .join(" ") || "(no labels)"}
+                </span>
+                <Show when={breached(s)}>
+                  <span class="series-breach" data-tip="This series reached the alert threshold">
+                    past threshold
+                  </span>
+                </Show>
+              </div>
+              <div class="series-stats">
+                <span>min {fmt(s.min)}</span>
+                <span>max {fmt(s.max)}</span>
+                <span>mean {fmt(s.mean)}</span>
+                <span>first {fmt(s.first)}</span>
+                <span>last {fmt(s.last)}</span>
+                <span class="muted">{s.points.length} pts</span>
+              </div>
+            </div>
+          )}
+        </For>
+      </details>
+    </Show>
+  );
+}
 
 const TRIAGE_STATE: Record<IssueTriage["status"], string> = {
   pending: "unseen",
@@ -179,6 +259,64 @@ function renderSummary(src: string): string {
         entries.length === 1 ? "evidence" : `evidence ×${entries.length}`;
       return `<span class="citation" data-tip="${detail}">${label}</span>`;
     },
+  );
+}
+
+/// A sticky index of the panels on the page.
+///
+/// Read from the DOM after render rather than declared alongside the panels, and that is the
+/// point: which panels exist depends on what has been analysed — a subject with no triage has no
+/// approaches, one with no diff has no verdict — and a hand-maintained list would drift from the
+/// render every time a panel gained a condition. Reading the headings back means the spine cannot
+/// disagree with the page.
+function SectionSpine() {
+  const [items, setItems] = createSignal<{ id: string; label: string }[]>([]);
+
+  /// Re-read on a beat rather than on every reactive change: panels appear as their resources
+  /// resolve, over a second or two, and the spine only needs to be right once they have.
+  const scan = () => {
+    const found: { id: string; label: string }[] = [];
+    document.querySelectorAll(".detail-grid > section").forEach((el, i) => {
+      const h = el.querySelector("h3");
+      if (!h) return;
+      const id = `sect-${i}`;
+      el.setAttribute("id", id);
+      // The heading's first clause. "The change — this pull request's diff and review" is a
+      // sentence; a spine needs a word.
+      const label = (h.textContent || "")
+        .split(/[—·(]/)[0]
+        .trim()
+        .slice(0, 22);
+      if (label) found.push({ id, label });
+    });
+    setItems(found);
+  };
+
+  onMount(() => {
+    scan();
+    const t = window.setInterval(scan, 1500);
+    onCleanup(() => window.clearInterval(t));
+  });
+
+  return (
+    <Show when={items().length > 2}>
+      <nav class="spine">
+        <For each={items()}>
+          {(s) => (
+            <button
+              class="spine-item"
+              onClick={() =>
+                document
+                  .getElementById(s.id)
+                  ?.scrollIntoView({ behavior: "smooth", block: "start" })
+              }
+            >
+              {s.label}
+            </button>
+          )}
+        </For>
+      </nav>
+    </Show>
   );
 }
 
@@ -463,6 +601,12 @@ export default function SubjectDetail(props: {
           dispatches are the answer to "did that button do anything", so they belong where
           the eye lands after pressing one — not in a panel further down. */}
       <DispatchStrip subjectKey={props.id} />
+
+      {/* The map. Seven panels over several screens with nine same-weight headings gave no
+          indication of what the page even contained — you landed on Summary with no way to know
+          there was a verdict, three proposed approaches, PR-fix candidates and predictions below.
+          Built from the panels actually present, so it never offers a section that is not there. */}
+      <SectionSpine />
 
       <Show when={thread()}>
         {(t) => (
@@ -993,6 +1137,27 @@ export default function SubjectDetail(props: {
 
             <section class="panel timeline-panel">
               <h3>Timeline</h3>
+              {/* Evidence, folded — the same rule the patches now follow. Two events cost 333px
+                  and six buttons on a real subject, above the verdict and the options, and a
+                  timeline is what you consult *after* deciding something looks wrong rather than
+                  the first thing you read. The count and the span are on the summary line, so
+                  folding it never hides that there is history to look at. */}
+              <details class="timeline-fold">
+                <summary>
+                  <span class="tl-count">
+                    {t().signals.length} event{t().signals.length === 1 ? "" : "s"}
+                  </span>
+                  <Show when={t().signals.length}>
+                    <span class="muted">
+                      {new Date(
+                        t().signals[t().signals.length - 1].occurred_at,
+                      ).toLocaleDateString()}
+                      {t().signals.length > 1
+                        ? ` – ${new Date(t().signals[0].occurred_at).toLocaleDateString()}`
+                        : ""}
+                    </span>
+                  </Show>
+                </summary>
               <ol class="timeline">
                 <For each={t().signals}>
                   {(s) => (
@@ -1119,6 +1284,7 @@ export default function SubjectDetail(props: {
                   Split selected ({selected().size})
                 </button>
               </div>
+              </details>
             </section>
 
             {/* What the browser read off any linked dashboard. MuggleBot drives
@@ -1136,6 +1302,20 @@ export default function SubjectDetail(props: {
                         >
                           {inv.status}
                         </span>
+                        {/* Which tier answered, because it changes how much the reading is
+                            worth: a `grafana` reading quotes series that were checked, a
+                            `browser` reading describes a rendered page and cannot be. */}
+                        <span
+                          class="read-via"
+                          classList={{ verified: inv.method === "grafana" }}
+                          data-tip={
+                            inv.method === "grafana"
+                              ? "Read from Grafana's API — every figure below was checked against the series"
+                              : "Read off the rendered page in your signed-in Chrome — figures are as the model saw them"
+                          }
+                        >
+                          {inv.method === "grafana" ? "series" : "page"}
+                        </span>
                         <a href={inv.url} target="_blank" rel="noreferrer">
                           open dashboard ↗
                         </a>
@@ -1145,12 +1325,16 @@ export default function SubjectDetail(props: {
                       </div>
                       <Show when={inv.status === "running"}>
                         <p class="muted">
-                          Reading the page in your authenticated Chrome…
+                          {inv.method === "grafana"
+                            ? "Querying the series behind this alert…"
+                            : "Reading the page in your authenticated Chrome…"}
                         </p>
                       </Show>
                       <Show when={inv.status === "pending"}>
                         <p class="muted">
-                          Queued — the browser worker takes one page at a time.
+                          {inv.method === "grafana"
+                            ? "Queued — resolving the alert rule, then its queries."
+                            : "Queued — the browser worker takes one page at a time."}
                         </p>
                       </Show>
                       <Show when={inv.error}>
@@ -1199,10 +1383,18 @@ export default function SubjectDetail(props: {
                           </Show>
                         }
                       >
-                        <div
-                          class="browser-findings md"
-                          innerHTML={renderMarkdown(inv.findings!)}
-                        />
+                        <>
+                          <div
+                            class="browser-findings md"
+                            innerHTML={renderMarkdown(inv.findings!)}
+                          />
+                          {/* The series the conclusion was drawn from, folded. This is what
+                              makes the reading checkable rather than merely plausible — but
+                              the conclusion is the answer and the numbers are what back it,
+                              so the same rule as the diff applies: unfold the judgement,
+                              fold the evidence. */}
+                          <GrafanaSeries raw={inv.evidence} />
+                        </>
                       </Show>
                     </div>
                   )}
@@ -1326,35 +1518,36 @@ export default function SubjectDetail(props: {
                       {t.patches.length === 1 ? "" : "es"}
                       <span class="muted"> — proposals, nothing applied</span>
                     </h4>
+                    {/* Each approach folded to its own headline. Three unfolded proposals ran
+                        to 2,638px — 48% of the page once the patches were folded — and choosing
+                        between three options means comparing them, which you cannot do when the
+                        first fills the screen. The head carries what the comparison turns on:
+                        what it does, how much work, how confident, and the mechanism, which is
+                        the check on whether the answer is real or generic. The rest — files,
+                        sketch, risk — is what you read *after* picking one. */}
                     <For each={t.patches}>
                       {(p, i) => (
-                        <div class="patch">
-                          <div class="patch-head">
+                        <details class="patch">
+                          <summary class="patch-head">
                             <span class="patch-index">{i() + 1}</span>
                             <span class="patch-title">{p.title}</span>
-                            <span class={`chip effort-${p.effort}`}>
-                              {p.effort}
-                            </span>
+                            <span class={`chip effort-${p.effort}`}>{p.effort}</span>
                             <span
                               class="rc-confidence"
                               data-tip="The model's confidence — a proposal, not a verdict"
                             >
                               {Math.round(p.confidence * 100)}%
                             </span>
-                          </div>
-                          {/* The mechanism is the check on ecosystem-appropriateness:
-                              "js-yaml parse" vs "ValidatingAdmissionPolicy" is the
-                              difference between a generic answer and a real one. */}
-                          <Show when={p.mechanism}>
-                            <div class="patch-mechanism">
-                              <span class="rc-label">via</span> {p.mechanism}
-                            </div>
-                          </Show>
+                            <Show when={p.mechanism}>
+                              <span class="patch-via" data-tip={p.mechanism!}>
+                                via {p.mechanism}
+                              </span>
+                            </Show>
+                          </summary>
                           <div class="patch-approach">{p.approach}</div>
                           <Show when={p.new_dependency}>
                             <div class="patch-dep">
-                              adds a new dependency:{" "}
-                              <code>{p.new_dependency}</code>
+                              adds a new dependency: <code>{p.new_dependency}</code>
                             </div>
                           </Show>
                           <Show when={p.files.length}>
@@ -1368,7 +1561,7 @@ export default function SubjectDetail(props: {
                               <span class="rc-label">risk</span> {p.risk}
                             </div>
                           </Show>
-                        </div>
+                        </details>
                       )}
                     </For>
                   </Show>
@@ -1666,6 +1859,11 @@ export default function SubjectDetail(props: {
               </section>
             </Show>
 
+            {/* Who this work is with. Placed after the analysis panels and before live
+                assist: it is a question you ask once you know what the change *is*, and the
+                answer is about people rather than about the code. */}
+            <PersonaPredict subjectKey={props.id} />
+
             <Show when={threadHints().length}>
               <section class="panel">
                 <h3>Live assist</h3>
@@ -1793,7 +1991,10 @@ export default function SubjectDetail(props: {
             </Show>
 
             <section class="panel">
-              <h3>Actions</h3>
+              {/* Named for what it does. "Actions" sent a reader to the bottom of a
+                  twelve-thousand-pixel page hunting for Ack and Snooze, which are in the
+                  header where you land. */}
+              <h3>Attach context</h3>
               <div class="form">
                 <label>Attach context</label>
                 <textarea

@@ -115,8 +115,13 @@ impl Triager {
             store: store.clone(),
             checkouts,
             github: token.and_then(|t| GithubClient::new(t).ok()),
-            pr_fixes: crate::prfix::PrFixFinder::new(store, coder.clone(), writer.clone(), "triage")
-                .with_analyst(analyst),
+            pr_fixes: crate::prfix::PrFixFinder::new(
+                store,
+                coder.clone(),
+                writer.clone(),
+                "triage",
+            )
+            .with_analyst(analyst),
             comments: CommentJudge::new(coder.clone()),
             coder,
             writer,

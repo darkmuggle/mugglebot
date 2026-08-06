@@ -32,8 +32,26 @@ const [redAlert, setRedAlert] = createSignal<RedAlert | null>(null);
 export interface ChatSeed {
   prompt: string;
   tags: string[];
+  /**
+   * Open the chat talking *as* this persona.
+   *
+   * Carried on the seed rather than as its own signal so the two hand-offs stay one
+   * mechanism: "open this subject in chat" and "talk to this person" both set a seed and
+   * switch views, and the Chat component consumes either shape once on mount.
+   */
+  persona?: string;
 }
 const [chatSeed, setChatSeed] = createSignal<ChatSeed | null>(null);
+
+/**
+ * The persona the board is currently reviewing *as*, or null for nobody.
+ *
+ * Shared state rather than a Board-local signal so it survives clicking into a subject and
+ * back: "review the board as Pavel" is a mode you work in for a few minutes, and losing it on
+ * every navigation would make it useless for the thing it is for — sweeping a lane to see where
+ * one person would push back.
+ */
+const [reviewAs, setReviewAs] = createSignal<string | null>(null);
 
 export {
   connected,
@@ -44,6 +62,8 @@ export {
   redAlert,
   chatSeed,
   setChatSeed,
+  reviewAs,
+  setReviewAs,
 };
 
 function upsertHint(h: Hint) {

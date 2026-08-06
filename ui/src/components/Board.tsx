@@ -1,7 +1,21 @@
-import { createMemo, createSignal, For, type JSX, Show } from "solid-js";
+import {
+  createMemo,
+  createResource,
+  createSignal,
+  For,
+  type JSX,
+  onCleanup,
+  Show,
+} from "solid-js";
 import { api } from "../api";
-import { isBusy, patchHandled, subjects } from "../state";
-import type { Signal, SubjectView } from "../types";
+import {
+  isBusy,
+  patchHandled,
+  reviewAs,
+  setReviewAs,
+  subjects,
+} from "../state";
+import type { PersonaPrediction, Signal, SubjectView } from "../types";
 
 /// The three lanes, in the order an operator works them.
 ///
@@ -96,7 +110,23 @@ export function displayTitle(t: SubjectView): string {
 /// rank for the router's benefit; a human reads every GitHub artifact as `#`.
 export function ref(t: SubjectView): string {
   const m = t.key.match(/^(?:[^/]+)\/([^/#!~]+)[#!~](\d+)$/);
-  return m ? `${m[1]}#${m[2]}` : t.key;
+  if (m) return `${m[1]}#${m[2]}`;
+  // A Slack key is `channel_id/thread_ts` — `C0744EUMHFF/1785793056.122949`, which is 29
+  // characters of nothing. The signals carry the channel *name* as a resolution key and the
+  // thread_ts is a unix time, so both halves can be said in a way a person can act on.
+  const slack = t.key.match(/^(C|D|G)[A-Z0-9]+\/(\d+)\.\d+$/);
+  if (slack) {
+    const channel = t.signals
+      .flatMap((s) => s.keys)
+      .find((k) => k.kind === "channel")?.value;
+    const when = new Date(Number(slack[2]) * 1000);
+    const stamp = Number.isNaN(when.getTime())
+      ? ""
+      : when.toLocaleDateString(undefined, { day: "numeric", month: "short" });
+    const where = channel ? `#${channel.replace(/^#/, "")}` : "slack";
+    return stamp ? `${where} · ${stamp}` : where;
+  }
+  return t.key;
 }
 
 /// Who last moved this, and how much there is of it.
@@ -127,19 +157,105 @@ function ago(iso: string): string {
 /// the attempts, both explanations, the AI facet strip — is in the click-in view
 /// already. Printing it here as well cost 533px a subject and put one card on the
 /// screen at a time, which is not a board.
-function Row(props: {
+/// The short type marker. The full words were a 102px fixed column stating a fact the ref
+/// sigil and the (former) group heading also stated — three copies, one fact.
+const TYPE_MARK: Record<SubjectView["rank"], string> = {
+  pull_request: "PR",
+  issue: "ISSUE",
+  slack_thread: "SLACK",
+  incident: "INC",
+};
+
+/// What the AI has established, as filled or hollow pills.
+///
+/// Documented in AGENTS.md as part of what the board leads with, and absent from it until now
+/// even though every field was already on the wire. A row of hollow pills is the "nobody has
+/// looked at this yet" signal, which was otherwise only discoverable by opening the subject and
+/// finding empty panels.
+///
+/// `⌂` counts passes run on this machine and `☁` ones that left it. Under local-by-default the
+/// second should be zero unless somebody pressed 2ND OPINION — which makes a non-zero `☁` worth
+/// seeing, and on a real board it was 1–2 on nearly every card with nothing saying so.
+/// One sentence naming what has and has not been done, for the strip's own tooltip — so the
+/// whole row is readable at once rather than dot by dot.
+function facetSummary(facets: { key: string; on: boolean; tip: string }[]): string {
+  const done = facets.filter((f) => f.on).map((f) => f.tip);
+  const not = facets.filter((f) => !f.on).map((f) => f.tip);
+  const parts = [];
+  if (done.length) parts.push(`done: ${done.join(", ")}`);
+  if (not.length) parts.push(`not yet: ${not.join(", ")}`);
+  return parts.join(" · ") || "nothing looked at yet";
+}
+
+function AiStrip(props: { t: SubjectView }) {
+  const d = () => props.t.attention.decorated;
+  const facets = () => [
+    { key: "sum", on: d().summary, tip: "summarised" },
+    { key: "tags", on: d().tags, tip: "tagged" },
+    { key: "dash", on: d().dashboard, tip: "dashboard read" },
+    { key: "rc", on: d().root_cause === "complete", tip: `root cause: ${d().root_cause ?? "not run"}` },
+    { key: "tri", on: d().triage === "complete", tip: `triage: ${d().triage ?? "not run"}` },
+    { key: "prs", on: d().prs_judged > 0, tip: `${d().prs_judged} pull request(s) judged` },
+  ];
+  return (
+    <span class="card-ai">
+      {/* Dots, not labels. Six 9px abbreviations — SUM TAGS DASH RC TRI PRS — was a row of
+          things to decode on every card, which is the clutter this rework exists to remove. The
+          filled/hollow signal is what carries the meaning ("has anything looked at this?"), and
+          a dot carries it without asking anyone to read it. The name is on hover. */}
+      <span class="facet-dots" data-tip={facetSummary(facets())}>
+        <For each={facets()}>
+          {(f) => <i class="facet-dot" classList={{ on: f.on }} data-tip={f.tip} />}
+        </For>
+      </span>
+      <Show when={d().local_passes}>
+        <span class="pass-count" data-tip="passes run on this machine">
+          ⌂{d().local_passes}
+        </span>
+      </Show>
+      <Show when={d().cloud_passes}>
+        <span
+          class="pass-count cloud"
+          data-tip="passes that left this machine — should be zero unless you asked for a second opinion"
+        >
+          ☁{d().cloud_passes}
+        </span>
+      </Show>
+    </span>
+  );
+}
+
+/// One subject as a card.
+///
+/// Each block answers exactly one question, in the order they get asked:
+///
+/// | Block | Question |
+/// |---|---|
+/// | head | what kind of thing is this, and how stale |
+/// | title | what is it |
+/// | why | why is it on my board |
+/// | headline | what is already known |
+/// | foot | what has the AI done, and what can I do |
+///
+/// The two things a card buys over the row it replaces: the **title can wrap** rather than
+/// ellipsing at a fixed column, and the **reason can be shown at all** — `attention.reason` was
+/// on the wire and had nowhere to go, so a lane said *Decide* without saying what was asking.
+function Card(props: {
   t: SubjectView;
   onOpen: (key: string) => void;
-  /// Triage the focused row from the keyboard. Working a lane shouldn't mean
-  /// travelling to a button on every row.
+  /// Triage the focused card from the keyboard. Working a lane shouldn't mean travelling to a
+  /// button on every card.
   onKey?: (t: SubjectView, key: string) => void;
   actions: (t: SubjectView) => JSX.Element;
+  verdict?: PersonaPrediction | null;
+  onReview?: (t: SubjectView) => void;
+  reviewing?: boolean;
 }) {
   const t = () => props.t;
   const open = () => props.onOpen(t().key);
   return (
-    <div
-      class={`lane-row rank-${t().rank}`}
+    <article
+      class={`card rank-${t().rank}`}
       classList={{
         acked: t().handled === "acknowledged",
         dim: t().handled === "resolved" || t().handled === "snoozed",
@@ -157,68 +273,137 @@ function Row(props: {
         props.onKey?.(t(), e.key);
       }}
     >
-      <span class="row-kind">{KIND_LABEL[t().rank]}</span>
-      <span class="row-mid">
-        <span class="row-titleline">
-          <span class="row-title">{displayTitle(t())}</span>
-          <span class="row-ref">{ref(t())}</span>
-          {/* Signed off, or blocked. On the board this replaces asking for attention:
-              once a human has said yes, the answer to "does this need me" has been
-              given, and the row should say so rather than sit in Decide.
-
-              Two states, not one. `gates_passed` is the stronger claim — approved *and*
-              nothing still failing — and it is the one an operator can act on by not
-              acting. A bare "approved" on a PR with red CI would read as finished when
-              it isn't, so the badge only makes the stronger claim when it's true. */}
-          <Show when={t().gates_passed}>
-            <span
-              class="badge badge-cleared"
-              data-tip="Approved, and nothing failing — nothing to do"
-            >
-              nothing to do
-            </span>
-          </Show>
-          <Show when={t().review_state === "approved" && !t().gates_passed}>
-            <span
-              class="badge badge-approved"
-              data-tip="Approved, but something is still failing"
-            >
-              approved
-            </span>
-          </Show>
-          <Show when={t().review_state === "changes_requested"}>
-            <span class="badge badge-blocked">changes requested</span>
-          </Show>
-          <Show when={t().live}>
-            <span class="badge badge-live">live</span>
-          </Show>
-          <Show when={isBusy(t().key)}>
-            <span class="badge badge-ai" data-tip="an AI pass is running or queued">
-              <span class="thinking-dots">
-                <i />
-                <i />
-                <i />
-              </span>
-            </span>
-          </Show>
-        </span>
-        {/* The one line the board is for. A subject with no usable summary says so
-            rather than showing a truncated event body dressed as a conclusion. */}
-        <Show
-          when={t().headline}
-          fallback={<span class="row-headline none">Not summarised yet</span>}
-        >
-          <span class="row-headline">{t().headline}</span>
+      <div class="card-head">
+        <span class="card-type">{TYPE_MARK[t().rank]}</span>
+        <span class="card-ref">{ref(t())}</span>
+        <span class="card-spacer" />
+        <Show when={t().gates_passed}>
+          <span class="badge badge-cleared" data-tip="Approved, and nothing failing">
+            nothing to do
+          </span>
         </Show>
-      </span>
-      <span class="row-who">{provenance(t())}</span>
-      <time class="row-when" data-tip={new Date(t().updated_at).toLocaleString()}>
-        {ago(t().updated_at)}
-      </time>
-      <span class="row-actions" onClick={(e) => e.stopPropagation()}>
-        {props.actions(t())}
-      </span>
-    </div>
+        <Show when={t().review_state === "approved" && !t().gates_passed}>
+          <span class="badge badge-approved" data-tip="Approved, but something is still failing">
+            approved
+          </span>
+        </Show>
+        <Show when={t().review_state === "changes_requested"}>
+          <span class="badge badge-blocked">changes requested</span>
+        </Show>
+        <Show when={t().live}>
+          <span class="badge badge-live">live</span>
+        </Show>
+        <Show when={isBusy(t().key)}>
+          <span class="badge badge-ai" data-tip="an AI pass is running or queued">
+            <span class="thinking-dots">
+              <i />
+              <i />
+              <i />
+            </span>
+          </span>
+        </Show>
+        <time class="card-when" data-tip={new Date(t().updated_at).toLocaleString()}>
+          {ago(t().updated_at)}
+        </time>
+      </div>
+
+      <h3 class="card-title">{displayTitle(t())}</h3>
+
+      {/* Why this is on the board. The single most valuable thing that was on the wire and
+          nowhere on screen: every card that needs you carries a reason — "you're in this one",
+          "critical" — and the lane heading alone could not say which. */}
+      <Show when={t().attention.needed}>
+        <p class="card-why">
+          <span class="why-label">needs you</span>
+          <Show when={t().attention.reason}>
+            <span class="why-reason">{t().attention.reason}</span>
+          </Show>
+        </p>
+      </Show>
+
+      {/* What is already known — and **only when it says something new.** The backend now
+          refuses a headline that answers a person, reports that a thing exists, or repeats the
+          title (`subject::headline_is_noise`), so a card with no line here is a card with
+          nothing to add rather than one with a placeholder. Four of nine cards on a real board
+          were carrying such a line. */}
+      <Show when={t().headline}>
+        <p class="card-headline">{t().headline}</p>
+      </Show>
+
+      {/* The predicted reaction, when reviewing the board as somebody. */}
+      <Show when={props.verdict}>
+        <p class="card-verdict">
+          <PersonaVerdict p={props.verdict!} />
+        </p>
+      </Show>
+
+      <div class="card-foot" onClick={(e) => e.stopPropagation()}>
+        <AiStrip t={t()} />
+        <Show when={t().tags.length}>
+          <span class="card-tags">
+            <For each={t().tags.slice(0, 3)}>{(g) => <i class="chip tag">{g}</i>}</For>
+            <Show when={t().tags.length > 3}>
+              <i class="muted" data-tip={t().tags.join(", ")}>
+                +{t().tags.length - 3}
+              </i>
+            </Show>
+          </span>
+        </Show>
+        <span class="card-spacer" />
+        {/* Always visible, not hover-only. The row this replaces hid its actions behind
+            `visibility: hidden`, which also hid `review as` — an affordance nobody could
+            discover by looking. */}
+        <span class="card-actions">
+          <Show when={props.onReview && !props.verdict}>
+            <button
+              disabled={props.reviewing}
+              data-tip="Predict what they would do about this, from their profile"
+              onClick={() => props.onReview!(t())}
+            >
+              {props.reviewing ? "…" : "review as"}
+            </button>
+          </Show>
+          {props.actions(t())}
+        </span>
+      </div>
+    </article>
+  );
+}
+
+/// One persona's predicted verdict, compressed to a chip.
+///
+/// Three states, and keeping them distinct is the whole value on a board row:
+///
+/// - **A verdict** (`request changes` / `comment` / `approve`) on a pull request — the thing you
+///   scanned the lane to find.
+/// - **Would not engage** — dimmed, because it is a real answer and not a missing one. On a
+///   sweep this is most rows, and it must not read as "not predicted yet".
+/// - **Engaged with something to say** on an issue or thread, where there is no verdict
+///   vocabulary — the count of points stands in for it.
+///
+/// `data-tip` carries the note they would write, so hovering answers "what would they say"
+/// without leaving the board. Anything more belongs in the detail view, where the citations and
+/// caveats are.
+function PersonaVerdict(props: { p: PersonaPrediction }) {
+  const p = () => props.p;
+  const label = () => {
+    if (!p().would_engage) return "wouldn't engage";
+    if (p().recommendation) return p().recommendation!.replace(/_/g, " ");
+    return p().points.length ? `${p().points.length} point(s)` : "would comment";
+  };
+  return (
+    <span
+      class="badge persona-verdict"
+      classList={{
+        quiet: !p().would_engage,
+        [`rec-${p().recommendation}`]: !!p().recommendation,
+      }}
+      data-tip={`${p().summary || "no note"}${
+        p().caveats.length ? ` — ${p().caveats[0]}` : ""
+      }`}
+    >
+      {label()}
+    </span>
   );
 }
 
@@ -265,14 +450,23 @@ export default function Board(props: {
   // different kinds of work: batching them means one pass over the PRs and one over the
   // issues, rather than switching mode on every row. The lane still decides *whether*
   // the work is urgent; type decides what doing it involves.
+  // A lane, sorted by type and then newest-first — **flat**, with no per-type heading.
+  //
+  // AGENTS.md argued for the heading on the grounds that reviewing a pull request and scheduling
+  // an issue are different work, so batching them means one pass over each. That reasoning holds
+  // and the *sort* is what delivers it; the heading only labelled the boundary. Measured on a
+  // real board it cost one heading per 1.8 cards — `DECIDE 3` over `Pull requests 1` over a
+  // single card — and each card already names its own type. So the batch survives and the
+  // chrome does not.
   const inLane = (id: Lane) => {
-    const rows = active().filter((t) => lane(t) === id);
-    return TYPES.map((ty) => ({
-      ...ty,
-      rows: rows
-        .filter((t) => t.rank === ty.rank)
-        .sort((a, b) => b.updated_at.localeCompare(a.updated_at)),
-    })).filter((g) => g.rows.length);
+    const order = new Map(TYPES.map((ty, i) => [ty.rank, i]));
+    return active()
+      .filter((t) => lane(t) === id)
+      .sort(
+        (a, b) =>
+          (order.get(a.rank) ?? 9) - (order.get(b.rank) ?? 9) ||
+          b.updated_at.localeCompare(a.updated_at),
+      );
   };
 
   const laneCount = (id: Lane) =>
@@ -329,6 +523,81 @@ export default function Board(props: {
     if (key === "s") triage(t, "snoozed");
   };
 
+  // ---- reviewing the board as somebody -------------------------------------
+
+  // Only personas with a profile. One without traits predicts nothing — the backend refuses,
+  // so offering it here would be a button that returns a refusal.
+  const [personas] = createResource(() => api.listPersonas());
+  const profiled = () => personas()?.personas.filter((p) => p.traits > 0) ?? [];
+  const personaName = (slug: string) =>
+    profiled().find((p) => p.slug === slug)?.display_name ?? slug;
+
+  // Every prediction this persona has made, in one call, keyed by subject. One request for the
+  // whole board rather than one per row — a hundred rows would otherwise be a hundred round
+  // trips to render a chip.
+  const [verdicts, { refetch: refetchVerdicts }] = createResource(
+    () => reviewAs(),
+    async (slug) => {
+      const rows = await api.predictionsBy(slug).catch(() => [] as PersonaPrediction[]);
+      const map: Record<string, PersonaPrediction> = {};
+      for (const p of rows) {
+        // Newest wins when a subject has both a code-review and an issue-response prediction.
+        const prev = map[p.subject_key];
+        if (!prev || p.created_at > prev.created_at) map[p.subject_key] = p;
+      }
+      return map;
+    },
+  );
+
+  const [reviewing, setReviewing] = createSignal<string[]>([]);
+  let poll: number | undefined;
+  onCleanup(() => window.clearInterval(poll));
+
+  /// Predict one row as the selected persona.
+  ///
+  /// Submitted as a workflow, so this returns before the answer exists — hence the poll. The
+  /// key is `{persona}@{kind}@{model}@{subject}@{watermark}`, so pressing it twice on an
+  /// unchanged subject is a refused duplicate rather than a second pass.
+  const review = async (t: SubjectView) => {
+    const slug = reviewAs();
+    if (!slug || reviewing().includes(t.key)) return;
+    setReviewing((r) => [...r, t.key]);
+    try {
+      await api.predictPersonas(t.key, [slug]);
+    } catch {
+      // Non-fatal: the row simply keeps its "review as" button.
+    }
+    // Poll until it lands, bounded — a pass that dies terminally must not poll forever.
+    window.clearInterval(poll);
+    let ticks = 0;
+    poll = window.setInterval(async () => {
+      ticks += 1;
+      await refetchVerdicts();
+      const done = !!verdicts()?.[t.key];
+      if (done || ticks > 30) {
+        window.clearInterval(poll);
+        setReviewing((r) => r.filter((k) => k !== t.key));
+      }
+    }, 4000);
+  };
+
+  /// Whether a row is worth offering a prediction for.
+  ///
+  /// Issues and pull requests — "review as" is a question about a change or a problem. A Slack
+  /// thread gets an engagement prediction in the detail view, but offering it on every alert row
+  /// would put a button on the noisiest half of the board for the least useful answer.
+  const predictable = (t: SubjectView) =>
+    t.rank === "issue" || t.rank === "pull_request";
+
+  const rowProps = (t: SubjectView) =>
+    reviewAs() && predictable(t)
+      ? {
+          verdict: verdicts()?.[t.key] ?? null,
+          onReview: review,
+          reviewing: reviewing().includes(t.key),
+        }
+      : {};
+
   return (
     <div class="board">
       <div class="board-head">
@@ -345,6 +614,23 @@ export default function Board(props: {
           </Show>
         </span>
         <span class="board-spacer" />
+        {/* Pick the person once, then sweep. Reviewing as somebody is a mode you work in for a
+            few minutes — per-row pickers would mean choosing them again on every card, and the
+            question ("where would Pavel push back?") is about the lane, not the row. */}
+        <Show when={profiled().length}>
+          <select
+            class="review-as"
+            classList={{ on: !!reviewAs() }}
+            value={reviewAs() ?? ""}
+            data-tip="Predict how one person would respond to each issue and pull request"
+            onChange={(e) => setReviewAs(e.currentTarget.value || null)}
+          >
+            <option value="">review as…</option>
+            <For each={profiled()}>
+              {(p) => <option value={p.slug}>as {p.display_name}</option>}
+            </For>
+          </select>
+        </Show>
         <button classList={{ on: showHandled() }} onClick={toggleHandled}>
           {showHandled() ? "Hide handled" : "Show handled"}
         </button>
@@ -368,7 +654,7 @@ export default function Board(props: {
       >
         <For each={LANES}>
           {(l) => {
-            const groups = createMemo(() => inLane(l.id));
+            const cards = createMemo(() => inLane(l.id));
             const count = createMemo(() => laneCount(l.id));
             return (
               // A lane with nothing in it is worth one line — "nothing is waiting on
@@ -381,61 +667,44 @@ export default function Board(props: {
                       <span class="lane-count">{count()}</span>
                     </Show>
                   </h2>
-                  <Show
-                    when={count()}
-                    fallback={<p class="lane-empty">{l.empty}</p>}
-                  >
-                    <For each={groups()}>
-                      {(g) => (
-                        <>
-                          {/* Only worth a heading when the lane actually holds more
-                              than one type — a lone "Issues" label over every row in
-                              an issues-only lane is a label with no alternative. */}
-                          <Show when={groups().length > 1}>
-                            <h3 class="type-head">
-                              {g.label}
-                              <span class="lane-count">{g.rows.length}</span>
-                            </h3>
-                          </Show>
-                          <For each={g.rows}>
-                            {(t) => (
-                              <Row
-                                t={t}
-                                onOpen={props.onOpen}
-                                onKey={rowKey}
-                                actions={(t) => (
-                                  <>
-                                    <Show
-                                      when={t.handled === "acknowledged"}
-                                      fallback={
-                                        <button
-                                          data-tip="Acknowledge — keeps it on the board, out of Decide (e)"
-                                          onClick={() =>
-                                            triage(t, "acknowledged")
-                                          }
-                                        >
-                                          Ack
-                                        </button>
-                                      }
-                                    >
-                                      <button onClick={() => reopen(t)}>
-                                        Un-ack
-                                      </button>
-                                    </Show>
+                  <Show when={count()} fallback={<p class="lane-empty">{l.empty}</p>}>
+                    {/* One grid, sorted by type then recency. The per-type headings are gone;
+                        the sort keeps the batch and each card names its own type. */}
+                    <div class="card-grid">
+                      <For each={cards()}>
+                        {(t) => (
+                          <Card
+                            t={t}
+                            onOpen={props.onOpen}
+                            {...rowProps(t)}
+                            onKey={rowKey}
+                            actions={(t) => (
+                              <>
+                                <Show
+                                  when={t.handled === "acknowledged"}
+                                  fallback={
                                     <button
-                                      data-tip="Snooze — off the board until it moves (s)"
-                                      onClick={() => triage(t, "snoozed")}
+                                      data-tip="Acknowledge — keeps it on the board, out of Decide (e)"
+                                      onClick={() => triage(t, "acknowledged")}
                                     >
-                                      Snooze
+                                      Ack
                                     </button>
-                                  </>
-                                )}
-                              />
+                                  }
+                                >
+                                  <button onClick={() => reopen(t)}>Un-ack</button>
+                                </Show>
+                                <button
+                                  data-tip="Snooze — off the board until it moves (s)"
+                                  onClick={() => triage(t, "snoozed")}
+                                >
+                                  Snooze
+                                </button>
+                              </>
                             )}
-                          </For>
-                        </>
-                      )}
-                    </For>
+                          />
+                        )}
+                      </For>
+                    </div>
                   </Show>
                 </section>
               </Show>
@@ -456,11 +725,13 @@ export default function Board(props: {
             when={handled().length}
             fallback={<p class="lane-empty">Nothing handled yet.</p>}
           >
+            <div class="card-grid">
             <For each={handled()}>
-              {(t) => (
-                <Row
+              {(t: SubjectView) => (
+                <Card
                   t={t}
                   onOpen={props.onOpen}
+                  {...rowProps(t)}
                   actions={(t) => (
                     // Named for what it undoes, so the operator can see which state
                     // they are leaving rather than reading "Reopen" against three.
@@ -478,6 +749,7 @@ export default function Board(props: {
                 />
               )}
             </For>
+            </div>
           </Show>
         </section>
       </Show>

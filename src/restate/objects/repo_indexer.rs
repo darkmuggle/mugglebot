@@ -170,10 +170,7 @@ impl RepoIndexer {
 
 impl RepoIndexer {
     /// The work half of a tick: index a batch, record what it achieved, announce it.
-    async fn index_once(
-        &self,
-        ctx: ObjectContext<'_>,
-    ) -> HandlerResult<Json<serde_json::Value>> {
+    async fn index_once(&self, ctx: ObjectContext<'_>) -> HandlerResult<Json<serde_json::Value>> {
         let repo = ctx.key().to_string();
         let indexer = self.indexer.clone();
         let known = (self.repos)();

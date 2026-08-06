@@ -35,6 +35,9 @@ pub struct IngestOps {
     pub analyst: Arc<Analyst>,
     pub context: Arc<ContextManager>,
     pub browser: Arc<BrowserDriver>,
+    /// Reads the numbers behind an alert over Grafana's API, before the browser reads the
+    /// page. See [`crate::grafana`].
+    pub grafana: Arc<crate::grafana::Reader>,
     pub events: broadcast::Sender<Event>,
     /// The watchers themselves, by name. They live in the daemon because they hold
     /// the HTTP clients and the tokens; the object addresses them by name.
@@ -49,6 +52,12 @@ pub struct IngestOps {
     pub github: Option<crate::github::GithubClient>,
     /// The org the repo index crawls, and where the managed contexts tree lives.
     pub org: String,
+    /// Whether a modelled person being active should refresh their persona.
+    ///
+    /// Checked here rather than in the persona object so a disabled feature costs nothing at
+    /// all on the poll path — the alternative is an ingress call per burst that exists only to
+    /// be ignored.
+    pub personas_on_engagement: bool,
     pub contexts_dir: std::path::PathBuf,
 }
 
@@ -65,6 +74,13 @@ pub struct PollOutcome {
     pub routed: Vec<(String, String)>,
     /// Slack messages to classify per-message, off the poll path.
     pub to_classify: Vec<String>,
+    /// Personas whose modelled person was seen being active in this batch.
+    ///
+    /// Slugs, deduped, and routing information only — the *write* happens in the persona's own
+    /// exclusive handler, exactly like `routed`. Sending it from here would put a write to a
+    /// persona inside the `Watcher` object's handler, which is serialized per watcher rather
+    /// than per persona.
+    pub engaged: Vec<String>,
     pub new_count: usize,
     pub refreshed: usize,
     pub resolved: usize,
@@ -230,11 +246,22 @@ impl IngestOps {
         Ok(n)
     }
 
-    /// Investigations waiting for the browser. The workflow id is the claim now, so
-    /// this is a plain read rather than a claim-a-row transaction.
-    pub fn pending_browser_investigations(&self) -> Vec<String> {
+    /// Investigations waiting to be read, as `(id, method)`. The workflow id is the claim
+    /// now, so this is a plain read rather than a claim-a-row transaction.
+    ///
+    /// The method rides along because the two tiers are submitted to different workflows in
+    /// different scopes: one Chrome means concurrency 1, and a Grafana HTTP read has no
+    /// such constraint.
+    pub fn pending_browser_investigations(&self) -> Vec<(String, String)> {
         self.store
             .list_browser_investigations_pending()
+            .unwrap_or_default()
+    }
+
+    /// Thread analyses waiting to run.
+    pub fn pending_thread_analyses(&self) -> Vec<String> {
+        self.store
+            .list_thread_analyses_pending()
             .unwrap_or_default()
     }
 
@@ -307,7 +334,12 @@ impl IngestOps {
             // Enrich a linked-out Slack message with a summary of the (public) page
             // it points at, before storing.
             crate::enrich::slack_links(&mut sig, &self.context).await;
-            crate::enrich::queue_dashboard_investigation(&mut sig, &self.store, &self.browser);
+            crate::enrich::queue_dashboard_investigation(
+                &mut sig,
+                &self.store,
+                &self.browser,
+                &self.grafana,
+            );
             // Queue triage for an assigned issue *before* the insert-dedup check:
             // the signal is re-emitted every poll and only inserts once, but a
             // triage that previously failed (or whose code has moved on) still
@@ -331,6 +363,25 @@ impl IngestOps {
                         .unwrap_or_default();
                     if sig.source == Source::Slack && !is_env_alert(&sig) {
                         out.to_classify.push(sig.id.clone());
+                    }
+                    // Somebody we model was just active. A profile that only refreshes on a
+                    // twelve-hour timer is stale exactly when it matters — you are about to
+                    // ask them about the thing they were talking about ten minutes ago. The
+                    // lookup is an indexed read on `persona_identities`, so this costs nothing
+                    // on the poll path even when nothing is modelled.
+                    if let Some(actor) = sig
+                        .actor
+                        .as_deref()
+                        .filter(|a| !a.trim().is_empty())
+                        .filter(|_| self.personas_on_engagement)
+                    {
+                        match self.store.persona_for_actor(sig.source, actor) {
+                            Ok(Some(slug)) if !out.engaged.contains(&slug) => {
+                                out.engaged.push(slug)
+                            }
+                            Ok(_) => {}
+                            Err(e) => debug!("persona lookup for actor '{actor}': {e:#}"),
+                        }
                     }
                     let _ = self.events.send(Event::Signal(sig.clone()));
                     out.routed.push((sig.id.clone(), routed));
@@ -438,12 +489,12 @@ impl IngestOps {
 
     /// The newest attributed signal id, which versions the `RootCause` workflow key:
     /// nothing new has arrived → same key → nothing to re-investigate.
+    ///
+    /// Delegates to [`crate::store::Store::subject_watermark`], which is where it lives now
+    /// that `Explain` and `PersonaPredict` version their keys on the same phrase — two
+    /// implementations of "has this subject moved?" would eventually disagree.
     pub fn watermark(&self, subject_key: &str) -> String {
-        self.store
-            .signals_for_subject(subject_key)
-            .ok()
-            .and_then(|sigs| sigs.last().map(|s| s.id.clone()))
-            .unwrap_or_else(|| "empty".into())
+        self.store.subject_watermark(subject_key)
     }
 
     pub fn push_board(&self) {

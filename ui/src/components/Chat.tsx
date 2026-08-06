@@ -2,7 +2,7 @@ import { createEffect, createResource, createSignal, For, onMount, Show } from "
 import { api } from "../api";
 import { looksLikeMarkdown, renderMarkdown } from "../markdown";
 import { chatSeed, setChatSeed } from "../state";
-import type { ChatBubble, ChatImage, ChatTurn, Tag } from "../types";
+import type { ChatBubble, ChatImage, ChatTurn, PersonaList, Tag } from "../types";
 
 // UI-facing provider labels; the id is what the backend maps to a reasoner.
 //
@@ -58,6 +58,17 @@ export default function Chat() {
     if (list && list.length && !list.includes(model())) setModel(list[0]);
   });
 
+  // Who you are talking to. Empty = MuggleBot; a slug = a simulated colleague.
+  //
+  // Only personas with a profile are offered. Talking to an empty one would be the model
+  // improvising a person out of its own priors, which the backend refuses anyway — offering
+  // it here would just be a button that returns a refusal.
+  const [persona, setPersona] = createSignal<string>("");
+  const [personas] = createResource(() => api.listPersonas());
+  const profiled = () => (personas() as PersonaList | undefined)?.personas.filter((p) => p.traits > 0) ?? [];
+  const personaName = (slug: string) =>
+    profiled().find((p) => p.slug === slug)?.display_name ?? slug;
+
   // Routing tags attached to this chat. Their tag-matched memory and context are
   // folded in server-side as grounding, so the agent starts with the relevant
   // runbooks/lessons already in hand.
@@ -78,6 +89,7 @@ export default function Chat() {
     setHistory([]);
     setInput(seed.prompt);
     setSelectedTags(seed.tags);
+    if (seed.persona) setPersona(seed.persona);
   });
 
   const attach = async (files: FileList | null) => {
@@ -98,6 +110,9 @@ export default function Chat() {
     setInput("");
     setPending([]);
     setSelectedTags([]);
+    // Cleared: a new conversation should be with MuggleBot unless you say otherwise, or a
+    // persona picked once silently frames every later question.
+    setPersona("");
   };
 
   const openChat = async (id: string) => {
@@ -146,8 +161,23 @@ export default function Chat() {
     setBusy(true);
     try {
       const turns: ChatTurn[] = next.map((b) => ({ role: b.role, content: b.content, images: b.images }));
-      const resp = await api.chat(turns, provider(), model() || undefined, selectedTags());
-      const withReply = [...next, { role: "assistant" as const, content: resp.answer, images: [], tools: resp.tool_calls }];
+      const resp = await api.chat(
+        turns,
+        provider(),
+        model() || undefined,
+        selectedTags(),
+        persona() || undefined,
+      );
+      const withReply = [
+        ...next,
+        {
+          role: "assistant" as const,
+          content: resp.answer,
+          images: [],
+          tools: resp.tool_calls,
+          persona: resp.persona,
+        },
+      ];
       setHistory(withReply);
       persist(withReply);
     } catch (e) {
@@ -184,7 +214,17 @@ export default function Chat() {
           <Show when={history().length} fallback={<div class="empty">Ask about the board, a service, or drop a screenshot.</div>}>
             <For each={history()}>
               {(b) => (
-                <div class={`bubble ${b.role}`}>
+                <div class={`bubble ${b.role}`} classList={{ persona: !!b.persona }}>
+                  {/* Labelled, always. A simulated colleague rendered as an ordinary
+                      assistant reply reads as a quotation, and this is a prediction. */}
+                  <Show when={b.persona}>
+                    <div
+                      class="bubble-persona"
+                      data-tip="A prediction from their profile — not something they said"
+                    >
+                      {personaName(b.persona!)} · predicted
+                    </div>
+                  </Show>
                   <Show when={b.tools?.length}>
                     <div class="tool-trace">
                       <For each={b.tools}>{(t) => <span class="chip">{t.tool}</span>}</For>
@@ -214,6 +254,20 @@ export default function Chat() {
 
         <div class="chat-input">
           <div class="model-bar">
+            <Show when={profiled().length}>
+              <select
+                class="persona-picker"
+                classList={{ on: !!persona() }}
+                value={persona()}
+                data-tip="Talk to a simulated colleague instead of MuggleBot — a rehearsal, grounded in their profile"
+                onChange={(e) => setPersona(e.currentTarget.value)}
+              >
+                <option value="">MuggleBot</option>
+                <For each={profiled()}>
+                  {(p) => <option value={p.slug}>as {p.display_name}</option>}
+                </For>
+              </select>
+            </Show>
             <select value={provider()} onChange={(e) => setProvider(e.currentTarget.value)}>
               <For each={PROVIDERS}>{(p) => <option value={p.id}>{p.label}</option>}</For>
             </select>
@@ -271,7 +325,11 @@ export default function Chat() {
             </label>
             <textarea
               class="grow"
-              placeholder="Message MuggleBot…"
+              placeholder={
+                persona()
+                  ? `Rehearse with ${personaName(persona())}…`
+                  : "Message MuggleBot…"
+              }
               value={input()}
               onInput={(e) => setInput(e.currentTarget.value)}
               onKeyDown={(e) => {

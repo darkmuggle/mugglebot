@@ -422,7 +422,9 @@ mod tests {
 
     fn store() -> SubjectStore {
         let cfg = crate::config::RestateConfig::default();
-        SubjectStore::new(&cfg, Arc::new(Ingress::new(&cfg)))
+        // Offline: a real ingress on the default config points at the developer's own running
+        // Restate server. See `Ingress::offline`.
+        SubjectStore::new(&cfg, Arc::new(Ingress::offline()))
     }
 
     fn subject(key: &str, rank: SubjectRank) -> Subject {

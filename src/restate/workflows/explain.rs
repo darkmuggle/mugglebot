@@ -1162,10 +1162,7 @@ mod tests {
         let g = ctx();
         assert!(!g.pull_requests.is_empty(), "fixture must have attempts");
         let pr = sections_for("restatedev/nuon-byoc!140", &g);
-        assert!(
-            !pr.iter().any(|s| s.contains("The attempts")),
-            "{pr:#?}"
-        );
+        assert!(!pr.iter().any(|s| s.contains("The attempts")), "{pr:#?}");
         // On the issue those PRs attempt, it is exactly what the reader wants.
         let issue = sections_for("restatedev/nuon-byoc#1200", &g);
         assert!(

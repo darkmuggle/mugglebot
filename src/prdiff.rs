@@ -497,7 +497,10 @@ impl DiffReader {
         let shape = {
             let mut s = String::new();
             for f in &report.files {
-                s.push_str(&format!("  {} (+{} -{})\n", f.path, f.additions, f.deletions));
+                s.push_str(&format!(
+                    "  {} (+{} -{})\n",
+                    f.path, f.additions, f.deletions
+                ));
             }
             s
         };
@@ -741,6 +744,61 @@ pub fn batch_files(
     out
 }
 
+/// A stored diff rendered for a model prompt: the summary, the file list, then the patches.
+///
+/// Lives here rather than at the caller because the shape it walks is here, and because
+/// `patch_omitted` has to be reported rather than rendered as an empty patch — a file whose
+/// patch was dropped to stay inside [`PERSIST_PATCH_BUDGET`] and a binary file with no patch
+/// look identical otherwise, and one of those is about the change.
+///
+/// Largest patch first, matching [`batch_files`]: a render that has to be truncated should
+/// lose the one-line files rather than the seven-thousand-character one.
+pub fn render_for_prompt(report: &DiffReport) -> String {
+    let mut out = format!(
+        "{} PR #{}: {} file(s), +{} -{}{}\n",
+        report.repo,
+        report.number,
+        report.file_count,
+        report.additions,
+        report.deletions,
+        if report.truncated {
+            " (file list truncated)"
+        } else {
+            ""
+        }
+    );
+    if let Some(summary) = report.summary.as_deref().filter(|s| !s.trim().is_empty()) {
+        out.push_str(&format!("\nWhat it does: {summary}\n"));
+    }
+    if let Some(error) = report.error.as_deref() {
+        out.push_str(&format!("\nThe diff could not be read: {error}\n"));
+        return out;
+    }
+
+    out.push_str("\nFiles:\n");
+    for f in &report.files {
+        out.push_str(&format!("- {} (+{} -{})", f.path, f.additions, f.deletions));
+        if f.patch_omitted {
+            out.push_str(" [patch not stored]");
+        } else if f.patch.is_none() {
+            out.push_str(" [binary or no patch]");
+        }
+        out.push('\n');
+    }
+
+    let mut with_patches: Vec<&DiffFile> =
+        report.files.iter().filter(|f| f.patch.is_some()).collect();
+    with_patches.sort_by_key(|f| std::cmp::Reverse(f.patch.as_deref().map_or(0, str::len)));
+    for f in with_patches {
+        out.push_str(&format!(
+            "\n--- {} ---\n{}\n",
+            f.path,
+            f.patch.as_deref().unwrap_or("")
+        ));
+    }
+    out
+}
+
 /// Claims a diff cannot support, matched on the phrasing models use to make them.
 ///
 /// A review of a few hunks cannot know whether a symbol is used elsewhere, exported, tested,
@@ -822,8 +880,8 @@ pub fn split_model(version: &str) -> (&str, Option<(&str, &str)>) {
             // a model that does not exist.
             let spec = spec.split_once('#').map_or(spec, |(head, _)| head);
             match spec.split_once('/') {
-            // A provider with no model, or a model with no provider, is not enough to build a
-            // reasoner — fall back to the default tier rather than guessing one half.
+                // A provider with no model, or a model with no provider, is not enough to build a
+                // reasoner — fall back to the default tier rather than guessing one half.
                 Some((p, m)) if !p.is_empty() && !m.is_empty() => (watermark, Some((p, m))),
                 _ => (watermark, None),
             }
@@ -1303,7 +1361,10 @@ mod tests {
             "two unreviewable and one repeat should go: {comments:?}"
         );
         assert!(comments[0].note.starts_with("The use of REGISTRY"));
-        assert_eq!(comments[0].anchor.as_deref(), Some("+        panic!(\"too many\");"));
+        assert_eq!(
+            comments[0].anchor.as_deref(),
+            Some("+        panic!(\"too many\");")
+        );
     }
 
     /// The two notes below are verbatim from `restate-cloud!1255` — the pair that scored
@@ -1672,7 +1733,10 @@ mod tests {
         // The watermark comes back byte-identical. This is the part that matters: it is the
         // freshness token stored on the pull request's object, and a decorated one would make
         // every re-dispatch look like new activity.
-        assert_eq!(split_model(&version), (wm, Some(("claude", "claude-opus-5"))));
+        assert_eq!(
+            split_model(&version),
+            (wm, Some(("claude", "claude-opus-5")))
+        );
 
         // An undecorated key is the automatic path, and must stay untouched.
         assert_eq!(split_model(wm), (wm, None));

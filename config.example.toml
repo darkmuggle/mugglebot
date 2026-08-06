@@ -38,6 +38,10 @@ local_llm = 1                  # one Ollama, one GPU — a queue of one beats fo
 cloud_llm = 3                  # every concurrent invocation is real money
 github = 4
 browser = 1                    # one Chrome, one investigation
+grafana = 3                    # Grafana HTTP reads — not the browser's 1, which is about
+                               # the single Chrome, not about concurrency being unsafe
+thread = 1                     # one thread analysis at a time: each is already two
+                               # concurrent cloud calls
 checkout = 2                   # disk-bound; per-repo limit keys prevent a corrupt tree
 repo_index = 1                 # one org crawl at a time: two would clone the same repo
                                # into the same directory
@@ -276,6 +280,81 @@ retriage_on_new_commits = true
 # the local pass can't produce a usable answer.
 check_open_prs = true
 
+[personas]
+# Personas — the "who is this work with" axis.
+#
+# A persona is a candid behavioural model of one colleague, built from things they
+# actually wrote: their GitHub reviews and comments, their Slack messages, and the
+# lines attributed to them in meeting transcripts. You then select personas against
+# an issue or pull request and get a prediction — the review they would leave, the
+# comment they would write, or that they would not engage at all — and you can talk
+# to one in the chat pane to rehearse a conversation before having it.
+#
+# Three things worth knowing before turning it on.
+#
+# It is OPT-IN PER PERSON. There is no setting that models everybody who has ever
+# posted. You name the people you want modelled; MuggleBot proposes candidates
+# ranked by how much you actually deal with them, and creating each one is a
+# decision. Several hundred profiles of near strangers would bury the handful that
+# matter — and would be doing it to real people without anyone asking.
+#
+# Every claim CITES EVIDENCE or is dropped. A profile is a set of falsifiable
+# claims about observable behaviour ("asks for a test on anything touching the
+# store, in 4 of 6 reviews"), each carrying the excerpts it came from, with
+# contradicting excerpts kept and shown. Claims that are unfalsifiable — generic
+# virtue, or anything inferred about somebody's health, politics or personal life —
+# are removed deterministically, and what was removed is shown to you. That is what
+# makes the thing candid AND useful: "cares about quality" predicts nothing, and a
+# model told to be candid without the constraint writes fluent character
+# assassination instead of a prediction.
+#
+# NOTHING IS EVER POSTED. A predicted review is a private rehearsal, on the same
+# footing as every other critique here. See README → "Nothing is ever written back
+# to GitHub".
+#
+# Cost: harvesting Slack and meeting evidence is a SQL query over signals already
+# ingested — free. GitHub evidence is a couple of searches plus a handful of comment
+# reads per pass, at background priority, so it defers to the watchers. Profiling is
+# one LOCAL model pass per facet (ten of them), which is minutes on the single GPU
+# lane; nothing about a persona is sent to a cloud model unless you pick one by name
+# in the pane.
+enabled = false
+history_days = 90              # how far back to read their GitHub history
+harvest_interval = "12h"       # re-check a persona whose history walk has finished
+backfill_interval = "10m"      # one more page of history, while there is history left
+auto_profile = true            # re-distil when a pass finds new material
+max_proposals = 25             # candidates offered by "propose"
+# Refresh a persona when they are seen being active, rather than only on the timer.
+# A profile that refreshes twice a day is stale exactly when it matters — you are
+# about to ask somebody about the thing they were talking about ten minutes ago.
+# Debounced, and the Slack evidence it mostly picks up is a SQL query, so it is cheap.
+refresh_on_engagement = true
+engagement_debounce = "2m"
+# Which tier forms the opinion — distils the traits AND predicts. One setting for
+# both: they are the same cited-JSON contract and fail the same way.
+#   cloud (Claude, default) | code (the triage tier) | local
+#
+# THE ONE DEFAULT HERE THAT IS NOT ON-DEVICE, and it was earned rather than chosen. The
+# local 33B model produced sensible claims and then mangled the citation ids, so
+# verification correctly dropped every one; once that was fixed it asserted 100%
+# confidence, duplicated claims across facets, and returned nothing usable for half of
+# them. Every safeguard still applies whichever tier answers — falsifiability, citations,
+# counter-evidence, the confidence ceiling, the removal report. A stronger model simply
+# clears the bar more often.
+#
+# The cost, plainly: on any tier but `local`, harvested excerpts of your colleagues'
+# writing LEAVE THE MACHINE. They ride the subscription CLI bridge, so nothing is
+# metered — but "unmetered" is not "on-device". Set `local` to keep it on the Mac and
+# accept a thinner profile.
+profile_tier = "cloud"
+
+# Link BOTH handles. The same person is terse on GitHub and chatty in Slack, and the
+# profile tracks each separately — a persona with one source predicts one register.
+# A Slack name or @handle is resolved against the workspace directory (cached from
+# `users.list`), so you do not need to go and find the U… id. Slack evidence is a SQL
+# query over signals already ingested and lands immediately; GitHub evidence is API
+# calls walked back over `history_days`. If you only fill in one, fill in Slack.
+
 [browser]
 # Authenticated browser control. When a Slack alert links to a dashboard, the page
 # behind that link holds the actual numbers — and it's behind SSO. MuggleBot drives
@@ -306,6 +385,63 @@ allowed_tools = [
 url_patterns = ["grafana"]     # link substrings worth opening a browser for
 timeout = "5m"                 # hard cap per investigation, then the agent is killed
 max_attempts = 3               # give up on a link after this many failures
+
+[grafana]
+# Grafana as an EVIDENCE source: the numbers behind an alert, over the HTTP API.
+#
+# The tier above reads a rendered page and reports what it looked like. This one asks
+# Grafana for the series. It works because a Grafana alert's Slack message links the
+# ALERT RULE, and from that one UID the whole chain is available:
+#
+#   /api/v1/provisioning/alert-rules/{uid}  the rule: its queries, its threshold, its `for`
+#   /api/dashboards/uid/{uid}               panel definitions, and the queries behind them
+#   /api/ds/query                           those queries, over the alert's own window
+#
+# So the conclusion quotes figures you can go and re-run, and every figure in it is
+# checked against the series it came from — a figure that can't be found is marked rather
+# than printed as fact. That check is the reason this tier exists.
+#
+# CREDENTIAL: store a `grafana` secret (config page, or `mugglebot secret set grafana`).
+# Use a VIEWER service-account token. A Viewer cannot silence an alert or save a
+# dashboard, so read-only here is a property of the token rather than of an allowlist —
+# which is stricter than the browser tier can be.
+#
+# NOT A WATCHER. Grafana raises its alerts into Slack and Slack is already ingested, so
+# polling Grafana too would open a second subject for a firing this system already has.
+# It is asked a question when an alert arrives and is silent otherwise.
+enabled = false
+base_url = ""                  # e.g. "https://acme.grafana.net" — also used to spot its links
+lookback = "6h"                # window when the alert's own link carries no from/to
+timeout = "60s"                # per request; /api/ds/query over a wide range is the slow one
+fallback_to_browser = true     # hand the alert to [browser] when Grafana can't answer
+
+[threads]
+# Slack thread analysis, asked for by hand. Paste a thread permalink; two models read it
+# independently and you get told what happened — including your own part in it.
+#
+# WHY TWO MODELS. One model asked "was anyone unreasonable here" gives a confident answer
+# either way, and its particular flavour of agreeableness is a property of that model. So
+# Claude and ChatGPT get the same prompt, at the same time, neither seeing the other's
+# answer, and the result marks which findings BOTH reached. There is deliberately no third
+# pass to reconcile them: a synthesiser turns two analyses into one, which smooths away the
+# disagreement — the most informative thing on the page.
+#
+# WHAT KEEPS IT HONEST. Every finding must cite the messages it rests on, and any text the
+# model puts in quotes is checked character-by-character against the thread; a finding
+# quoting words nobody wrote is discarded and shown as discarded. "Nothing to call out" is
+# an explicitly allowed answer, because a prompt that demands criticism manufactures it.
+#
+# This uses cloud models, breaking the local-by-default rule on purpose: it only runs
+# because you pasted a link, and the whole value is two DIFFERENT readers. One local model
+# twice is one opinion twice.
+#
+# Needs the `slack` credential (to read the thread) and [sources.slack].user_id — without
+# the latter nothing can be attributed to you, which is the section you came for.
+# Set either model to "" to drop it from the panel; findings then come back uncorroborated.
+enabled = false
+claude_model = "claude-opus-5"
+chatgpt_model = "gpt-5.6-sol"   # NOT "gpt-5.6": Codex on a ChatGPT account rejects that
+                               # name, and the panel then quietly drops to one model
 
 [mcp]
 stdio = true

@@ -154,6 +154,14 @@ impl Watcher {
 
         // Per-message Slack tagging, off the poll path so a model call never stalls
         // ingest.
+        // Tell each modelled person's object they were active. Debounced on the other side,
+        // so a burst of nine messages is one refresh — see `Persona::engaged`.
+        for slug in &outcome.engaged {
+            ctx.object_client::<super::persona::PersonaClient>(slug.clone())
+                .engaged()
+                .send();
+        }
+
         if !outcome.to_classify.is_empty() {
             let ops = self.ops.clone();
             let ids = outcome.to_classify.clone();

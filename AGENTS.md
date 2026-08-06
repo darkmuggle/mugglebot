@@ -147,6 +147,12 @@ actually working on becomes a fourth with none of the activity attached.
 subject, and they're what the reasoner reads for background — but nothing is
 keyed on them.
 
+> **`person` gets modelled anyway — as a lens, not a card.** See _Personas_. A persona is
+> keyed by a person and is emphatically not a subject: it never reaches the board, never owns
+> a signal, and is only read when you ask for it against a subject you picked. The property
+> that disqualifies `person` as a subject — long-lived, shared, spanning a whole career — is
+> the same property that makes it a good lens.
+
 The reason is the same in every case: they're long-lived and shared. `main` is
 shared by every CI run in a repository forever; a Restate Cloud environment is
 shared by months of alerts; `#alerts` is shared by everything that ever fired.
@@ -401,10 +407,13 @@ per workflow id, journalled step by step, and interactive while they run.
 | `Merge` | `{a}+{b}` | collapse two subjects: re-attribute signals, rewrite edges, carry artifacts |
 | `ContextIngest` | `{context-id}@{etag\|mtime}` | fetch → normalize → summarize → embed → store |
 | `Explain` | `{subject}@{watermark}+{critiques}` | distil a subject *and everything under it* into something readable |
+| `PersonaProfile` | `{slug}@{evidence-watermark}` | distil one colleague's harvested writing into cited, falsifiable traits |
+| `PersonaPredict` | `{slug}@{kind}@{produced_by}@{subject}@{watermark}` | predict what that person would do about this subject |
 
 The `RepoIndexer` object (one per repo) drives the code index — see _The code index_. It's an
 object rather than a workflow because indexing is recurring, resumable, and needs a cursor;
-a workflow instance per batch would be lifecycle for nothing.
+a workflow instance per batch would be lifecycle for nothing. The `Persona` object (one per
+modelled person) is one for exactly the same three reasons — see _Personas_.
 
 Each ends by calling back into the subject: `Issue::apply_artifact(ArtifactRef)`.
 The workflow writes the bulky output to SQLite and hands the object a pointer and
@@ -944,6 +953,58 @@ of the surrounding handler never re-pays for it. That is a *second* cache layer
 below the completion cache — the journal stops a retry from re-paying, the SQLite
 cache stops a *new* invocation from re-paying.
 
+### A headline has to earn its line
+
+The board gives each card one line for what is already known, and that line is only worth having
+if it says something the title did not. Measured on a real board, **four of nine did not**: a
+conversational reply where the summariser answered the person it was reading rather than
+describing the work (*"You're correct in your understanding of the document titled…"*), a
+content-free status (*"The PR has been assigned and is currently being worked on"*), a
+restatement of the title, and a `Not summarised yet` placeholder. Worse, the *most* informative
+headline on that board — a DynamoDB/WorkOS blocker — was the one clipped, because every headline
+was competing for the same width.
+
+So `subject::headline_is_noise` refuses three shapes, deterministically, in the projection that
+derives the headline:
+
+1. **A reply, not a summary** — matched on conversational openers, anchored to the start, because
+   "you" mid-sentence is ordinary English.
+2. **Process, not substance** — a narrow list of empty phrases rather than a shape. A blanket
+   rejection of anything opening *"The PR…"* would have thrown away the best headline on the
+   board, so the list names the phrases.
+3. **A restatement of the title** — tested as a strict *subset*: if every significant word is
+   already in the title, it adds nothing. Subset rather than a similarity score, because
+   *"Move the Auth metadata service out of Lambda"* against the title *"auth metadata service:
+   migrate to k8s deployment"* shares most of its words and is still worth reading — `lambda` is
+   new. A threshold would have cut it.
+
+A refused headline yields `None`, so the card simply has no such line — which is quieter and more
+honest than a placeholder, and makes the board *shorter and more informative at once*.
+
+### A summary loses the blocks that say nothing
+
+The same filter that keeps dead headlines off a board card also runs over the *blocks* of a
+summary in the detail view. On a real subject, two of four were dead weight:
+
+- `Status: The PR has been assigned and is currently under review by @pcholakov` — the
+  content-free shape [`headline_is_noise`] already refuses on the board, at full length.
+- `Impact:` then restated it almost word for word.
+
+What was left — who wants what, and what happens next — is the part worth reading, and it was
+third and fourth on the page. So each block goes through the headline filter, plus one rule that
+only makes sense *between* blocks: a block adding no significant word to the blocks already kept
+is a restatement of them.
+
+Two safeguards, because a filter that empties a panel is worse than the noise it removes. If
+**every** block would be dropped the original stands — the filter is wrong about that summary, not
+the subject. And a summary with fewer than two labelled blocks is left exactly alone: a
+deterministic summary has no blocks to reason about, and guessing at sentence level would cut real
+content.
+
+It is a **display** transform. The stored summary keeps every word, because the explainer, the
+prompts and the MCP surface read it and they are not the detail view — the same division
+`headline_for` already has.
+
 ### What the board reports: attention, and whether the AI looked
 
 Handled-ness (`Open` / `Seen` / `Acked` / `Snoozed` / `Resolved`) is bookkeeping.
@@ -1207,6 +1268,108 @@ on the port, no `npx`, or an unparseable response is **transient** and retried
 under the workflow's policy; a 404 or an auth wall is a `TerminalError` recorded
 on the subject. A permanently unreachable link stops consuming the slot instead of
 spinning forever.
+
+## Grafana — the numbers behind the alert, and whether the conclusion is real
+
+The browser tier above reads the *page* behind an alert link. It works on anything SSO can
+reach, and what it returns is a description of a rendered chart — which means a figure in
+its conclusion was read off a picture and cannot be checked. For a system whose every other
+analysis anchors itself to something reproducible (`prdiff` to line anchors, `explain` to
+dossier facts, `persona` to cited excerpts), that is the one loose thread.
+
+So there is a second tier that asks Grafana instead. It exists because of a specific
+property of these alerts, measured rather than assumed: **204 of 291 ingested Slack signals
+are Grafana alerts**, they are Grafana's *own* unified-alerting notifications, and the Slack
+message therefore links the **alert rule**. From that one UID the whole chain is available:
+
+| | |
+|---|---|
+| `GET /api/v1/provisioning/alert-rules/{uid}` | the rule: its queries, its threshold, its `for` |
+| `GET /api/dashboards/uid/{uid}` | panel definitions, and the queries behind them |
+| `POST /api/ds/query` | those queries executed over the alert's own window — **actual series** |
+
+Run over all 164 Grafana alerts in a real store, every one yields a rule UID, 157 a
+dashboard, 157 a time range, 146 a tenant.
+
+### Read-only as a property of the credential
+
+The token is a **Viewer** service account. Silencing an alert, editing a dashboard, saving a
+panel: not things a Viewer can do. The browser tier needs three layers to promise the same
+thing — an allowlist, `--strict-mcp-config`, and a prompt — and only the first actually
+enforces it. Here there is nothing to get right.
+
+### It is not a watcher, and that is the point
+
+Grafana raises its alerts *into Slack*, and Slack is already ingested. A Grafana watcher
+would open a second subject for a firing this system already has — the notification-dedup
+rule, applied one source earlier. Grafana is asked a question when an alert arrives and is
+silent otherwise.
+
+### Three links, and only one of them is safe to follow
+
+A Grafana Slack notification carries `/alerting/grafana/{uid}/view` (the rule),
+`/d/{uid}/{slug}` (the dashboard), and **`/alerting/silence/new`** (a form for silencing the
+alert). Across 25 consecutive real alerts, every single message carried all three.
+
+The pre-existing selection was "the first URL containing `grafana`". That resolved to the
+**rule page** in 25 of 25 — the rule's definition rather than its graph — and it was one
+Slack template change from handing a browser agent a silence form. It is now a parser: the
+silence link is refused by name, the rule UID and the dashboard's window are folded from
+*different* links of the same message, and the browser tier gets `/d/` when it gets anything.
+
+### The escaped ampersand
+
+Slack escapes `&` in message text, so a stored dashboard link reads
+`?from=1785862320000&amp;to=1785865956924`. Grafana reads the second parameter of that as
+one named `amp;to` and ignores it, so **the alert's own time range was being silently
+dropped** — and not only here: the browser tier navigates to the same URL, which means every
+dashboard it has ever been pointed at opened on the panel's default window rather than the
+window the alert was about.
+
+Found by running the parser over the corpus rather than over a fixture: it recovered a time
+range from 11 of 164 alerts, which is not a plausible number for alert links. After
+unescaping at ingest, 157. Template variables went from 0 to 146 and panel ids from 0 to 42,
+because they sit after the first `&`.
+
+That is the argument for the corpus test existing at all. The hand-written fixture passed
+throughout — a fixture is written from what the format is *supposed* to look like, which is
+precisely the assumption that was wrong.
+
+### Every figure is checked against the series
+
+`grafana::verify` is the tier's reason for being. A model handed twenty series will produce
+a confident paragraph either way; the difference between evidence and a plausible paragraph
+about evidence is whether the figures in it can be found again. So each line of the
+conclusion is checked against every value, extreme, and threshold it was given.
+
+Three details make the check usable rather than noise:
+
+- **One formatter.** `grafana::num` renders the numbers in the prompt *and* parses the ones
+  in the answer. Two formatters would make a correctly-copied figure unverifiable, which is
+  worse than not checking.
+- **1% tolerance.** A figure rounded one digit differently is not a fabrication.
+- **Percentages and small integers are exempt.** A stated `40%` is arithmetic over figures
+  that are present, and `3` is a count. Flagging those trains the reader to ignore the marks.
+
+A flagged line is **marked, not deleted** — the opposite of `persona::verify`, deliberately.
+There, an unsupported trait is a claim about a person and silence is the safe failure. Here
+the line may well be right and the reader can see the series it was drawn from, so removing
+it would be destroying an answer to protect a check.
+
+### Failure has three outcomes, not two
+
+- **Transient** — a 5xx, a timeout, a 429. Retried; Grafana Cloud has bad minutes.
+- **Terminal** — 401/403/404. A revoked token, a datasource the Viewer cannot see, a deleted
+  rule. Recorded once with the reason rather than retried four times.
+- **Insufficient** — no readable rule, no dashboard queries, no points in the window. This
+  is *not* an error, and this is the part worth noticing: it hands the same investigation to
+  the browser tier and returns successfully. An alert whose graph lives on a panel the token
+  cannot query ends up read, by the tier that can read it.
+
+The two tiers share one queue and one row. One row per signal is the invariant worth keeping
+— it is what stops a re-emitted alert being re-queued on every poll — so escalation is a
+*transition* on that row rather than a second row, and the reason Grafana came up short
+survives on the record even after the browser succeeds.
 
 ## Assigned issues — the work you own, triaged against the code
 
@@ -1906,6 +2069,34 @@ parameter appears.
 - `set_subject_tags(subject, tags)` — pin a subject's tags and re-run its
   analysis (mirrors relation pins).
 
+**Tools (personas — read/write, writes gated):**
+
+Every write here is to MuggleBot's own store; nothing reaches GitHub or Slack. See _Personas_.
+
+- `list_personas()` — the modelled people, their identities, and how much evidence is
+  behind each profile. A `proposed` identity is rendered as unconfirmed because it
+  contributes no evidence until confirmed.
+- `get_persona(slug)` — the profile in full: traits with their citations, **the claims
+  verification refused and why**, the counted stats, evidence excerpts, and recent
+  predictions.
+- `propose_personas(limit?)` — people in the signal log who are not modelled yet, ranked by
+  how much you interact with them. Proposes only.
+- `create_persona(display_name, slug?, role?, notes?, identities?)` — start modelling
+  somebody. `role` and `notes` are your words and are used verbatim, outside the trait model.
+- `update_persona(slug, …)` / `delete_persona(slug)` — edit the asserted parts; delete takes
+  the harvested excerpts, traits and predictions with it. Traits are deliberately **not**
+  editable: a hand-written trait would be an uncited claim in a store whose whole contract is
+  that every claim carries a citation.
+- `link_persona_identity(slug, source, handle)` / `unlink_persona_identity(source, handle)` —
+  manage the handles. Linking a handle another persona owns fails, naming it.
+- `harvest_persona(slug)` — gather now rather than at the next tick.
+- `refresh_persona_profile(slug, force?)` — submit `PersonaProfile`. `submitted: false`
+  means the profile is already current, which is a success.
+- `predict_persona(subject, personas[], kind?, provider?, model?)` — submit `PersonaPredict`
+  for each named person. `kind` defaults from the subject, because offering a code review on
+  a Slack thread produces one about a diff that does not exist.
+- `list_predictions(subject | slug)` — stored predictions, with their watermark.
+
 **Tools (secrets — write-only):**
 
 - `list_secrets()` — names, whether set, and when last changed. **Never values.**
@@ -2010,10 +2201,544 @@ Both explanations are stored (the table is keyed `(subject_key, produced_by)`) a
 rendered, labelled `LOCAL` and `CLOUD`. Replacing the local one would throw away the thing the
 second opinion is being compared against.
 
+## Personas — modelling the people, not just the work
+
+Everything above models **what** the work is. A persona models **who it is with**: one
+colleague, candidly, from things they actually wrote — so that before you ask them, you
+can ask what they will probably say.
+
+The question this answers is one every engineer already answers badly, from memory: *will
+Pavel block this? does anyone care about the docs change? is this the kind of thing Ben
+raises in Slack rather than on the PR?* MuggleBot has already ingested the evidence — every
+review they left, every message they posted, every meeting they spoke in — and was throwing
+away the one axis it was best placed to model.
+
+### A persona is not a subject
+
+The data model says `person` is a resolution key and context, **never** a subject, because a
+person spans a career and keying work on one collapses unrelated work into a single card.
+That rule is untouched. A persona:
+
+- **never appears on the board** and never competes for attention;
+- **never owns a signal** — attribution still climbs to an issue, PR, Slack thread or
+  incident, exactly as before;
+- is read **only when the operator asks**, against a subject they picked.
+
+It is a *lens*, not a card. And what made `person` unsuitable as a subject — long-lived,
+shared, spanning everything — is exactly what makes it a good lens: a profile is supposed
+to accumulate over a career. `Persona` is a virtual object for the same reasons
+`RepoIndexer` is one (recurring, resumable, cursored), and like it, holds only the process;
+the profile is in SQLite because it is the expensive artifact.
+
+### Opt-in, one person at a time
+
+Personas exist only for people the operator names. The alternative — mint one for every
+actor the signal log has ever seen — would build several hundred profiles of near
+strangers, and the ones that mattered would be indistinguishable from the noise. It would
+also be doing it to real people without anybody asking.
+
+So the proposal pass **ranks candidates by how much you actually interact with them** and
+proposes; creating each persona is a decision. Bots are filtered on the name, which errs
+toward including people: a missed bot is a junk row in a list you are already reading, and
+a missed person is invisible.
+
+### Identity: the failure that looks like nothing
+
+One human is three or four handles — a GitHub login, a Slack user id, a Granola speaker
+label — and nothing upstream joins them. A **wrong** join is the worst failure this feature
+has: a persona built from two people's writing predicts neither of them, and nothing about
+the output looks wrong.
+
+So identity is explicit and provenanced. `operator` (you said so) and `exact` (an upstream
+join — a Slack profile naming the login) are **confirmed**; a similarity guess is
+`proposed` and **contributes no evidence at all** until you confirm it. The table's primary
+key is `(source, handle)`, not `(persona, source, handle)`, so one login cannot belong to
+two personas — and the attempt fails loudly, naming the other persona, rather than silently
+re-pointing.
+
+**Both handles, not one.** A persona is created with a field per source rather than a source
+dropdown, because a persona with one source is half a persona: the same colleague is terse on
+GitHub and chatty in Slack, and the two registers are what makes a prediction about
+*engagement* possible at all. A dropdown makes the one-source case the default by accident,
+which is exactly what happened — and the `link_persona_identity` tool existed from the first
+commit with nothing calling it, so a persona born with a GitHub login could never gain a Slack
+one. The persona panel now carries that control, next to the stats, because "0 excerpts" is
+most often "no Slack handle linked" and the fix should be within reach of the symptom.
+
+**The Slack directory.** Slack identifies people by opaque id, and the normalized `raw` a signal
+carries keeps only channel/ts/flags — so the signal log knows *that* `U063RCBCFSP` said
+something and nothing about who that is. Fine for attribution, useless for letting somebody say
+"model Pavel". So `users.list` is read once and cached in `slack_users`, refreshed lazily on the
+operator paths that need it. Three things it buys:
+
+- **Readable proposals.** A ranked list of `U06T7445RHD (95 interactions)` cannot be acted on.
+- **Typing a name instead of an id.** `Pavel Tcholakov` resolves to `U063RCBCFSP` on the way in,
+  and the rationale records that it did. Exact alias match only — the aliases are the id, the
+  `@handle`, the real and display names, and the **email local part**, which is very often the
+  GitHub login. Fuzzy matching here would produce a *confident wrong join*, the one failure the
+  identity model exists to prevent.
+- **Automation identified rather than guessed.** `harvest::propose` filters bots on the name,
+  which cannot see through an opaque id — on this workspace the single highest-ranked candidate
+  was `U06T7445RHD`, the incident.io bot, with 95 interactions of alerts. The directory's own
+  `is_bot` is an upstream fact. The name filter stays as the fallback for a workspace with no
+  directory, where a missed bot is a junk row rather than an invisible person.
+
+### Candour, and what it has to mean
+
+The point of a persona is prediction, and a profile that reads like a performance review
+predicts nothing. "Thoughtful and collaborative" is true of nearly everyone and tells you
+nothing about whether this reviewer will block your PR. That is the same failure the PR
+review hit when one prompt asked a small model to read a large diff, decide, and justify at
+once — a fluent answer carrying no information.
+
+So a profile is a set of **traits**, each of which must be:
+
+1. **Falsifiable** — about observable behaviour, checkable against their next message.
+   "Blocks on missing tests for anything touching storage" is a claim; "cares about
+   quality" is not.
+2. **Cited** — carrying the verbatim excerpts it was built from. A trait with no evidence
+   is *dropped*, not shown with low confidence.
+3. **Contestable** — contradicting excerpts are kept as counter-evidence and displayed. A
+   reviewer who blocks on tests four times in seven is **contested**, and asserting the
+   pattern flatly would be the more confident and less useful answer.
+
+That is what candour buys. With the constraint in place the model says the unflattering
+thing when the evidence supports it — "does not read past the first file of a large diff"
+is real, citable and useful. Without it, a model told to be candid about somebody's *biases*
+produces fluent character assassination, which is both unkind and, for a prediction tool,
+**unfalsifiable and therefore worthless**.
+
+`persona::verify` enforces all three deterministically, the same way `prdiff::unverifiable`
+drops review findings the diff cannot support and `explain::verify` strips claims the
+dossier cannot support. Prompt hardening was not enough in either of those cases and is not
+enough here. Four rules fire in order — no evidence; a cited id we do not hold (a
+hallucinated citation is worse than none, because it looks checkable); evidence of the wrong
+*kind* for the facet (a Slack claim cited to GitHub reviews is answering from the wrong
+material); and an unfalsifiable claim shape. Then confidence is **capped** rather than
+filtered: one excerpt can never exceed 50%, and counter-evidence pulls the number down in
+proportion.
+
+The unfalsifiable list has two halves. **Generic virtue** ("strong engineer", "collaborative",
+"cares about quality") is the default output of any model asked to describe a person.
+**Inferred personal characteristic** — health, politics, religion, sexuality, nationality,
+age, family — is what a model reaches for the moment you ask it about somebody's biases, and
+every one of them is (a) not evidence-bearing on how somebody reviews a pull request and (b)
+an assertion about a real colleague that no excerpt can support. Dropping them is not
+squeamishness; it is the same rule as the rest of the filter, applied where it matters most.
+A claim about a *stated* preference — "says repeatedly that they don't want to own the
+alerting rotation" — is behaviour, and survives.
+
+**What was refused is shown**, for the same reason `subject_explanations.removed` is: on a
+first pass against real review history the removed list is routinely longer than the
+profile, and a filter nobody can see is a filter nobody can debug. A facet whose reply held
+**no usable traits at all** is recorded too — without that, a profile came back with zero
+traits *and* zero refusals, which reads as "nothing is established about this person" when the
+truth was "the model answered in a shape we could not use, eight times".
+
+**Citations are ordinals, not ids.** This is the second live failure, and it cost a profile that
+was otherwise correct. An evidence id is `{persona}/{source}/{kind}/{url}` — about a hundred
+characters ending in a GitHub permalink — and the facet prompt originally asked the model to cite
+them verbatim. deepseek-coder:33b returned well-formed JSON, sensible claims, and citations of
+the form `pavel/github/review_comment/…#issuecomment-5168030937` for excerpts stored as
+`pavel/github/issue_comment/…#issuecomment-5168030937`: it had "corrected" the one segment of the
+id that looks guessable. Every citation missed, `verify` correctly dropped every trait, and the
+profile came back empty from a model that had answered *well*.
+
+So the prompt now numbers the excerpts `[e1]`, `[e2]`, … and resolves the tokens back to real ids
+on the way in. Same lesson as `prdiff`'s line anchoring — *anchor on something the model can
+actually reproduce and resolve it yourself* — and the same shape of fix: `e7` has no structure to
+"fix" and is one token to copy. An out-of-range or unresolvable token is dropped rather than
+passed on as a fake id, so the reason recorded is "cites no evidence", which is true, rather than
+"cites an excerpt we do not hold", which blames the wrong thing.
+
+### Which model forms the opinion
+
+`[personas] profile_tier` defaults to **Claude**, and this is the one place in MuggleBot whose
+default is not on-device. The reversal was earned rather than chosen.
+
+The local 33B model could not hold the contract. It produced sensible claims and then mangled
+the citation ids (above), and once that was fixed it produced four traits asserting `1.0`
+confidence, duplicated one claim across two facets, and returned nothing usable for five of the
+ten facets — including `expertise`, which is the one SME depends on. Ten facet passes over months
+of somebody's writing also sit behind the single local permit, which is tens of minutes and
+stacks when a force and an auto-refresh coincide.
+
+Every safeguard applies whichever tier answers — falsifiability, citations, counter-evidence, the
+confidence ceiling, the removal report. A stronger model simply clears the bar more often, which
+is the whole argument: the filters are not a substitute for a capable model, they are what makes
+a capable model's output checkable.
+
+The cost is real and the config says so plainly: **on any tier but `local`, harvested excerpts of
+your colleagues' writing leave the machine.** They ride the subscription CLI bridge, so nothing is
+metered, but "unmetered" is not "on-device". `profile_tier = "local"` keeps it on the Mac and
+accepts a thinner profile.
+
+### Subject-matter expertise — who to ask about what
+
+A profile says *how* somebody reviews. SME says *what* they review, and it answers the question
+you have first: **who knows the storage layer?** The most useful colleague for a given change is
+often not the one whose review style you were curious about.
+
+**Counted first, judged second.** Every GitHub excerpt carries the subject it was written on and,
+for an inline review comment, the file path it was attached to. Group by those and the shape of
+somebody's attention falls out with no model involved — so `sme::areas` counts, and the model is
+asked only for what counting cannot supply: whether their comments in an area are *specific*.
+That arrives as an `expertise` trait and is folded on by `sme::with_depth`.
+
+**Volume is not expertise, and three bars enforce it.** The tempting shortcut — most comments in
+a repo ⇒ SME in that repo — is wrong in a way that actively misleads, because the person with the
+most comments on a repository is frequently the one *learning* it, or the one who owns its release
+process, or a reviewer CODEOWNERS adds to everything. So an area needs: **sustained** activity
+(≥4 excerpts — two comments is a visit), **reviewing rather than talking** (≥2 review actions —
+being asked to judge a change is somebody trusting you, commenting is not; this is the bar that
+drops the person who asked three questions in an unfamiliar repo), and **concentration** (≥8% of
+their own activity — somebody spread evenly over forty repos is not an expert in the fortieth).
+
+**Presence and expertise never render alike.** An area with no `expertise` trait behind it is
+labelled *presence only*, dimmed, and says what it is. One means "ask them"; the other means "they
+are around", and merging them would put somebody forward as an expert on the strength of having
+commented a lot. Slack is excluded entirely: a channel is a room, not a subject area, and treating
+`#cloud-alerts` as expertise would make everybody an SRE.
+
+`who_knows(area)` ranks it across every modelled person, expertise first. It reports how many
+personas were considered, because the real expert may not have a persona at all — a ranked list of
+two is a ranked list of two, and reading it as "the two people who know this" would be wrong.
+
+The areas are also rendered into the prediction prompt, because *whether the change is even their
+area* is often the whole prediction: the honest answer for a storage reviewer looking at a docs
+change is silence.
+
+### What you know about them
+
+Not everything worth knowing is in the evidence. "Owns the release process", "prefers async
+review", "is on sabbatical until March", a link to their team's charter — none of that is
+inferable from their comments, and all of it changes what those comments mean.
+
+So a persona carries a list of operator-supplied context entries. Text is used verbatim; a URL
+goes through the same `ContextIngest` path as the context library. They are **asserted, not
+inferred**, and therefore bypass `verify` entirely — the filter exists to stop the *model* making
+unfalsifiable claims, and applying it to something the operator stated would be the filter
+second-guessing its own author. The UI labels the block as the one thing on the page that has not
+been verified, so the distinction is visible rather than implied.
+
+Distinct from `notes`, which is the one-line who-they-are beside their name: these accumulate and
+are individually removable, which is what makes them usable for what actually happens — learning
+one more fact about somebody every few weeks. Adding one **re-profiles**, because a profile
+distilled before you said "owns the release process" was distilled without it, and the evidence
+watermark has not moved so a plain submission would be refused as a duplicate.
+
+### Counted, never modelled
+
+How many reviews, what share were approvals, how long their comments run, how often they
+ask a question rather than issue an instruction, how much of their review activity is inline
+on a line of the diff — all computed in Rust from the evidence rows. A model asked "what is
+their approval rate?" invents a plausible number, and a plausible invented number is worse
+than none, because the reader cannot tell it from a counted one. The two nothings stay
+distinguishable: no *decided* reviews is `None`, which must never render as "never approves
+anything".
+
+### Where the evidence comes from
+
+| Source | Where | Cost |
+|---|---|---|
+| Slack (log) | the signal log, filtered by `actor` | a SQL query |
+| Granola | the signal log, transcripts split by speaker | a SQL query |
+| Slack (fetched) | `search.messages` with `from:@handle` | Slack API calls |
+| GitHub | the search API, then reviews/comments per hit | GitHub API calls |
+
+**Why Slack is read twice.** The signal-log half was originally the only one, on the reasoning
+that MuggleBot has already ingested it. That was wrong about *what the log holds*: notifications
+— alert-channel posts, @-mentions of the operator, keyword hits. Measured on a live workspace
+with `channels = []`: 194 Slack signals, every one of them from `#cloud-alerts` or `#incidents`,
+so a colleague who posts all day had **two** excerpts to their name and the profile was
+effectively GitHub-only. Fetching their own messages turned that persona's 2 into 292, across
+`#dev-cloud`, `#restate-nuon` and a dozen incident channels — which is where register, latency
+and willingness to engage actually show. Both halves are kept and are additive; deterministic ids
+mean a message found by both is one row.
+
+`search.messages` needs a **user** token and reaches everything that token can see, including
+private channels and **the operator's DMs with that person**. Nothing is read that the operator
+could not already read, but a profile built partly from DMs is a different thing from one built
+from `#eng` — so `[personas] slack_search` gates it, the config says what it reads, and a DM
+excerpt is labelled `DM with @handle` rather than rendered as if it were a channel.
+
+GitHub is fetched at **background** priority when the loop asks (a late profile costs nothing; a
+watcher that stopped noticing incidents because a backfill was running is broken) and
+**interactive** when the operator does, and **walked backwards** a bounded page at a time.
+
+The backward walk earns three notes. Their last three reviews are a sample of three; their
+last two hundred are a pattern — so each pass does one forward search and one backward step,
+and over a day of ticks a profile accumulates real history without ever spending more than a
+handful of requests at once. And the cursor is **stored, not derived from the oldest evidence
+held**: deriving it looks tidier and does not terminate, because a barren window (a month
+they reviewed nothing) leaves the oldest evidence where it was, so the next pass issues the
+identical query and the walk stalls forever, silently, looking merely slow.
+
+The third note is the one this got wrong on its first live run, and it is the reason background
+priority and a moving cursor cannot be designed independently. **A deferred query is not a
+barren window.** The GitHub budget refuses background callers once it is down to the 1000-request
+reserve held for notifications and operator actions — correct behaviour, and the refusal even
+says when it lifts. The harvester treated it as "nothing here": both searches came back empty,
+`search` swallowed the refusal, the pass reported success with an empty note list, and the
+cursor advanced anyway. Three consecutive passes moved `walked_back_to` from *now* to
+2026-02-04 without a single successful request, and because the walk only goes backwards those
+six months were unrecoverable. On screen it was a persona with `0 ev`, indistinguishable from a
+colleague who never writes anything.
+
+So the walk now separates *no hits* from *never asked*, and:
+
+- **the cursor holds** when the backward window was deferred, so the next tick retries the
+  same window;
+- **the pass says why**, in one note naming the reason once — and the note is **persisted on
+  the persona**, not merely returned, because the pass runs inside a Restate handler minutes
+  after whatever asked for it, so a return value reaches nobody;
+- **items that could not be read are counted**, because an item that was never fetched is not
+  an item they said nothing on;
+- **the note clears on a clean pass**, so a recovered budget stops reporting a problem that has
+  gone — the same rule that keeps every other indicator here from going stale.
+
+Both halves matter and they are easy to fix separately and wrong to separate: a pass that holds
+the cursor *silently* is a persona that stays empty for a reason nobody can see, which is the
+state that made the whole feature look like a button that does nothing.
+
+**And the deferral should not have been happening at all.** Every pass ran at `Background`
+priority, so a persona created two minutes ago was refused for as long as the code index held
+the budget at its reserve — which, crawling 147 repositories, is most of the time. The rule was
+already written down two sections up and this code did not follow it: *watchers and operator
+actions are `Interactive`: never paced, never refused.* Creating a persona, linking a handle, or
+pressing harvest is an operator action. The scheduled backfill walk is not, and stays
+`Background`. Same token, two clients, and [`harvest::Trigger`] decides which one a pass gets.
+Measured on the same workspace immediately after: the first operator-triggered pass harvested
+**34 excerpts** where every previous pass had harvested zero.
+
+The signal-log half has no priority because it has no cost — it is a SQL query over signals
+already ingested. That is why linking a **Slack** handle is the fastest way to a usable profile:
+it lands immediately, budget or no budget.
+
+### Keeping up: engagement refreshes the persona
+
+A profile that only refreshes on a twelve-hour timer is stale exactly when it matters — you are
+about to ask somebody about the thing they were talking about ten minutes ago.
+
+So ingest carries a second, cheap routing decision alongside subject attribution: if a new
+signal's actor resolves to a modelled persona, that persona's object is told it was `engaged`.
+Four properties keep it from being a liability:
+
+- **It is routing, not a write.** The lookup is an indexed read on `persona_identities` inside
+  the poll, and the *send* happens from the `Watcher` object exactly like `record` does — a
+  write to a persona from inside the watcher's handler would be serialized per watcher rather
+  than per persona.
+- **It is debounced on the subjects' own durable timer.** Nine messages in a minute is one
+  refresh, with a hard cap so a busy thread cannot defer it indefinitely.
+- **It is `Background`.** This is *their* activity prompting a refresh, not the operator asking,
+  so it must not spend the reserve. It still earns its keep, because the Slack half it mostly
+  picks up costs nothing.
+- **It costs nothing when off.** Gated at the source on `[personas] refresh_on_engagement`, so a
+  disabled feature is not an ingress call per burst that exists to be ignored.
+
+Combined with `history_days = 90`, that is the shape the feature needed: three months of GitHub
+history walked once, all the Slack there is, and then kept current by the person's own activity
+rather than by a clock.
+
+Distillation is **one model pass per facet**, over a sample **spread across the whole
+observed range** rather than the newest N — newest-N describes last week, and somebody who
+spent it reviewing one migration comes out looking like a person who only talks about
+migrations.
+
+### Keys chosen so re-running is free
+
+| Workflow | Key | A refused submission means |
+|---|---|---|
+| `PersonaProfile` | `{slug}@{evidence watermark}` | nothing new harvested; the profile is current |
+| `PersonaPredict` | `{slug}@{kind}@{produced_by}@{subject}@{watermark}` | this exact question is already answered |
+
+The profile watermark is `{count}@{newest ingested_at}`, **not** the newest excerpt's id, and
+the distinction is the whole reason the key works. The backward walk adds *older* material,
+which leaves a newest-id token unchanged — so every backfill pass would be refused as a
+duplicate and the profile would freeze at whatever the first pass happened to see. Nothing
+about that failure is visible: the workflow answers "already run at this key", which is
+normally the good answer.
+
+`PersonaPredict`'s key is five positional components split at most five ways, so the
+**watermark keeps its own `@`s** — a GitHub signal id is
+`github/24800345076@2026-07-27T21:35:05Z`, so a real key carries two more separators than the
+format suggests. Splitting greedily is precisely the bug that made every `Explain` on a
+notification-sourced subject fail instantly against a subject key that did not exist. And
+`produced_by` is in the key so that asking a cloud model for its own read sits *beside* the
+local one rather than being refused as a duplicate of it — the same arrangement as
+`SecondOpinion`.
+
+### Predictions, and why "nothing" is one of them
+
+For any issue or pull request you select personas and get one of three predictions: the
+review they would leave, the comment they would write, or whether they would engage in the
+thread at all.
+
+**`would_engage` is a first-class field**, and often false. A predictor that always produces
+a review tells you nothing about who to ask, and the honest answer for a docs change in
+front of a storage reviewer is silence.
+
+This is deliberately **not a second code review**. MuggleBot already reviews pull requests,
+and that review is the tool for deciding whether a change should land. A prediction answers
+*what will Pavel say*, and is only worth anything if it is grounded in Pavel rather than in
+the diff. Two rules enforce that in code rather than asking for it in the prompt:
+
+- **Every point must cite a trait.** A point citing none is dropped. Without this the output
+  is the base model's own review of the diff with a colleague's name on top — which the
+  operator already has, better, from the real review, and which is actively misleading when
+  attributed to somebody. This fires a lot, and it is supposed to: a persona with three
+  established traits cannot predict eight review comments.
+- **The verdict must be consistent with the counted base rate.** `persona::predict::reconcile`
+  demotes a `request_changes` against somebody who approves most of what they decide, unless
+  a cited `reviews_for` or `bar` trait explains why this change is different. Modelled on
+  `prdiff::reconcile`, which taught the same lesson: the findings win, and the *demotion*
+  direction matters as much as the promotion one.
+
+An **empty profile short-circuits before the model call**. Asking a model to predict a person
+it has been told nothing about produces a confident, fluent invention, and the verifier would
+strip it to an empty shell afterwards having already paid for it.
+
+Every prediction carries its **caveats** — how thin the profile is, whether any review
+activity was harvested at all, what the verifier removed. A prediction from four excerpts and
+one from four hundred look identical on screen, and the operator is about to act on which it
+is.
+
+### Talking to one
+
+The chat pane will answer *as* a persona, which is the rehearsal case: "how will Pavel react
+if I propose putting this behind a flag?" is worth an answer before the meeting. Same tool
+loop — asked about a pull request it should go and read it rather than react to the title —
+with the framing and the grounding swapped.
+
+Three properties, matching the prediction path. It is **grounded in the profile**, and an
+empty profile refuses outright rather than improvising a person. It **never fabricates a
+quotation**: it may say what they would probably think, and it may quote a harvested excerpt
+with its id, and nothing else — a plausible sentence attributed to a real colleague is the
+worst output available here. And it is **labelled**: the response carries the persona slug and
+the pane renders it as a prediction, because an unlabelled simulated colleague reads as a
+quotation. Only **read** tools are offered; a write executed "as Pavel" would be
+indistinguishable in the log from one the operator asked for.
+
+### Local, private, and never posted
+
+Profiling and predicting run on the **local** model. A candid behavioural model of a
+colleague is the most personal material in this database and has no reason to leave the
+machine; the operator can still name a cloud model per prediction from the pane, which is the
+operator asking, by name, as everywhere else.
+
+And a prediction is a **private rehearsal** — never posted to GitHub or Slack, on exactly the
+same footing as every other critique here. See the next section, which is the invariant this
+rests on.
+
+## Slack thread analysis — two models, no synthesis, and the quotes have to be real
+
+Paste a Slack permalink; get an assessment of what happened in that thread, including your own
+part in it. Deliberately **not** a watcher: threads already become subjects when they involve
+you, and this is the other thing — one conversation you want read properly, asked for by hand.
+
+### Two models, run blind to each other
+
+One model asked "was anyone unreasonable here" produces a confident answer either way, and its
+particular flavour of agreeableness is a property of that model. So the same prompt goes to
+**Claude and ChatGPT concurrently**, neither seeing the other's output, and agreement is then
+**computed**: same subject, same stance, at least one message in common.
+
+There is no third synthesis pass, and that is the design rather than an omission. A synthesiser
+reads two analyses and writes one, which means the disagreement — the most informative thing on
+the page — gets smoothed into a paragraph that sounds more settled than the evidence is. It
+would also be a model deciding whether two models agree, which is the laundering this whole
+shape exists to avoid. `both models` is the strongest thing the page can say; everything else is
+one reader's opinion and is labelled as such.
+
+### The trap in asking to be called out
+
+The point is to be told when *you* were the problem. But a prompt that demands criticism gets
+criticism, invented if necessary, because the model is answering the instruction rather than
+reading the thread. Three defences, and the first is structural:
+
+1. **Everyone is graded on the same rubric, you included.** The prompt never says "be hard on
+   this participant" — it asks the same question about every person in the thread, and the
+   operator's findings are then *extracted*. A rubric bent around one person is not a rubric,
+   and it is the mechanism by which a model both flatters and over-punishes.
+2. **"Nothing to call out" is explicitly allowed**, with the reason required. Without that the
+   model manufactures a fault to fill the section. On three live runs of a thread the operator
+   had not posted in, both models independently declined — Claude's words: *"a two-message
+   fragment where someone is absent supports no verdict about them at all, and inventing one
+   would be worse than the silence."*
+3. **Every finding cites messages, and quotes are checked character by character.** A finding
+   whose citations don't resolve is discarded; so is one quoting words nobody wrote. Fabricating
+   a damning quote is the worst failure this could have and the cheapest to make impossible.
+   Discards are *shown*, because an analysis that lost four findings to invented quotes is
+   telling you something, and silently returning two looks identical to a quiet thread.
+
+Quote checking normalises whitespace and case and ignores spans under twelve characters — a
+model that reflowed a Slack message has not fabricated anything, and flagging `"no"` would train
+you to ignore the marks.
+
+### Personas make it a claim about a pattern
+
+Participants' persona profiles go in as context, using five of the ten facets:
+`SlackRegister` (literally how this person behaves in this medium), `Escalation` (what they do
+when they disagree — the question a contentious thread is asking), `Style`, `HobbyHorses`,
+`MeetingRegister`. The five left out are all about how someone handles a *diff*.
+
+Participants **without** a profile are named as such in the prompt, and the model is told it may
+describe what they did but not characterise what they are like. That distinction is the whole
+difference between an insight and a slur, and only the profile can tell them apart.
+
+A model that uses a trait quotes its `[tr:ID]` label back mid-sentence, so the label is lifted
+out into `from_traits` and the sentence left readable — and the UI marks it, because a finding
+resting on a profile claims a *pattern* rather than an incident, which is a materially stronger
+thing to say about a colleague.
+
+### A partial panel has to be loud
+
+The first live run came back looking like a complete two-model analysis whose findings happened
+to be uncorroborated. It wasn't: `[threads].chatgpt_model` defaulted to `gpt-5.6`, which Codex
+rejects on a ChatGPT account (*"model is not supported when using Codex with a ChatGPT
+account"*) — so ChatGPT never answered and the failure was swallowed. All eight findings were
+Claude's.
+
+That is the worst shape this feature can take. The operator asked for two independent readers,
+got one, and had no way to tell: `one model only` on every finding reads as "the models
+disagreed" when it actually means "there was only one model". So failures are recorded on the
+verdict, the page leads with them, and `full_panel()` is false whenever a configured model did
+not answer. The default is now `gpt-5.6-sol`, which that account can use.
+
+Worth noting how it was found: not by a test, but by *reading* a live run's output and noticing
+that every finding carried the same `source`. The fixtures were all green.
+
+### Everything else
+
+- **The link parser is not a regexp on "slack.com".** Slack's "Copy link" on a *reply* puts the
+  reply's ts in the path and the thread's in `?thread_ts=` — reading the path would fetch a
+  one-message "thread" and analyse a single reply out of context. `thread_ts` wins; the clicked
+  message is kept as `focus_ts`, since "the bit I was looking at" is context.
+- **Ordinals, not timestamps.** Messages are cited `[m3]`. A model asked to copy
+  `1712345678.123456` gets a digit wrong often enough to matter, and a citation that doesn't
+  resolve is a finding thrown away — the same reason persona evidence uses `[e3]`.
+- **The thread is capped from the front**, keeping the root and the end: where a conversation
+  got to matters more than how it opened, and a thread long enough to need capping is usually
+  long because it went in circles. What was dropped is declared to the model.
+- **The fetch runs inline, before the row is written.** A mistyped link or a channel the token
+  cannot see becomes an error on the button, where the operator is looking, rather than a queued
+  row that fails somewhere they would have to go and find. Slack's own error strings are
+  translated: `not_in_channel` becomes "invite the app to that channel".
+- **One row per `(channel, thread_ts)`.** Re-pasting a link whose thread has grown updates the
+  reply count and re-queues it; re-pasting an unchanged one is the same row.
+- Its own vqueue scope at concurrency 1 rather than sharing `cloud-llm`: each analysis is
+  *already* two concurrent cloud calls, so two pasted links should queue rather than put four on
+  the same subscription — and the cloud budget stays free for work the operator is waiting on.
+- Two retries, not four. Each retry is two more model calls on a question asked once.
+
 ## Nothing is ever written back to GitHub
 
 A PR critique is a note in MuggleBot's own store. It is rendered in the LCARS console and
-nowhere else: it never becomes a PR comment, a review, an approval, or a label.
+nowhere else: it never becomes a PR comment, a review, an approval, or a label. The same is
+true of a **persona prediction**, which needs saying twice as loudly: a predicted review
+reads like a review *and* carries a colleague's name, so posting one would be putting words
+in somebody's mouth in public. It is a rehearsal, it is labelled as one everywhere it is
+rendered, and there is no mechanism to post it.
 
 This is worth stating as an invariant rather than leaving implicit, because a critique
 *reads* like a review — "this papers over the leak, and a reviewer already objected" is
@@ -2075,9 +2800,133 @@ A single-pane dashboard in the **LCARS** idiom (the swooping Okudagram panels fr
 Star Trek: TNG). The aesthetic isn't just fun — LCARS is genuinely good at dense,
 color-coded, panelized status display, which is exactly the job.
 
-- **Board view.** Subjects as panels, ranked by attention, grouped by rank
-  (issues, then unparented PRs, then Slack-only conversations) with the
-  unattributed lane last. Color = severity. Snooze, acknowledge, deep-link out.
+- **The foot clock — UTC, then Denver, London, Berlin.** A 26px strip below the body, outside the
+  scrolling region, so it is frame like the top band rather than something a view can slide under.
+
+  **UTC heads the row, set apart by a rule.** Every offset on the strip is written relative to it,
+  so without it those chips are a subtraction you have to do in your head; with it, each city's
+  time is one you can check. It is separated rather than mixed in because it is not a place — the
+  three cities run west to east, and inserting a non-place into that run breaks the ordering. It
+  carries no offset chip (its own offset is zero by definition; `UTC+0` beside the label would say
+  it twice) and no working-hours state, but it *does* carry the day marker: from a Denver evening
+  it is already tomorrow in UTC, and a log line stamped in UTC is then a date you would read wrong.
+
+  **All three zones are set identically** — place in the identity hue, time in bold white, then
+  the live UTC offset. The hue names the column and the weight carries the value, so nothing is
+  read twice; the offset sits a tier down in weight and colour, because it is what the time is
+  measured *against* rather than a second reading.
+
+  **Daylight saving is never encoded here.** Zones are IANA identifiers (`America/Denver`, …),
+  never fixed offsets, and every offset shown is asked of the browser's tz database *at the
+  instant being displayed* — so `UTC−6` in August becomes `UTC−7` in November with no rule
+  written down and nothing to revisit when a government moves a date. The offset itself is read
+  back out of the zone's own formatted wall clock: format the instant in the target zone,
+  reinterpret those fields as if they were UTC, and the difference is the offset.
+
+  This is not pedantry, because the zones don't move together. The US springs forward on the
+  second Sunday in March and the EU on the last, so for the ~two weeks between, Denver↔London is
+  six hours rather than the usual seven and Denver↔Berlin is seven rather than eight. A table of
+  fixed offsets is wrong twice a year.
+
+  The hover text names what the zone is currently observing and when that next changes —
+  `America/Denver · MDT, UTC−6 · UTC−7 from 1 Nov`. The changeover is **found by search, not by
+  rule**: step forward a day at a time until the offset differs, then bisect down to the hour.
+  Encoding "last Sunday in October" would be encoding politics. ICU only carries the
+  abbreviations for the locales that use them — `en-US` knows `MDT` but renders Berlin as
+  `GMT+2`, `en-GB` knows `CEST` but renders Denver as `GMT-6` — so both are asked and whichever
+  answers with a name rather than another offset wins.
+
+  > **Reversal, recorded on purpose.** The first cut styled the three differently: a zone outside
+  > weekday 09:00–18:00 dimmed to `--slate`, and your own zone's label took the identity hue while
+  > the others stayed `--faint`. Each rule was individually defensible — whether you can raise
+  > something with someone now is the reason to look, and your own zone is what you read the
+  > others against. Together they were wrong. Three clocks set three ways read as three different
+  > *kinds* of thing, and the eye stops to work out what each treatment means instead of just
+  > reading the row. Both facts survive in the hover text, which is where a qualifier belongs when
+  > the row itself is meant to be glanced at.
+
+  **The weekday and a `+1`/`−1` appear only when the date there isn't the date here**, which is
+  what stops a same-looking hour meaning two different things. It is computed by comparing
+  calendar dates, not by differencing offsets, so it stays right across a changeover.
+
+  The digits are monospaced and `tabular-nums`. A proportional `1` is narrower than a `0`, so on
+  a running clock the field twitches sideways every second — exactly the motion the eye can't
+  ignore, on a component that is meant to be glanced at. The tick is a `setTimeout` re-aligned to
+  the wall clock each time rather than `setInterval(1000)`, which drifts against the second
+  boundary until the display skips a value.
+
+- **Board view.** Subjects as **cards** in a responsive grid, one lane per question — *Decide*,
+  *On your plate*, *Nothing to do* — and within a lane sorted by type then recency. Snooze,
+  acknowledge, deep-link out.
+
+  Each block of a card answers exactly one question: the head says what kind of thing and how
+  stale, the title says what it is, the **why** line says why it is on the board, the headline
+  says what is already known, and the footer says what the AI has done and what you can do. A
+  block that answers none of those was cut, which is the whole rework in one sentence.
+
+  Three things it fixes that the previous dense rows got wrong, each measured on a real board of
+  nine subjects:
+
+  - **The same fact was stated three times** — a fixed 102px `GITHUB PR` column, a
+    `Pull requests 1` group heading, and the `#`/`!` sigil in the ref. The column and the heading
+    are gone; rank is now a coloured spine plus a short marker, and the reclaimed width goes to a
+    title that **wraps to two lines** instead of ellipsing at a fixed column.
+  - **The row showed almost none of the data it had.** `attention.reason` was on the wire and had
+    nowhere to go, so a lane said *Decide* without saying what was asking. Tags, the whole
+    `decorated` strip, and the `⌂`/`☁` pass counts were likewise unrendered — and **zero badges
+    rendered across all nine rows**, so the badge machinery was invisible in the common case. All
+    of it is on the card now. The `☁` count earns its place immediately: it was 1–2 on nearly
+    every subject, which under local-by-default should be zero unless somebody asked for a second
+    opinion, and the board was the thing that would have said so.
+  - **Actions were `visibility: hidden`.** Hover-only controls also hid `review as`, an
+    affordance nobody could discover by looking. The footer shows them.
+
+  > **Reversal, recorded on purpose.** This section used to specify grouping by rank *with a
+  > heading per group*, on the reasoning that reviewing a pull request and scheduling an issue are
+  > different work and batching them means one pass over each. That reasoning holds — and the
+  > **sort** is what delivers it. The heading only labelled the boundary, and at 1–2 cards per
+  > group it cost one heading per 1.8 cards: `DECIDE 3` over `Pull requests 1` over a single card.
+  > The batch survives; the chrome does not.
+
+  The AI-decoration strip is **dots, not labels**. It started as six 9px pills reading
+  `SUM TAGS DASH RC TRI PRS` on every card, which is a row of abbreviations to decode — the exact
+  clutter the rework exists to remove. Fill carries the meaning ("has anything looked at this?"),
+  the name is on hover, and a row of hollow dots is still the "nobody has looked at this yet"
+  signal it was always meant to be.
+
+  A Slack card's reference is **humanised**: `C0744EUMHFF/1785793056.122949` — 29 characters of
+  nothing, shoving titles toward ellipsis — becomes `#cloud-alerts · Aug 3`, from the channel
+  resolution key the signals already carry and the unix time in the thread id.
+- **Subject view — judgement unfolded, evidence folded.** One pull request's detail view measured
+  **12,126px — ten screenfuls — with no map**: nine same-weight headings, and nothing telling you
+  the page held a verdict, three proposed approaches, PR-fix candidates and predictions. **52% of
+  it was raw patch text** (6,319px of unified diff), and `Attach context` sat at 11,988px, so
+  reaching the bottom of the page meant scrolling past a diff you had not asked for.
+
+  The rework is one rule: **unfold the judgement, fold the evidence.** It brings the same page to
+  **4,055px** with nothing removed.
+
+  - **The patches fold behind `▸ show the 10 patches +972 −12`.** This reverses the earlier
+    decision that a diff should be unfolded in the click-in view — and the reversal is principled
+    rather than a change of taste. That decision was right *when there was no review*: the patch
+    was the only answer available, so a disclosure triangle over it hid the answer. There is a
+    review now, so the answer is the verdict and its findings and the patch is what backs them.
+    Folding evidence is the opposite of hiding the answer.
+  - **The review's findings render beside the verdict.** They used to appear only anchored to
+    their line — *inside* the patches — so folding the patches hid the findings and not folding
+    them buried the verdict. The findings are the review's actual content.
+  - **Proposed approaches fold to their headlines**, carrying what the comparison turns on: what
+    it does, effort, confidence, and the mechanism. Three unfolded proposals were 2,638px, and
+    choosing between three options means comparing them, which is impossible when the first fills
+    the screen.
+  - **The timeline folds to a count and a span.** A timeline is what you consult after deciding
+    something looks wrong, not the first thing you read.
+  - **A sticky spine** indexes the panels, read back from the rendered headings rather than
+    declared — which panels exist depends on what has been analysed, and a hand-maintained list
+    would drift from the render every time a panel gained a condition.
+  - **`Actions` is renamed `Attach context`**, which is what it does. The old name sent readers to
+    the bottom of the page hunting for Ack and Snooze, which are in the header where you land.
+
 - **Subject view.** Timeline + attributed signals + summary with citations, the
   hierarchy (parent issue, child PRs, contributing Slack threads and meetings),
   and the relation graph. **Nested, not flat:** a bug renders with the pull requests
@@ -2109,7 +2958,36 @@ color-coded, panelized status display, which is exactly the job.
 - **Live assist.** In subjects you're active in, inline hints and suggestions,
   plus flags on your own messages (factual error / risky action) with citations.
 - **Agent chat.** A multimodal chat panel — drop screenshots, images, logs, or
-  files and converse with MuggleBot over the live board, memory, and context.
+  files and converse with MuggleBot over the live board, memory, and context. A picker
+  beside the model picker switches the conversation to a **persona**, so you can rehearse
+  with a simulated colleague; those replies are labelled `<name> · predicted`, always, because
+  an unlabelled simulated colleague reads as a quotation.
+- **Personas.** Its own view beside Chat rather than under the reference views: a persona is
+  something you interact with, not something you look up. Each row shows how much evidence is
+  behind the profile *and* how many traits survived verification — 400 excerpts and 2 traits
+  is a real and informative state. Opening one shows the counted facts, the traits grouped by
+  facet with their **verbatim citations one click away**, a `contested` badge on any claim its
+  own evidence contradicts, and a collapsed list of **what verification refused and why**.
+  Styled quieter than the board, in the identity hue, with no severity colours: a persona
+  never competes for attention and a prediction is never an alarm.
+- **"How will this land?"** A panel on every subject: select personas, press PREDICT, and read
+  the predicted reviews. Takes a *set*, because the useful answer is the set of reactions — a
+  reviewer who will block and one who will not care are one answer together. Each point names
+  the trait it follows from; "would not engage" renders as a dimmed card rather than an empty
+  one, because it is the answer and not a missing answer.
+- **Review the board as somebody.** A picker in the board header puts the whole board in one
+  person's view, and each issue and pull request gains a `review as` action and then a compact
+  verdict chip — `request changes`, `approve`, `wouldn't engage` — with the note they would write
+  on hover. The point is the *sweep*: "where would Pavel push back?" is a question about a lane,
+  not a row, which is why the persona is chosen once in the header rather than per card and why
+  the selection is shared state that survives clicking into a subject and back.
+
+  A chip rather than a card, because the board is a scanning surface and the answer needs a
+  colour and two words; the citations and caveats stay in the detail view. Offered on issues and
+  pull requests only — a Slack thread gets an engagement prediction when you click in, but a
+  button on every alert row would be the noisiest half of the board carrying the least useful
+  answer. And `wouldn't engage` is dimmed rather than hidden, because on a real sweep it is most
+  rows and it must not read as *not predicted yet*, which is the absence of a chip entirely.
 - **Live.** Fed over a WebSocket; new signals animate in, resolved ones fade.
 - **Red-alert mode.** A high-confidence live-assist flag shifts the interface to
   LCARS red-alert (color + optional audio cue, off by default) and fires a
@@ -2221,6 +3099,16 @@ files = ["~/notes/architecture.md"]
 url = "https://runbooks.internal/oncall"
 credential = "runbooks"
 header = "Authorization"
+
+# Personas — modelling the people, not just the work. Off by default: this is the one
+# feature here that models *people*, and that should be a decision rather than something
+# the daemon starts doing. Opt-in per person even once it is on.
+[personas]
+enabled = false
+harvest_interval = "12h"       # re-check a persona whose history walk has finished
+backfill_interval = "10m"      # one more page of history, while there is history left
+auto_profile = true            # re-distil when a pass finds new material
+max_proposals = 25
 
 [mcp]
 stdio = true

@@ -301,10 +301,15 @@ pub async fn list_models(
             .map(|s| s.to_string())
             .collect(),
         // "claude" and anything unrecognized.
-        _ => ["claude-opus-5", "claude-opus-4-8", "claude-sonnet-5", "claude-haiku-4-5"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect(),
+        _ => [
+            "claude-opus-5",
+            "claude-opus-4-8",
+            "claude-sonnet-5",
+            "claude-haiku-4-5",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect(),
     };
     let mut models = curated;
     // Surface whichever configured models belong to this provider.

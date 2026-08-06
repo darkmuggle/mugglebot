@@ -12,14 +12,27 @@ import {
 import Board from "./components/Board";
 import Incidents from "./components/Incidents";
 import Chat from "./components/Chat";
+import Clock from "./components/Clock";
 import ConfigPage from "./components/Config";
 import ContextLibrary from "./components/Context";
 import MemoryEditor from "./components/Memory";
+import Personas from "./components/Personas";
+import Threads from "./components/Threads";
 import RepoIndexView from "./components/RepoIndex";
 import TagEditor from "./components/Tags";
 import SubjectDetail from "./components/SubjectDetail";
 import TooltipLayer from "./components/Tooltip";
-import { connect, connected, disconnect, health, hints, redAlert, signals, subjects } from "./state";
+import {
+  connect,
+  connected,
+  disconnect,
+  health,
+  hints,
+  redAlert,
+  setChatSeed,
+  signals,
+  subjects,
+} from "./state";
 
 type View =
   | "board"
@@ -29,6 +42,8 @@ type View =
   | "tags"
   | "index"
   | "chat"
+  | "personas"
+  | "threads"
   | "config";
 
 const SOURCES = ["github", "slack", "granola", "incident"] as const;
@@ -41,6 +56,8 @@ const VIEWS: View[] = [
   "tags",
   "index",
   "chat",
+  "personas",
+  "threads",
   "config",
 ];
 
@@ -104,6 +121,13 @@ export default function App() {
   // state before this fires, and the Chat component consumes it on mount).
   const openChat = () => setView("chat");
 
+  // Open the chat talking *as* a persona. The seed carries the slug, so the pane starts a
+  // fresh conversation already in persona mode rather than needing the picker touched.
+  const openPersonaChat = (persona: string) => {
+    setChatSeed({ prompt: "", tags: [], persona });
+    setView("chat");
+  };
+
   const healthFor = (src: string) => health().find((h) => h.source === src);
   const flags = createMemo(() => hints().filter((h) => h.kind === "flag"));
 
@@ -115,6 +139,12 @@ export default function App() {
     // different question from "what does my work need", and the two lists are disjoint.
     { id: "incidents", label: "Incidents" },
     { id: "chat", label: "Chat" },
+    // Beside Chat rather than under the reference views: a persona is something you
+    // interact with, not something you look up.
+    { id: "personas", label: "Personas" },
+    // Beside Personas, not under the reference views: reading a thread *uses* the personas,
+    // and both answer "what is going on with these people" rather than "what does the code say".
+    { id: "threads", label: "Threads" },
     { id: "memory", label: "Memory", sep: true },
     { id: "context", label: "Context" },
     { id: "tags", label: "Tags" },
@@ -183,7 +213,11 @@ export default function App() {
                 >
                   <span
                     class="dot"
-                    classList={{ on: h()?.ok === true, off: h()?.ok === false, idle: !h() }}
+                    classList={{
+                      on: h()?.ok === true,
+                      off: h()?.ok === false,
+                      idle: !h(),
+                    }}
                   />
                   <span class={`src src-${src}`}>{src.toUpperCase()}</span>
                 </div>
@@ -211,7 +245,9 @@ export default function App() {
             <Match when={view() === "board"}>
               <Show
                 when={selected()}
-                fallback={<Board onOpen={openThread} sourceFilter={sourceFilter()} />}
+                fallback={
+                  <Board onOpen={openThread} sourceFilter={sourceFilter()} />
+                }
               >
                 <SubjectDetail
                   id={selected()!}
@@ -236,6 +272,14 @@ export default function App() {
             <Match when={view() === "chat"}>
               <Chat />
             </Match>
+            <Match when={view() === "personas"}>
+              {/* Same chat hand-off as the code index uses: set the seed on shared state,
+                  then switch views, and the Chat component consumes it on mount. */}
+              <Personas onChat={openPersonaChat} />
+            </Match>
+            <Match when={view() === "threads"}>
+              <Threads />
+            </Match>
             <Match when={view() === "index"}>
               {/* The chat hand-off: the seed is set on shared state, and switching views is
                   what makes the Chat component consume it on mount. */}
@@ -247,6 +291,11 @@ export default function App() {
           </Switch>
         </main>
       </div>
+
+      {/* The team's three zones, along the foot of every view. Outside `.lcars-body`
+          so it is chrome like the top band — it never scrolls, and the body gives up
+          the height rather than sliding under it. */}
+      <Clock />
 
       {/* One layer for every `data-tip` in the app, at the root so a tooltip is never
           clipped by the panel that raised it. */}

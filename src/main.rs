@@ -26,12 +26,14 @@ mod embed;
 mod enrich;
 mod event;
 mod github;
+mod grafana;
 mod incident;
 mod live;
 mod live_engine;
 mod mcp;
 mod memory;
 mod notify;
+mod persona;
 mod prdiff;
 mod prfix;
 mod reasoner;
@@ -45,6 +47,7 @@ mod signal;
 mod store;
 mod subject;
 mod tags;
+mod thread;
 mod tools;
 mod triage;
 mod watchers;
@@ -231,10 +234,12 @@ async fn main() -> Result<()> {
             // Background priority: reading a discussion is two API calls per subject on
             // every summary pass, and a summary that arrives a minute late costs far
             // less than a watcher that runs out of budget and stops noticing incidents.
-            Some(gh) => Arc::new(analyst.with_conversations(correlation::llm::Conversations::new(
-                Arc::new(gh.background()),
-                Arc::new(comments::CommentJudge::new(reasoners.local.clone())),
-            ))),
+            Some(gh) => Arc::new(
+                analyst.with_conversations(correlation::llm::Conversations::new(
+                    Arc::new(gh.background()),
+                    Arc::new(comments::CommentJudge::new(reasoners.local.clone())),
+                )),
+            ),
             None => {
                 warn!(
                     "no GitHub token: subject summaries will be written from signals alone, \
@@ -300,6 +305,61 @@ async fn main() -> Result<()> {
         cfg.investigation.clone(),
     ));
     let browser_driver = Arc::new(browser::BrowserDriver::new(cfg.browser.clone()));
+
+    // Grafana: the numbers behind an alert, before the browser reads the page.
+    //
+    // On the **local** reasoner, like everything else that runs automatically. What a
+    // metered tier would buy here is bought instead by `grafana::verify`, which checks every
+    // figure in the conclusion against the series it was drawn from — a guarantee rather
+    // than a better guess, which is the same trade `explain::verify` makes.
+    // One factory, shared: the Analyser needs it to reach Claude and ChatGPT, and
+    // `WorkflowOps` needs it for the re-dispatch button. Two would be two places for
+    // "which provider does that label mean" to drift apart.
+    let reasoner_factory: restate::workflows::ReasonerFactory = {
+        let cfg = cfg.clone();
+        let secrets = secrets.clone();
+        Arc::new(move |provider: &str, model: &str| {
+            reasoner::build(
+                reasoner::provider_label(provider),
+                model,
+                &cfg.reasoner,
+                secrets.get_opt("ollama"),
+            )
+        })
+    };
+
+    // Slack thread analysis: two models, blind to each other, on a thread you pasted.
+    let thread_analyser = Arc::new(thread::Analyser::new(
+        store.clone(),
+        secrets.get_opt("slack"),
+        cfg.sources.slack.user_id.clone(),
+        cfg.threads.clone(),
+        reasoner_factory.clone(),
+    ));
+    if cfg.threads.enabled && !thread_analyser.ready() {
+        warn!(
+            "[threads].enabled is set but thread analysis is inert — it needs a `slack` \
+             credential to read the thread"
+        );
+    }
+    if cfg.threads.enabled && cfg.sources.slack.user_id.is_none() {
+        warn!(
+            "[threads] is on but [sources.slack].user_id is unset — nothing can be attributed \
+             to you, so a thread analysis cannot tell you about your own part in it"
+        );
+    }
+
+    let grafana_reader = Arc::new(grafana::Reader::new(
+        cfg.grafana.clone(),
+        secrets.get_opt("grafana"),
+        reasoners.local.clone(),
+    ));
+    if cfg.grafana.enabled && !grafana_reader.ready() {
+        warn!(
+            "[grafana].enabled is set but the tier is inert — needs both a `grafana` secret \
+             (a Viewer service-account token) and [grafana].base_url"
+        );
+    }
 
     // Assigned-issue triage: check the repo out, read the code, propose patches, look for a
     // PR that already fixes it, then render the lot in plain English.
@@ -392,8 +452,72 @@ async fn main() -> Result<()> {
             reasoners.code.clone(),
             &cfg.reasoner.code_model,
         )
-            .context("building the diff reader")?,
+        .context("building the diff reader")?,
     );
+    // Personas: the "who is this work with" axis. Harvesting reads the signal log (free) and
+    // GitHub (bounded, background priority — a profile arriving late costs nothing, and a
+    // watcher that stopped noticing incidents because a backfill was running is broken).
+    // Profiling and predicting are **local**: a candid model of a colleague is the most
+    // personal material in this database, and the operator can still name a cloud model per
+    // prediction from the pane.
+    let personas = Arc::new(persona::Engine {
+        store: store.clone(),
+        harvester: persona::harvest::Harvester {
+            store: store.clone(),
+            // Two clients, one token. Which one a pass uses is decided by who asked for it:
+            // an operator action is never paced, the loop's own tick defers to the watchers.
+            // See `persona::harvest::Trigger` — getting this wrong is what made a freshly
+            // created persona sit at 0 evidence indefinitely.
+            github: github_token
+                .as_ref()
+                .and_then(|t| github::GithubClient::new(t.clone()).ok()),
+            github_background: github_token
+                .as_ref()
+                .and_then(|t| github::GithubClient::new(t.clone()).ok())
+                .map(github::GithubClient::background),
+            org: Some(cfg.investigation.org.clone()).filter(|o| !o.is_empty()),
+            history_days: cfg.personas.history_days,
+            // A *user* token, and only when the operator has opted in: `search.messages`
+            // reaches private channels and DMs the token can see. See `[personas] slack_search`.
+            slack_token: cfg
+                .personas
+                .slack_search
+                .then(|| secrets.get_opt("slack"))
+                .flatten(),
+            slack_pages: cfg.personas.slack_pages,
+        },
+        distiller: persona::profile::Distiller {
+            store: store.clone(),
+            // Claude by default — see `[personas] profile_tier` for why this is the one place
+            // the default is not on-device, and what it costs.
+            reasoner: match cfg.personas.profile_tier.as_str() {
+                "local" => reasoners.local_background.clone(),
+                "code" => reasoners.code.clone(),
+                _ => reasoners.cloud.clone(),
+            },
+            tier: cfg.personas.profile_tier.clone(),
+        },
+        predictor: persona::predict::Predictor {
+            store: store.clone(),
+        },
+        enabled: cfg.personas.enabled,
+        harvest_interval: config::parse_duration(&cfg.personas.harvest_interval)
+            .unwrap_or(Duration::from_secs(43_200)),
+        backfill_interval: config::parse_duration(&cfg.personas.backfill_interval)
+            .unwrap_or(Duration::from_secs(600)),
+        auto_profile: cfg.personas.auto_profile,
+        max_proposals: cfg.personas.max_proposals,
+        engagement_debounce: restate::objects::debounce::Debounce {
+            quiet: config::parse_duration(&cfg.personas.engagement_debounce)
+                .unwrap_or(Duration::from_secs(120)),
+            // Six windows of the quiet period, so a busy thread still refreshes rather than
+            // deferring forever — the same shape as the subjects' re-analysis cap.
+            max: config::parse_duration(&cfg.personas.engagement_debounce)
+                .unwrap_or(Duration::from_secs(120))
+                * 6,
+        },
+    });
+
     let tools = Arc::new(Tools {
         agents: agent_sessions.clone(),
         store: store.clone(),
@@ -409,7 +533,9 @@ async fn main() -> Result<()> {
         investigator: investigator.clone(),
         repos: repo_index.clone(),
         browser: browser_driver.clone(),
+        threads: thread_analyser.clone(),
         diffs: diff_reader.clone(),
+        personas: personas.clone(),
     });
     let chat = Arc::new(ChatAgent::new(
         tools.clone(),
@@ -497,6 +623,7 @@ async fn main() -> Result<()> {
         analyst: analyst.clone(),
         context: context.clone(),
         browser: browser_driver.clone(),
+        grafana: grafana_reader.clone(),
         events: events.clone(),
         watchers: watchers.clone(),
         ingress: ingress.clone(),
@@ -507,6 +634,7 @@ async fn main() -> Result<()> {
             .clone()
             .and_then(|t| github::GithubClient::new(t).ok()),
         org: cfg.investigation.org.clone(),
+        personas_on_engagement: cfg.personas.enabled && cfg.personas.refresh_on_engagement,
         contexts_dir: data_dir.join("contexts"),
     });
     let ops = Arc::new(restate::SubjectOps {
@@ -536,23 +664,16 @@ async fn main() -> Result<()> {
         analyst: analyst.clone(),
         repos: repo_index.clone(),
         browser: browser_driver.clone(),
+        grafana: grafana_reader.clone(),
+        grafana_fallback_enabled: cfg.grafana.fallback_to_browser,
+        threads: thread_analyser.clone(),
         context: context.clone(),
         diffs: diff_reader.clone(),
+        personas: personas.clone(),
         // Operator-named models only — the re-dispatch button. The Ollama key is read
         // inside the closure rather than captured, so rotating it through the config page
         // takes effect on the next call.
-        reasoner_factory: {
-            let cfg = cfg.clone();
-            let secrets = secrets.clone();
-            Arc::new(move |provider: &str, model: &str| {
-                reasoner::build(
-                    reasoner::provider_label(provider),
-                    model,
-                    &cfg.reasoner,
-                    secrets.get_opt("ollama"),
-                )
-            })
-        },
+        reasoner_factory: reasoner_factory.clone(),
     });
     {
         // Claim the endpoint port before anything else, and make a collision fatal.
@@ -609,6 +730,19 @@ async fn main() -> Result<()> {
     {
         let rcfg = cfg.restate.clone();
         let names: Vec<String> = watchers.iter().map(|w| w.name().to_string()).collect();
+        // Read at boot rather than watched: a persona created later arms its own loop from
+        // the create path, and this sweep is only here to recover the ones that existed
+        // before this process did.
+        let persona_slugs: Vec<String> = if cfg.personas.enabled {
+            store
+                .list_personas()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|p| p.slug)
+                .collect()
+        } else {
+            Vec::new()
+        };
         let mut tasks: Vec<String> = vec![
             restate::objects::scheduler::CONTEXT_REFRESH.into(),
             restate::objects::scheduler::CONTEXTS_DIR.into(),
@@ -664,6 +798,17 @@ async fn main() -> Result<()> {
                     Ok(true) => info!("scheduler '{task}': armed"),
                     Ok(false) => debug!("scheduler '{task}': already running"),
                     Err(e) => error!("scheduler '{task}': arming failed: {e:#}"),
+                }
+            }
+            // Each modelled person's harvest loop, on the same footing. `start` is
+            // idempotent by staleness, so this re-arms a loop the last process lost and
+            // leaves a live one alone — arming unconditionally would multiply the harvest
+            // rate by the number of restarts, which for a loop that spends GitHub budget is
+            // the expensive version of that mistake.
+            for slug in persona_slugs {
+                match boot.send_object_empty("Persona", &slug, "start").await {
+                    Ok(()) => debug!("persona '{slug}': harvest loop armed if it was stale"),
+                    Err(e) => error!("persona '{slug}': arming the harvest loop failed: {e:#}"),
                 }
             }
         });
@@ -729,11 +874,12 @@ fn build_watchers(cfg: &Config, secrets: &secrets::Secrets) -> Vec<Arc<dyn Watch
 
     if cfg.sources.incident.enabled {
         match secrets.get("incident") {
-            Ok(Some(key)) => match watchers::incident::IncidentWatcher::new(&cfg.sources.incident, key)
-            {
-                Ok(w) => watchers.push(Arc::new(w)),
-                Err(e) => error!("incident.io watcher init failed: {e:#}"),
-            },
+            Ok(Some(key)) => {
+                match watchers::incident::IncidentWatcher::new(&cfg.sources.incident, key) {
+                    Ok(w) => watchers.push(Arc::new(w)),
+                    Err(e) => error!("incident.io watcher init failed: {e:#}"),
+                }
+            }
             Ok(None) => warn!(
                 "incident.io enabled but no API key stored (account 'incident'); \
                  the incidents board will stay empty until one is added"

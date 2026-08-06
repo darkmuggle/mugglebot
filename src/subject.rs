@@ -549,6 +549,15 @@ fn quoted_comment_headers(lines: &[&str]) -> usize {
 /// result is plain text: citations, markdown emphasis and links are stripped,
 /// because a row is not a place to render them.
 pub fn headline_from(summary: Option<&str>) -> Option<String> {
+    headline_for(summary, "")
+}
+
+/// [`headline_from`], with the subject's title so a restatement of it can be refused.
+///
+/// A headline that adds nothing to the title is worse than no headline: it occupies the one line
+/// the board has for *new* information and spends it repeating the line above. Measured on a real
+/// board, four of nine rows were like that — see [`headline_is_noise`].
+pub fn headline_for(summary: Option<&str>, title: &str) -> Option<String> {
     let text = summary.map(str::trim).filter(|s| !s.is_empty())?;
     if !is_usable_summary(text) {
         return None;
@@ -560,7 +569,119 @@ pub fn headline_from(summary: Option<&str>) -> Option<String> {
     let flat = strip_for_row(&candidate);
     let sentence = first_sentence(&flat);
     let out = truncate_on_word(sentence, HEADLINE_MAX);
-    (!out.is_empty()).then_some(out)
+    if out.is_empty() || headline_is_noise(&out, title) {
+        return None;
+    }
+    Some(out)
+}
+
+/// Openers that mean the summariser answered a person instead of describing the work.
+///
+/// A summary is a description of a piece of work. When it opens like a reply — "You're correct in
+/// your understanding of the document titled…" was on a live board — the model has continued the
+/// conversation it was reading rather than summarising it. Nothing after such an opener is about
+/// the subject, so the whole line goes.
+///
+/// Anchored to the start, because "you" mid-sentence is ordinary English.
+const CONVERSATIONAL_OPENERS: &[&str] = &[
+    "you're correct",
+    "you are correct",
+    "you're right",
+    "you are right",
+    "thanks",
+    "thank you",
+    "good catch",
+    "good point",
+    "i agree",
+    "i think we",
+    "i've ",
+    "i have ",
+    "sure,",
+    "yes,",
+    "no,",
+    "sorry",
+    "as discussed",
+    "as mentioned",
+    "let me know",
+    "happy to",
+];
+
+/// Phrases that describe process rather than substance.
+///
+/// "The PR has been assigned and is currently being worked on by @github-actionsbot" says only
+/// that the thing exists, which the row already showed. These are matched anywhere in the line
+/// rather than at the start, because they arrive mid-sentence as often as not.
+///
+/// Deliberately narrow. A blanket rejection of anything opening "The PR…" would also have thrown
+/// away the most informative headline on the board — *"The PR#1312 to update the production
+/// controlPlaneImage to 1.7.2 is blocked by a missing DynamoDB mapping for Cognito-era users"* —
+/// so the list names the empty phrases, not the shape they arrive in.
+const CONTENT_FREE: &[&str] = &[
+    "has been assigned",
+    "is currently being worked on",
+    "is being worked on",
+    "no further action",
+    "no action is required",
+    "no updates",
+    "no update since",
+    "awaiting review",
+    "awaiting feedback",
+    "pending review",
+    "will be updated",
+    "remains open",
+    "is still open",
+    "is open for",
+    "has been opened",
+    "was opened by",
+];
+
+/// Whether a headline earns the line the board gives it.
+///
+/// Three rejections, each observed on a live board:
+///
+/// 1. **A reply, not a summary** — [`CONVERSATIONAL_OPENERS`].
+/// 2. **Process, not substance** — [`CONTENT_FREE`].
+/// 3. **A restatement of the title.** Tested as a strict subset: if every significant word in the
+///    headline already appears in the title, the headline adds nothing. Subset rather than a
+///    similarity score on purpose — *"Move the Auth metadata service out of Lambda"* against the
+///    title *"auth metadata service: migrate to k8s deployment"* shares most of its words and is
+///    still worth reading, because `lambda` is new. A threshold would have cut it; a subset test
+///    keeps it.
+pub fn headline_is_noise(headline: &str, title: &str) -> bool {
+    let lower = headline.trim().to_ascii_lowercase();
+    if lower.is_empty() {
+        return true;
+    }
+    if CONVERSATIONAL_OPENERS.iter().any(|o| lower.starts_with(o)) {
+        return true;
+    }
+    if CONTENT_FREE.iter().any(|p| lower.contains(p)) {
+        return true;
+    }
+    // A restatement adds no significant word the title did not already have.
+    if title.trim().is_empty() {
+        return false;
+    }
+    let title_words = significant_words(title);
+    if title_words.is_empty() {
+        return false;
+    }
+    let mut fresh = significant_words(&lower)
+        .into_iter()
+        .filter(|w| !title_words.contains(w));
+    fresh.next().is_none()
+}
+
+/// Words worth comparing: lowercased, punctuation-stripped, four characters or more.
+///
+/// The length floor drops the connectives that every sentence has and no sentence is *about*, so
+/// two lines differing only in "the" and "for" are correctly seen as the same line.
+fn significant_words(text: &str) -> std::collections::BTreeSet<String> {
+    text.to_ascii_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| w.len() >= 4)
+        .map(str::to_string)
+        .collect()
 }
 
 /// Put every `**Label:**` at the start of its own line.
@@ -584,9 +705,11 @@ fn split_labels(text: &str) -> String {
             continue;
         }
         let after = &text[i + 2..];
-        let is_label = LABELS
-            .iter()
-            .any(|l| after.get(..l.len()).is_some_and(|p| p.eq_ignore_ascii_case(l)));
+        let is_label = LABELS.iter().any(|l| {
+            after
+                .get(..l.len())
+                .is_some_and(|p| p.eq_ignore_ascii_case(l))
+        });
         out.push_str(&text[last..i]);
         if is_label && !out.is_empty() && !out.ends_with('\n') {
             out.push_str("\n\n");
@@ -630,13 +753,90 @@ fn labelled_section(text: &str, label: &str) -> Option<String> {
             out.push_str(bare[needle.len()..].trim_start_matches(['*', ' ']).trim());
         }
     }
-    found.then(|| out.trim().to_string()).filter(|s| !s.is_empty())
+    found
+        .then(|| out.trim().to_string())
+        .filter(|s| !s.is_empty())
 }
 
 /// Does this line open one of the summariser's labelled sections?
 fn is_label_line(bare: &str) -> bool {
     let lower = bare.to_ascii_lowercase();
     LABELS.iter().any(|l| lower.starts_with(l))
+}
+
+/// A summary's labelled blocks, in order, as `(label, content)`.
+fn summary_blocks(text: &str) -> Vec<(String, String)> {
+    let normalised = split_labels(text);
+    let mut out: Vec<(String, String)> = Vec::new();
+    for line in normalised.lines() {
+        let bare = line.trim().trim_start_matches(['*', '#', '-', ' ']);
+        if bare.is_empty() {
+            continue;
+        }
+        if is_label_line(bare) {
+            let (label, rest) = bare.split_once(':').unwrap_or((bare, ""));
+            out.push((
+                label.trim().to_string(),
+                rest.trim_start_matches(['*', ' ']).trim().to_string(),
+            ));
+        } else if let Some(last) = out.last_mut() {
+            // A continuation line belongs to the block above it.
+            if !last.1.is_empty() {
+                last.1.push(' ');
+            }
+            last.1.push_str(bare);
+        }
+    }
+    out
+}
+
+/// Drop the blocks of a summary that say nothing the reader does not already have.
+///
+/// The click-in view showed four labelled prose blocks totalling 1,268 characters, of which two
+/// were dead weight on a real subject:
+///
+/// - `Status: The PR has been assigned and is currently under review by @pcholakov` — the exact
+///   content-free shape [`headline_is_noise`] already refuses on the board, at full length.
+/// - `Impact:` then restated it almost word for word.
+///
+/// What was left — who wants what, and what happens next — is the part worth reading, and it was
+/// third and fourth on the page. So each block is put through the same filter the headline uses,
+/// plus one more that only makes sense between blocks: a block adding no significant word to the
+/// blocks already kept is a restatement of them.
+///
+/// A **display** transform. The stored summary keeps every word, because the explainer, the
+/// prompts and the MCP surface read it and they are not the board; this only shapes what the
+/// detail view renders, the same way `headline_for` does.
+pub fn trim_summary(summary: &str, title: &str) -> String {
+    let blocks = summary_blocks(summary);
+    // Nothing labelled to work with — a deterministic summary, or prose. Left alone: the filter
+    // has no blocks to reason about and guessing at sentence level would cut real content.
+    if blocks.len() < 2 {
+        return summary.trim().to_string();
+    }
+    let mut kept: Vec<(String, String)> = Vec::new();
+    let mut seen: std::collections::BTreeSet<String> = significant_words(title);
+    for (label, content) in blocks {
+        if content.is_empty() || headline_is_noise(&content, title) {
+            continue;
+        }
+        let words = significant_words(&content);
+        // Adds nothing to the title or to any block already kept.
+        if words.iter().all(|w| seen.contains(w)) {
+            continue;
+        }
+        seen.extend(words);
+        kept.push((label, content));
+    }
+    // Everything filtered means the filter is wrong about this summary, not that the subject has
+    // no summary — so the original stands rather than the view going blank.
+    if kept.is_empty() {
+        return summary.trim().to_string();
+    }
+    kept.iter()
+        .map(|(label, content)| format!("**{label}:** {content}"))
+        .collect::<Vec<_>>()
+        .join("\n\n")
 }
 
 /// Reduce summary markdown to plain single-line text fit for a table row.
@@ -1002,6 +1202,143 @@ mod tests {
         assert!(got.chars().count() <= HEADLINE_MAX + 1, "{got:?}");
         assert!(got.ends_with('…'), "{got:?}");
         assert!(!got.contains("alph…"), "cut mid-word: {got:?}");
+    }
+
+    /// The four kinds of dead headline seen on one real board of nine rows, and the two
+    /// informative ones that must survive.
+    ///
+    /// The board has one line per card for information the title did not already carry. A
+    /// headline that answers a person, reports that a thing exists, or repeats the title spends
+    /// that line and gives nothing back — and it is worse than an empty line, because the reader
+    /// has to read it before discovering that.
+    #[test]
+    fn a_headline_that_adds_nothing_is_refused() {
+        // 1. A reply, not a summary. The model continued the conversation it was reading.
+        assert!(headline_is_noise(
+        "You're correct in your understanding of the document titled \"Restate Cloud: On-Call Observability Guide\".",
+        "[FIRING:1] TenantPodRescheduled Restate Cloud Alerts",
+    ));
+        // 2. Process, not substance.
+        assert!(headline_is_noise(
+            "The PR has been assigned and is currently being worked on by @github-actionsbot.",
+            "Env VO creates the per-env RestateEnvironment CR",
+        ));
+        assert!(headline_is_noise(
+        "The PR is open for restatedev/restate-cloud#1312, which includes changes in production images.",
+        "Prod: use 1.7.2-hotfix for new restate control planes",
+    ));
+        // 3. A restatement: every significant word is already in the title.
+        assert!(headline_is_noise(
+            "Migrate the auth metadata service to a k8s deployment.",
+            "auth metadata service: migrate to k8s deployment",
+        ));
+
+        // The two that must survive. This one shares most of its words with the title and is
+        // still worth reading, because `lambda` is new — which is why the test is a subset
+        // check and not a similarity threshold.
+        assert!(!headline_is_noise(
+            "Move the Auth metadata service out of Lambda.",
+            "auth metadata service: migrate to k8s deployment",
+        ));
+        // And the most informative headline on that board, which a blanket "starts with The PR"
+        // rule would have thrown away.
+        assert!(!headline_is_noise(
+        "The PR#1312 to update the production controlPlaneImage to 1.7.2 is blocked by a missing DynamoDB mapping for Cognito-era users migrated to WorkOS.",
+        "Update the Restate Cloud production controlPlaneImage to 1.7.2",
+    ));
+        assert!(!headline_is_noise(
+            "We have an excessive amount of alarms from TenantPodRescheduled from e2e tests.",
+            "grafana: exclude create-and-destroy envs from TenantPodRescheduled",
+        ));
+    }
+
+    /// The real summary from the click-in view that prompted this, trimmed.
+    ///
+    /// 1,268 characters in four labelled blocks, of which `Status:` was the content-free
+    /// "has been assigned and is currently under review" shape and `Impact:` restated it. What
+    /// survives is what a reader came for: who wants what, and what happens next.
+    #[test]
+    fn a_summary_loses_the_blocks_that_say_nothing() {
+        let title = "Gate production deploys on weekday release windows";
+        let summary = "**Status:** The PR has been assigned and is currently under review by \
+                       @pcholakov.\n\n\
+                       **Impact:** This PR is under review by @pcholakov and has been \
+                       assigned.\n\n\
+                       **Conversation:** @lukebond wants a more detailed explanation about the \
+                       motivation; @pcholakov wants to merge but is concerned about \
+                       disruption.\n\n\
+                       **Next:** Merge with conditions once the rollout pace is agreed.";
+        let got = trim_summary(summary, title);
+
+        assert!(
+            !got.contains("Status:"),
+            "the content-free block goes: {got}"
+        );
+        assert!(!got.contains("Impact:"), "the restatement goes: {got}");
+        assert!(
+            got.contains("Conversation:"),
+            "the unique content stays: {got}"
+        );
+        assert!(got.contains("Next:"), "so does the next step: {got}");
+        // Exactly the two blocks worth reading, and nothing else — a stronger claim than any
+        // length ratio, since what matters is *which* blocks survived rather than how many
+        // characters they happen to run to.
+        assert_eq!(
+            got.lines().filter(|l| l.starts_with("**")).count(),
+            2,
+            "two blocks kept: {got}"
+        );
+        assert!(got.len() < summary.len(), "and it is shorter overall");
+    }
+
+    /// Two failure modes the trim must not have: blanking a summary it does not understand, and
+    /// mangling one that has no labelled blocks at all.
+    #[test]
+    fn the_trim_never_leaves_the_view_empty() {
+        let title = "Some title";
+        // Every block would be filtered — the filter is wrong about this summary, not the
+        // subject, so the original stands rather than the panel going blank.
+        let all_noise = "**Status:** Some title.\n\n**Impact:** Some title.";
+        assert_eq!(trim_summary(all_noise, title), all_noise);
+
+        // A deterministic summary has no labels to reason about. Guessing at sentence level
+        // would cut real content, so it is left exactly alone.
+        let plain = "3 events from github. Latest: CI failed on main.";
+        assert_eq!(trim_summary(plain, title), plain);
+
+        // One block is not a set of blocks to compare, so it survives untouched.
+        let single = "**Status:** The connection pool is exhausted under load.";
+        assert_eq!(trim_summary(single, title), single);
+    }
+
+    /// With no title to compare against, only the phrase rules apply — the restatement check
+    /// cannot fire, and must not reject everything by vacuous subset.
+    #[test]
+    fn no_title_still_admits_a_real_headline() {
+        assert!(!headline_is_noise("Anything at all here.", ""));
+        assert!(headline_is_noise("Thanks, will do.", ""));
+        // The vacuous case: an empty headline is noise whatever the title.
+        assert!(headline_is_noise("", "a title"));
+        assert!(headline_is_noise("   ", "a title"));
+    }
+
+    /// The filter runs inside `headline_for`, so a restating summary yields no headline at all
+    /// rather than a line the board then has to render.
+    #[test]
+    fn the_projection_drops_a_restating_headline() {
+        let summary = "**Headline:** Migrate the auth metadata service to a k8s deployment.\n\n                       **Status:** open";
+        assert_eq!(
+            headline_for(
+                Some(summary),
+                "auth metadata service: migrate to k8s deployment"
+            ),
+            None
+        );
+        // Same summary, a title it genuinely adds to: kept.
+        assert_eq!(
+            headline_for(Some(summary), "Tenant pods are being rescheduled").as_deref(),
+            Some("Migrate the auth metadata service to a k8s deployment.")
+        );
     }
 
     #[test]

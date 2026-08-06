@@ -210,10 +210,7 @@ impl OllamaEmbedder {
         if let Some(key) = &self.api_key {
             req_b = req_b.bearer_auth(key);
         }
-        let resp = req_b
-            .send()
-            .await
-            .context("ollama embeddings request")?;
+        let resp = req_b.send().await.context("ollama embeddings request")?;
         let status = resp.status();
         // The **body**, not just the status. `error_for_status()` discards it, and the body is
         // the only place Ollama says *why*: the log line that started this read
@@ -395,13 +392,21 @@ mod tests {
         let prose = "the quick brown fox jumps over the lazy dog. ".repeat(4_000);
         let v = e.embed(&prose).await.unwrap();
         println!("prose {} chars -> {} dims", prose.len(), v.len());
-        assert_eq!(v.len(), 768, "a long document must still get a real embedding");
+        assert_eq!(
+            v.len(),
+            768,
+            "a long document must still get a real embedding"
+        );
 
         // The shape that defeated a fixed budget: dense, one token per character.
         let dense = "x".repeat(60_000);
         let v = e.embed(&dense).await.unwrap();
         println!("dense {} chars -> {} dims", dense.len(), v.len());
-        assert_eq!(v.len(), 768, "the retry must shrink until the model accepts it");
+        assert_eq!(
+            v.len(),
+            768,
+            "the retry must shrink until the model accepts it"
+        );
     }
 
     /// The bug this file's truncation exists to prevent, asserted on the two facts that
@@ -414,13 +419,20 @@ mod tests {
     #[test]
     fn a_long_input_is_truncated_rather_than_lost() {
         // Short input is untouched — the common case must not be altered.
-        assert_eq!(truncate_for_embedding("TenantPodOOMKillLoop"), "TenantPodOOMKillLoop");
+        assert_eq!(
+            truncate_for_embedding("TenantPodOOMKillLoop"),
+            "TenantPodOOMKillLoop"
+        );
 
         // A document larger than any model's window comes back bounded.
         let long = "the quick brown fox jumps over the lazy dog. ".repeat(4_000);
         let cut = truncate_for_embedding(&long);
         assert!(cut.len() <= MAX_EMBED_CHARS);
-        assert!(cut.len() > MAX_EMBED_CHARS - 8, "cut close to the budget: {}", cut.len());
+        assert!(
+            cut.len() > MAX_EMBED_CHARS - 8,
+            "cut close to the budget: {}",
+            cut.len()
+        );
         // Still a prefix of the original: an embedding of the opening, not of nothing.
         assert!(long.starts_with(cut));
 

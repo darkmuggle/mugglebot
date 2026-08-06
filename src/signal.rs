@@ -4,6 +4,29 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+/// Undo the HTML entity escaping an upstream applied to text it sent us.
+///
+/// Slack escapes `&`, `<` and `>` in message text, which is invisible in prose and
+/// destructive in a URL: `?from=1785862320000&amp;to=1785865956924` is not the same query
+/// as `?from=…&to=…`. Grafana reads the second parameter of the escaped form as one named
+/// `amp;to` and ignores it, so a dashboard link with a time range opens on the dashboard's
+/// *default* window instead — the alert's own range, silently dropped.
+///
+/// This was found by running the link parser over 164 real alerts: 157 carried a dashboard
+/// link, and the parser recovered a time range from 11 of them. The other 146 had one and
+/// it had been escaped away.
+///
+/// `&amp;` is undone **last**. Doing it first would turn a literal `&amp;lt;` into `<`,
+/// inventing markup that was never in the message.
+pub fn unescape_html(text: &str) -> String {
+    text.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&nbsp;", " ")
+        .replace("&amp;", "&")
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Source {
@@ -166,5 +189,33 @@ impl Signal {
 
     fn raw_flag(&self, key: &str) -> bool {
         self.raw.get(key).and_then(|v| v.as_bool()).unwrap_or(false)
+    }
+}
+
+#[cfg(test)]
+mod unescape_tests {
+    use super::unescape_html;
+
+    /// A real Grafana dashboard link, exactly as Slack delivers it.
+    #[test]
+    fn a_slack_escaped_url_becomes_a_usable_one() {
+        let got = unescape_html(
+            "https://g.grafana.net/d/abc?orgId=1&amp;from=now-6h&amp;to=now&amp;viewPanel=2",
+        );
+        assert_eq!(
+            got,
+            "https://g.grafana.net/d/abc?orgId=1&from=now-6h&to=now&viewPanel=2"
+        );
+    }
+
+    /// `&amp;` last, so an escaped entity reference does not become live markup.
+    #[test]
+    fn an_escaped_entity_reference_is_not_turned_into_markup() {
+        assert_eq!(unescape_html("&amp;lt;script&amp;gt;"), "&lt;script&gt;");
+    }
+
+    #[test]
+    fn text_with_nothing_to_undo_is_returned_as_is() {
+        assert_eq!(unescape_html("plain & simple"), "plain & simple");
     }
 }

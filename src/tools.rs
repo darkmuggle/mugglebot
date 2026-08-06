@@ -58,8 +58,14 @@ pub struct Tools {
     pub investigator: Arc<crate::rootcause::Investigator>,
     pub repos: Arc<crate::repos::RepoIndex>,
     pub browser: Arc<crate::browser::BrowserDriver>,
+    /// Reads a pasted Slack thread with two models. Held here because requesting one is an
+    /// operator action, and the fetch runs inline so a bad link is an error on the button
+    /// rather than a queued row that fails a minute later.
+    pub threads: Arc<crate::thread::Analyser>,
     /// Reads and summarizes pull request diffs, for the one case object state has none yet.
     pub diffs: Arc<crate::prdiff::DiffReader>,
+    /// Personas: the modelled people, their profiles, and the predictions made from them.
+    pub personas: Arc<crate::persona::Engine>,
 }
 
 /// Pull the indexing invocations out of a raw Restate introspection result.
@@ -131,6 +137,13 @@ impl Tools {
             "search" => self.search(args),
             "list_alerts" => self.list_alerts(args),
             "list_browser_investigations" => self.list_browser_investigations(args),
+            "analyse_thread" => self.analyse_thread(args).await,
+            "list_thread_analyses" => Ok(json!(self
+                .store
+                .list_thread_analyses(args.get("limit").and_then(|v| v.as_i64()).unwrap_or(30))?)),
+            "get_thread_analysis" => Ok(json!(self
+                .store
+                .get_thread_analysis(&req_str(args, "id")?)?)),
             "get_root_cause" => self.get_root_cause(args),
             "list_repos" => Ok(json!(self.repos.list()?)),
             "list_issue_triage" => Ok(json!(self.store.list_issue_triage()?)),
@@ -170,6 +183,21 @@ impl Tools {
                 }
             }
             "repo_index_detail" => self.repo_index_detail(args).await,
+            "list_personas" => self.list_personas(),
+            "get_persona" => self.get_persona(args),
+            "propose_personas" => self.propose_personas_labelled(args).await,
+            "create_persona" => self.create_persona(args).await,
+            "update_persona" => self.update_persona(args),
+            "delete_persona" => self.delete_persona(args),
+            "link_persona_identity" => self.link_persona_identity(args).await,
+            "unlink_persona_identity" => self.unlink_persona_identity(args),
+            "harvest_persona" => self.harvest_persona(args).await,
+            "refresh_persona_profile" => self.refresh_persona_profile(args).await,
+            "predict_persona" => self.predict_persona(args).await,
+            "list_predictions" => self.list_predictions(args),
+            "who_knows" => self.who_knows(args),
+            "add_persona_context" => self.add_persona_context(args).await,
+            "remove_persona_context" => self.remove_persona_context(args),
             "chat_context" => self.chat_context(args),
             "pr_diff" => self.pr_diff(args).await,
             "pr_review" => self.pr_review(args).await,
@@ -431,11 +459,36 @@ impl Tools {
             .first()
             .ok_or_else(|| anyhow!("subject {subject_key} has no signals to anchor to"))?;
         let context = anchor.body.as_deref().unwrap_or(&anchor.title);
+        // Operator-driven, and the operator named a URL — so this is the browser tier by
+        // construction. The Grafana tier is chosen from an alert's *parsed links*, which a
+        // hand-typed URL is not.
         let queued = self.store.queue_browser_investigation(
             &anchor.id,
             &url,
             self.browser.brief(&url, context).as_str(),
+            "browser",
         )?;
+        Ok(json!(queued))
+    }
+
+    /// Queue an analysis of one pasted Slack thread.
+    ///
+    /// The thread is fetched *here*, before the row is written: a mistyped link or a channel
+    /// the token cannot see becomes an error on the button, which is where the operator is
+    /// looking. Queueing first would put the same failure in a row they would have to go and
+    /// find.
+    async fn analyse_thread(&self, args: &Value) -> Result<Value> {
+        if !self.threads.ready() {
+            bail!(
+                "thread analysis is off — set [threads].enabled = true and store a `slack` \
+                 credential"
+            );
+        }
+        let link = req_str(args, "link")?;
+        let queued = self.threads.request(&link).await?;
+        // Poke the sweep rather than running two model calls inside this request: the
+        // operator gets the row back immediately and watches it fill in.
+        self.ingress.start_scheduler("browser-queue").await.ok();
         Ok(json!(queued))
     }
 
@@ -991,10 +1044,7 @@ impl Tools {
         // and wants another sample. `force` is the same escape hatch `pr_diff`'s re-read uses,
         // and for the same reason: per-second, so a double click is still free while a
         // deliberate redo is not.
-        let force = args
-            .get("force")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
+        let force = args.get("force").and_then(|v| v.as_bool()).unwrap_or(false);
         let mut version = crate::prdiff::with_model(&watermark, label, &model);
         if force {
             version.push_str(&format!("#r{}", chrono::Utc::now().timestamp()));
@@ -1046,6 +1096,625 @@ impl Tools {
             Ok(true) => debug!("reviewing {pr_key}"),
             Ok(false) => debug!("{pr_key} is already being reviewed at this watermark"),
             Err(e) => debug!("submitting a review for {pr_key} failed: {e:#}"),
+        }
+    }
+
+    // ---- personas -----------------------------------------------------------
+    //
+    // The write tools here mutate MuggleBot's own store, like every other write on this
+    // surface — nothing reaches GitHub or Slack. A prediction is a private rehearsal.
+
+    /// Every modelled person, with their freshness and how much is behind each profile.
+    fn list_personas(&self) -> Result<Value> {
+        let mut out = Vec::new();
+        for p in self.store.list_personas()? {
+            let evidence = self.store.persona_evidence(&p.slug, None)?;
+            let (cursor, backfill_complete) = self.store.persona_harvest_cursor(&p.slug)?;
+            out.push(json!({
+                "slug": p.slug,
+                "display_name": p.display_name,
+                "role": p.role,
+                "identities": p.identities,
+                "harvested_at": p.harvested_at,
+                "profiled_at": p.profiled_at,
+                "traits": self.store.persona_traits(&p.slug)?.len(),
+                // Counted, never modelled — see `persona::Stats`.
+                "stats": crate::persona::Stats::compute(&evidence),
+                "walked_back_to": cursor,
+                "backfill_complete": backfill_complete,
+                // Why this profile is thinner than it looks like it should be. NULL is the
+                // good case; anything else is the difference between "quiet colleague" and
+                // "nothing was actually read".
+                "harvest_note": self.store.persona_harvest_note(&p.slug)?,
+                // The two or three areas worth showing on a row — "who is this person for"
+                // answered before you click in.
+                "sme": crate::persona::sme::with_depth(
+                    crate::persona::sme::areas(&evidence),
+                    &self.store.persona_traits(&p.slug)?,
+                )
+                .into_iter()
+                .take(3)
+                .collect::<Vec<_>>(),
+            }));
+        }
+        Ok(json!({ "enabled": self.personas.enabled, "personas": out }))
+    }
+
+    /// One persona in full: the profile, what verification refused, and recent predictions.
+    ///
+    /// `removed` is returned rather than hidden for the same reason `subject_explanations`
+    /// returns it: a profile that had claims taken out of it is one to read more carefully,
+    /// and a filter nobody can see is a filter nobody can debug.
+    fn get_persona(&self, args: &Value) -> Result<Value> {
+        let slug = req_str(args, "slug")?;
+        let Some(profile) = self.store.persona_profile(&slug)? else {
+            bail!("no persona '{slug}'");
+        };
+        let evidence_limit = args
+            .get("evidence_limit")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(60) as usize;
+        Ok(json!({
+            "persona": profile.persona,
+            "traits": profile.traits,
+            "removed": profile.removed,
+            "stats": profile.stats,
+            "caveats": profile.caveats(),
+            "harvest_note": self.store.persona_harvest_note(&slug)?,
+            "sme": profile.sme,
+            "context": profile.context,
+            "evidence": self.store.persona_evidence(&slug, Some(evidence_limit))?,
+            "predictions": self.store.predictions_for_persona(&slug, 20)?,
+        }))
+    }
+
+    /// Refresh the cached Slack workspace directory if it is stale.
+    ///
+    /// Lazy and best-effort, on the operator paths that need names. A failure is not an error
+    /// here: without the directory, proposals fall back to raw ids and linking still works by
+    /// id, so a missing `users:read` scope degrades the feature rather than breaking it.
+    async fn refresh_slack_directory(&self) {
+        /// A workspace directory changes when somebody joins. Daily is generous.
+        const TTL_HOURS: i64 = 24;
+
+        let stale = match self.store.slack_directory_age() {
+            Ok((_, 0)) => true,
+            Ok((Some(when), _)) => (chrono::Utc::now() - when).num_hours() >= TTL_HOURS,
+            Ok((None, _)) => true,
+            Err(_) => true,
+        };
+        if !stale {
+            return;
+        }
+        let Some(token) = self.secrets.get_opt("slack") else {
+            debug!("slack directory: no stored slack token, so names stay as ids");
+            return;
+        };
+        match crate::watchers::slack::fetch_users(&reqwest::Client::new(), &token).await {
+            Ok(users) => match self.store.put_slack_users(&users) {
+                Ok(n) => debug!("slack directory: cached {n} member(s)"),
+                Err(e) => debug!("slack directory: storing failed: {e:#}"),
+            },
+            Err(e) => debug!("slack directory: {e:#}"),
+        }
+    }
+
+    /// People the signal log has seen, ranked by how much the operator deals with them.
+    ///
+    /// Proposes; never creates. See [`crate::persona::harvest::propose`] on why modelling
+    /// every actor automatically would be both useless and wrong.
+    ///
+    /// Slack candidates are **labelled from the workspace directory**, because a ranked list of
+    /// `U06T7445RHD (94 interactions)` cannot be acted on: the operator has no way to tell
+    /// which of those opaque ids is the colleague they meant.
+    async fn propose_personas_labelled(&self, args: &Value) -> Result<Value> {
+        self.refresh_slack_directory().await;
+        let mut out = self.propose_personas(args)?;
+        if let Some(candidates) = out.get_mut("candidates").and_then(|c| c.as_array_mut()) {
+            for c in candidates.iter_mut() {
+                let (Some("slack"), Some(handle)) = (
+                    c.get("source").and_then(Value::as_str),
+                    c.get("handle").and_then(Value::as_str).map(str::to_string),
+                ) else {
+                    continue;
+                };
+                if let Ok(Some(user)) = self.store.slack_user(&handle) {
+                    c["label"] = json!(user.label());
+                    c["is_bot"] = json!(user.is_bot);
+                    c["deleted"] = json!(user.deleted);
+                    // The suggested slug becomes the *name* rather than the opaque id, so a
+                    // persona created from a proposal is called `pavel-cholakov` and not
+                    // `u06t7445rhd`.
+                    c["suggested_slug"] = json!(crate::persona::Persona::slugify(&user.name));
+                    // Every handle worth linking for this person, so the create form can
+                    // offer the GitHub side pre-guessed.
+                    c["aliases"] = json!(user.aliases());
+                }
+            }
+            // Automation the directory *knows* is automation, dropped.
+            //
+            // Strictly better than the name-substring guess in `harvest::propose`, which
+            // cannot see through an opaque id: `U06T7445RHD` is the incident.io bot and was
+            // the single highest-ranked candidate on this workspace, 95 interactions of
+            // alerts. The name filter stays as the fallback for a workspace with no directory
+            // cached — there, a missed bot is a junk row rather than an invisible person.
+            candidates.retain(|c| {
+                !c.get("is_bot").and_then(Value::as_bool).unwrap_or(false)
+                    && !c.get("deleted").and_then(Value::as_bool).unwrap_or(false)
+            });
+        }
+        Ok(out)
+    }
+
+    fn propose_personas(&self, args: &Value) -> Result<Value> {
+        let existing: Vec<String> = self
+            .store
+            .list_personas()?
+            .into_iter()
+            .flat_map(|p| {
+                // Match proposals against the identities already linked as well as the slug:
+                // a persona named `pav` with the GitHub login `pcholakov` linked should not
+                // have `pcholakov` proposed back at the operator.
+                let mut keys: Vec<String> = p.identities.iter().map(|i| i.handle.clone()).collect();
+                keys.push(p.slug);
+                keys
+            })
+            .collect();
+        let limit = args
+            .get("limit")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(self.personas.max_proposals as u64) as usize;
+        Ok(json!({
+            "candidates": crate::persona::harvest::propose(&self.store, &existing, limit)?,
+        }))
+    }
+
+    /// Create a persona and arm its harvest loop.
+    async fn create_persona(&self, args: &Value) -> Result<Value> {
+        if !self.personas.enabled {
+            bail!("personas are disabled — set `[personas] enabled = true` in the config");
+        }
+        let display_name = req_str(args, "display_name")?;
+        let slug = crate::persona::Persona::slugify(
+            &opt_str(args, "slug").unwrap_or_else(|| display_name.clone()),
+        );
+        if slug.is_empty() {
+            bail!("'{display_name}' does not reduce to a usable slug — pass one explicitly");
+        }
+        if self.store.get_persona(&slug)?.is_some() {
+            bail!("a persona '{slug}' already exists");
+        }
+        // The directory first, so a Slack handle typed as a name resolves to the id the
+        // signal log actually records. Without it the link harvests nothing and looks like a
+        // colleague who never posts.
+        self.refresh_slack_directory().await;
+        let mut identities = identities_from(args)?;
+        for identity in &mut identities {
+            resolve_slack_handle(&self.store, identity)?;
+        }
+        let now = chrono::Utc::now();
+        let persona = crate::persona::Persona {
+            slug: slug.clone(),
+            display_name,
+            role: opt_str(args, "role"),
+            notes: opt_str(args, "notes"),
+            identities,
+            created_at: now,
+            updated_at: now,
+            harvested_at: None,
+            profiled_at: None,
+            evidence_watermark: None,
+        };
+        self.store.put_persona(&persona)?;
+        // Two sends, and both are needed.
+        //
+        // `start` arms the recurring loop. `poke` does the *first* pass now, at operator
+        // priority — and that second one is the fix for a real failure: creating a persona armed
+        // the loop and left the first harvest to `tick`, which is `Trigger::Scheduled` and
+        // therefore background. So a persona created while the code index held the GitHub budget
+        // at its reserve was refused on its opening pass and sat with no GitHub evidence at all,
+        // which is precisely the "it isn't working" the operator sees. Creating a persona is an
+        // operator action; the loop's ticks are not.
+        //
+        // Best-effort: an unreachable ingress must not fail the creation, and `start` is
+        // idempotent-by-staleness so the next boot sweep arms it.
+        let armed = self.arm_persona(&slug).await;
+        let harvesting = self.poke_persona(&slug).await;
+        Ok(json!({ "persona": persona, "armed": armed, "harvesting": harvesting }))
+    }
+
+    /// Edit the operator-asserted parts of a persona.
+    ///
+    /// Deliberately only those. `role` and `notes` are *asserted*, not inferred, which is why
+    /// they bypass trait verification entirely and are fed to the model verbatim; the traits
+    /// themselves are not editable here, because a hand-written trait would be an uncited
+    /// claim in a store whose whole contract is that every claim has a citation.
+    fn update_persona(&self, args: &Value) -> Result<Value> {
+        let slug = req_str(args, "slug")?;
+        let Some(mut persona) = self.store.get_persona(&slug)? else {
+            bail!("no persona '{slug}'");
+        };
+        if let Some(name) = opt_str(args, "display_name") {
+            persona.display_name = name;
+        }
+        // Present-but-empty clears; absent leaves alone. The two have to be distinguishable
+        // or a note can be written and never removed.
+        if args.get("role").is_some() {
+            persona.role = opt_str(args, "role");
+        }
+        if args.get("notes").is_some() {
+            persona.notes = opt_str(args, "notes");
+        }
+        persona.updated_at = chrono::Utc::now();
+        self.store.put_persona(&persona)?;
+        Ok(json!(persona))
+    }
+
+    /// Stop modelling somebody, and remove everything derived from them.
+    fn delete_persona(&self, args: &Value) -> Result<Value> {
+        let slug = req_str(args, "slug")?;
+        Ok(json!({ "deleted": self.store.delete_persona(&slug)? }))
+    }
+
+    /// Attach a handle to a persona, and harvest through it from the next tick.
+    async fn link_persona_identity(&self, args: &Value) -> Result<Value> {
+        let slug = req_str(args, "slug")?;
+        if self.store.get_persona(&slug)?.is_none() {
+            bail!("no persona '{slug}'");
+        }
+        self.refresh_slack_directory().await;
+        let mut identity = one_identity(args)?;
+        resolve_slack_handle(&self.store, &mut identity)?;
+        self.store.link_persona_identity(&slug, &identity)?;
+        // A confirmed identity is new material, so harvest now rather than at the next tick:
+        // linking a login is the moment the operator expects the profile to start filling in.
+        let harvesting = identity.provenance.confirmed() && self.poke_persona(&slug).await;
+        Ok(json!({
+            "slug": slug,
+            "identity": identity,
+            "harvesting": harvesting,
+        }))
+    }
+
+    fn unlink_persona_identity(&self, args: &Value) -> Result<Value> {
+        let source = req_source(args, "source")?;
+        let handle = req_str(args, "handle")?;
+        Ok(json!({
+            "unlinked": self.store.unlink_persona_identity(source, &handle)?,
+        }))
+    }
+
+    /// Harvest now, rather than waiting for the next tick.
+    async fn harvest_persona(&self, args: &Value) -> Result<Value> {
+        let slug = req_str(args, "slug")?;
+        if self.store.get_persona(&slug)?.is_none() {
+            bail!("no persona '{slug}'");
+        }
+        Ok(json!({ "slug": slug, "harvesting": self.poke_persona(&slug).await }))
+    }
+
+    /// Re-distil the profile from everything harvested.
+    ///
+    /// Submitted as a workflow rather than run inline: it is one local model pass per facet,
+    /// which measured in minutes, and an HTTP request held open for it makes the UI hostage to
+    /// it. `submitted: false` means the profile is already current for this evidence set — a
+    /// success, not a failure.
+    async fn refresh_persona_profile(&self, args: &Value) -> Result<Value> {
+        let slug = req_str(args, "slug")?;
+        if self.store.get_persona(&slug)?.is_none() {
+            bail!("no persona '{slug}'");
+        }
+        let Some(watermark) = self.store.persona_evidence_watermark(&slug)? else {
+            bail!(
+                "nothing has been harvested for '{slug}' yet — link a GitHub login or Slack \
+                 user id, then harvest"
+            );
+        };
+        // An explicit redo on an unchanged evidence set has to bypass the key collision, the
+        // same way `IssueTriage`'s `#a{n}` suffix does.
+        let key = match args.get("force").and_then(|v| v.as_bool()).unwrap_or(false) {
+            true => format!(
+                "{}#r{}",
+                crate::restate::workflows::persona::PersonaProfile::key(&slug, &watermark),
+                chrono::Utc::now().timestamp()
+            ),
+            false => crate::restate::workflows::persona::PersonaProfile::key(&slug, &watermark),
+        };
+        let submitted = self
+            .ingress
+            .submit_workflow(
+                "PersonaProfile",
+                &key,
+                Some(crate::restate::workflows::persona::PersonaProfile::SCOPE),
+            )
+            .await?;
+        Ok(json!({
+            "submitted": submitted,
+            "workflow": key,
+            "note": if submitted {
+                "Distilling — one local pass per facet, so this takes a few minutes."
+            } else {
+                "The profile is already current for everything harvested. Pass force to redo it."
+            },
+        }))
+    }
+
+    /// Predict what one or more personas would do about a subject.
+    ///
+    /// Takes a list, because the operator's question is "how will this land" and the answer is
+    /// the *set* of reactions — a reviewer who will block and a reviewer who will not care are
+    /// one answer together, and two separate button presses apart.
+    async fn predict_persona(&self, args: &Value) -> Result<Value> {
+        let subject_key = req_str(args, "subject_key")?;
+        if self.attributor.subject_view(&subject_key)?.is_none() {
+            bail!("no subject {subject_key}");
+        }
+        let slugs = match str_array(args, "personas") {
+            empty if empty.is_empty() => vec![req_str(args, "slug")?],
+            many => many,
+        };
+        let kind = match opt_str(args, "kind") {
+            Some(k) => crate::persona::PredictionKind::parse(&k).ok_or_else(|| {
+                anyhow!("kind must be code_review, issue_response or slack_engagement (got '{k}')")
+            })?,
+            // The kind follows the subject unless the operator overrides it: offering a code
+            // review on a Slack thread would produce one, about a diff that does not exist.
+            None => crate::persona::PredictionKind::for_subject(&subject_key),
+        };
+        let watermark = self.store.subject_watermark(&subject_key);
+        // The model rides in the key, so a cloud read sits beside the local one rather than
+        // being refused as a duplicate of it — the same arrangement as `SecondOpinion`.
+        let produced_by = match (opt_str(args, "provider"), opt_str(args, "model")) {
+            (Some(provider), Some(model)) => {
+                crate::restate::workflows::persona::PredictKey::model_label(
+                    crate::reasoner::provider_label(&provider),
+                    &model,
+                )
+            }
+            _ => "local".to_string(),
+        };
+
+        let mut submitted = Vec::new();
+        for slug in slugs {
+            if self.store.get_persona(&slug)?.is_none() {
+                bail!("no persona '{slug}'");
+            }
+            let key = crate::restate::workflows::persona::PredictKey::new(
+                &slug,
+                kind,
+                &produced_by,
+                &subject_key,
+                &watermark,
+            )
+            .format();
+            let started = self
+                .ingress
+                .submit_workflow(
+                    "PersonaPredict",
+                    &key,
+                    Some(crate::restate::workflows::persona::PersonaPredict::SCOPE),
+                )
+                .await?;
+            submitted.push(json!({
+                "persona": slug,
+                "submitted": started,
+                "workflow": key,
+            }));
+        }
+        Ok(json!({
+            "subject_key": subject_key,
+            "kind": kind.as_str(),
+            "watermark": watermark,
+            "produced_by": produced_by,
+            "predictions": submitted,
+            // What is already stored, so a caller that submitted nothing new still gets the
+            // answer back rather than an empty response that reads as a failure.
+            "stored": self.store.predictions_for_subject(&subject_key)?,
+        }))
+    }
+
+    /// Attach something you know about a person that no excerpt could supply.
+    ///
+    /// Text is used verbatim. A URL goes through the same `ContextIngest` path as the context
+    /// library, so a team charter or an onboarding doc becomes a summary the model can read.
+    ///
+    /// This bypasses trait verification by design — see [`crate::persona::Context`]. It also
+    /// **re-profiles**, because a fact like "owns the release process" changes what their review
+    /// comments mean, and a profile distilled before you said so is distilled without it.
+    async fn add_persona_context(&self, args: &Value) -> Result<Value> {
+        let slug = req_str(args, "slug")?;
+        if self.store.get_persona(&slug)?.is_none() {
+            bail!("no persona '{slug}'");
+        }
+        let content = req_str(args, "content")?.trim().to_string();
+        if content.is_empty() {
+            bail!("`content` cannot be empty");
+        }
+        let is_url = content.starts_with("http://") || content.starts_with("https://");
+        let kind = if is_url { "url" } else { "text" };
+        // Fetched and summarized now rather than lazily: the operator is watching, and a URL
+        // whose summary arrives on some later tick would be attached-but-empty in the profile
+        // pass that runs seconds from here.
+        let summary = if is_url {
+            match self
+                .context
+                .add(ContextSourceKind::Url, &content, None, None, None, None)
+                .await
+            {
+                Ok(entry) => entry.summary,
+                Err(e) => {
+                    debug!("persona context: reading {content} failed: {e:#}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let id = self
+            .store
+            .add_persona_context(&slug, kind, &content, summary.as_deref())?;
+        let reprofiling = self.reprofile(&slug).await;
+        Ok(json!({
+            "id": id,
+            "slug": slug,
+            "kind": kind,
+            "summary": summary,
+            "reprofiling": reprofiling,
+        }))
+    }
+
+    /// Remove one attached fact, and re-profile without it.
+    fn remove_persona_context(&self, args: &Value) -> Result<Value> {
+        let id = req_str(args, "id")?;
+        Ok(json!({ "removed": self.store.remove_persona_context(&id)? }))
+    }
+
+    /// Submit a fresh profile pass, bypassing the key collision.
+    ///
+    /// Used by the paths that change what a profile should say without changing the evidence it
+    /// is built from — attaching context, editing the role. The watermark is unmoved in those
+    /// cases, so a plain submission would be refused as a duplicate and the operator's new fact
+    /// would sit unread until the next harvest happened to find something.
+    async fn reprofile(&self, slug: &str) -> bool {
+        let Ok(Some(watermark)) = self.store.persona_evidence_watermark(slug) else {
+            return false;
+        };
+        let key = format!(
+            "{}#r{}",
+            crate::restate::workflows::persona::PersonaProfile::key(slug, &watermark),
+            chrono::Utc::now().timestamp()
+        );
+        self.ingress
+            .submit_workflow(
+                "PersonaProfile",
+                &key,
+                Some(crate::restate::workflows::persona::PersonaProfile::SCOPE),
+            )
+            .await
+            .unwrap_or(false)
+    }
+
+    /// Who to ask about an area of the codebase.
+    ///
+    /// The question you have *before* you have a persona in mind: not "how does Pavel review"
+    /// but "who knows the storage layer". Ranked across every modelled person by where their
+    /// review activity actually concentrates — see [`crate::persona::sme`].
+    ///
+    /// Two honesty properties the ranking has to keep:
+    ///
+    /// - **Presence and expertise are distinguished, not merged.** An area where the model has
+    ///   established that their comments are specific outranks one where they are merely
+    ///   active, and both are returned labelled. "They are around" is a useful answer; it is
+    ///   not the same answer as "ask them".
+    /// - **It only knows who you have modelled.** The real expert may not have a persona at
+    ///   all, so the reply says how many people were considered. A ranked list of two is a
+    ///   ranked list of two, and reading it as "the two people who know this" would be wrong.
+    fn who_knows(&self, args: &Value) -> Result<Value> {
+        let area = req_str(args, "area")?.trim().to_ascii_lowercase();
+        if area.is_empty() {
+            bail!("`area` cannot be empty — pass a repo, a path, or a word from one");
+        }
+        let personas = self.store.list_personas()?;
+        let mut hits = Vec::new();
+        for p in &personas {
+            let Some(profile) = self.store.persona_profile(&p.slug)? else {
+                continue;
+            };
+            // Substring either way, so `storage` finds `o/r:src/storage` and
+            // `restatedev/restate-cloud` finds a persona whose area is the bare repo name.
+            let matched: Vec<_> = profile
+                .sme
+                .iter()
+                .filter(|a| {
+                    let name = a.area.to_ascii_lowercase();
+                    name.contains(&area) || area.contains(&name)
+                })
+                .collect();
+            let Some(best) = matched.iter().max_by(|a, b| {
+                a.is_expert()
+                    .cmp(&b.is_expert())
+                    .then(a.reviews.cmp(&b.reviews))
+            }) else {
+                continue;
+            };
+            hits.push(json!({
+                "persona": p.slug,
+                "display_name": p.display_name,
+                "role": p.role,
+                "area": best.area,
+                "kind": best.kind.as_str(),
+                "excerpts": best.excerpts,
+                "reviews": best.reviews,
+                "share": best.share,
+                // The distinction that must not be flattened.
+                "established_expertise": best.is_expert(),
+                "depth": best.depth,
+                "depth_trait": best.depth_trait,
+                "evidence": best.evidence,
+                "other_matching_areas": matched.len().saturating_sub(1),
+            }));
+        }
+        // Expertise first, then whoever reviews there most.
+        hits.sort_by(|a, b| {
+            let expert = |v: &Value| v["established_expertise"].as_bool().unwrap_or(false);
+            let reviews = |v: &Value| v["reviews"].as_u64().unwrap_or(0);
+            expert(b).cmp(&expert(a)).then(reviews(b).cmp(&reviews(a)))
+        });
+        Ok(json!({
+            "area": area,
+            "candidates": hits,
+            // Said out loud: this ranks the people you model, not the org.
+            "personas_considered": personas.len(),
+            "note": if hits.is_empty() {
+                "Nobody modelled has established activity in this area. That is a statement \
+                 about who you have modelled, not about who knows it."
+            } else {
+                "Ranked over modelled people only — the person who knows this best may not have \
+                 a persona."
+            },
+        }))
+    }
+
+    /// Stored predictions, for a subject or for a persona.
+    fn list_predictions(&self, args: &Value) -> Result<Value> {
+        match (opt_str(args, "subject_key"), opt_str(args, "slug")) {
+            (Some(subject), _) => Ok(json!(self.store.predictions_for_subject(&subject)?)),
+            (None, Some(slug)) => Ok(json!(self.store.predictions_for_persona(&slug, 50)?)),
+            (None, None) => bail!("pass either subject_key or slug"),
+        }
+    }
+
+    /// Arm a persona's harvest loop. Best-effort — see [`Self::create_persona`].
+    async fn arm_persona(&self, slug: &str) -> bool {
+        match self
+            .ingress
+            .send_object_empty("Persona", slug, "start")
+            .await
+        {
+            Ok(_) => true,
+            Err(e) => {
+                debug!("arming the persona loop for {slug} failed: {e:#}");
+                false
+            }
+        }
+    }
+
+    /// Run a harvest pass now, without disturbing the loop's cadence.
+    ///
+    /// Targets `poke`, **not** `tick`, for the reason the repo indexer does: `tick` arms the
+    /// next timer as its first act, so calling it out of band forks the loop and every later
+    /// press adds another chain.
+    async fn poke_persona(&self, slug: &str) -> bool {
+        match self
+            .ingress
+            .send_object_empty("Persona", slug, "poke")
+            .await
+        {
+            Ok(_) => true,
+            Err(e) => {
+                debug!("poking the persona harvest for {slug} failed: {e:#}");
+                false
+            }
         }
     }
 
@@ -1721,6 +2390,15 @@ pub fn definitions() -> Vec<ToolDef> {
         ToolDef { name: "list_browser_investigations", read_only: true,
             description: "Browser investigations of dashboard links on one subject, with status (pending/running/completed/failed) and the findings read off each page. MuggleBot drives the operator's signed-in Chrome read-only; it never mutates a dashboard.",
             schema: obj(json!({ "subject_key": s() }), &["subject_key"]) },
+        ToolDef { name: "analyse_thread", read_only: false,
+            description: "Analyse one Slack thread from a pasted permalink (Slack's \"Copy link\"). Two models — Claude and ChatGPT — read it independently and blind to each other, using any persona profiles the participants have; the result marks which findings both models reached and which only one did. Every finding cites the messages it rests on, and a finding quoting words nobody wrote is discarded. Includes a candid section about the operator's own part in the thread. Reads Slack only; never posts.",
+            schema: obj(json!({ "link": s() }), &["link"]) },
+        ToolDef { name: "list_thread_analyses", read_only: true,
+            description: "Slack thread analyses requested so far, newest first, with status (pending/running/completed/failed).",
+            schema: obj(json!({ "limit": {"type":"integer"} }), &[]) },
+        ToolDef { name: "get_thread_analysis", read_only: true,
+            description: "One Slack thread analysis by id: the thread as read, both models' findings, and what they agreed on.",
+            schema: obj(json!({ "id": s() }), &["id"]) },
         ToolDef { name: "get_root_cause", read_only: true,
             description: "The stored root-cause report for a subject: the symptoms searched, repos routed to, and the ranked issue/PR/commit/code candidates with confidences and rationales. Null if none has been run. Candidates are hypotheses with citations, never confirmed causes.",
             schema: obj(json!({ "subject_key": s() }), &["subject_key"]) },
@@ -1844,6 +2522,64 @@ pub fn definitions() -> Vec<ToolDef> {
         ToolDef { name: "list_incidents", read_only: true,
             description: "Open incident.io incidents, each with what it has been mapped to: the ranked code candidates (repo / component / commit, with evidence), and any issues or pull requests it has been linked to. Tracks what incident.io says is open — `triage`, `active` and `post-incident` — so an incident leaves this list when it is closed upstream rather than when you acknowledge it. Pass `active_only: false` to include closed ones.",
             schema: obj(json!({ "active_only": {"type":"boolean"} }), &[]) },
+        // ---- personas -------------------------------------------------------
+        //
+        // A persona is a candid behavioural model of one colleague, built from things they
+        // actually wrote, used to predict how they will respond *before* you ask them.
+        // Predictions are private rehearsals: nothing here posts anything anywhere.
+        ToolDef { name: "list_personas", read_only: true,
+            description: "The modelled people: their identities, how much evidence is behind each profile, and how fresh it is.",
+            schema: none() },
+        ToolDef { name: "get_persona", read_only: true,
+            description: "One persona in full: verified traits with their citations, the claims verification refused and why, counted stats, evidence excerpts, and recent predictions.",
+            schema: obj(json!({ "slug": s(), "evidence_limit": {"type":"integer"} }), &["slug"]) },
+        ToolDef { name: "propose_personas", read_only: true,
+            description: "People seen in the signal log who are not yet modelled, ranked by how much you interact with them. Proposes only — creating a persona is a decision.",
+            schema: obj(json!({ "limit": {"type":"integer"} }), &[]) },
+        ToolDef { name: "create_persona", read_only: false,
+            description: "Start modelling a person. `role` and `notes` are your own words and are used verbatim; identities are the handles to harvest through.",
+            schema: obj(json!({
+                "display_name": s(), "slug": s(), "role": s(), "notes": s(),
+                "identities": { "type": "array", "items": obj(json!({
+                    "source": s(), "handle": s(), "provenance": s(), "rationale": s()
+                }), &["source", "handle"]) }
+            }), &["display_name"]) },
+        ToolDef { name: "update_persona", read_only: false,
+            description: "Edit a persona's name, role or notes. Traits are not editable — every claim in a profile has to carry a citation.",
+            schema: obj(json!({ "slug": s(), "display_name": s(), "role": s(), "notes": s() }), &["slug"]) },
+        ToolDef { name: "delete_persona", read_only: false,
+            description: "Stop modelling somebody, and delete everything derived from them: evidence, traits, predictions and identities.",
+            schema: obj(json!({ "slug": s() }), &["slug"]) },
+        ToolDef { name: "link_persona_identity", read_only: false,
+            description: "Attach a GitHub login, Slack user id or Granola speaker name to a persona. Evidence is only ever harvested through a confirmed identity.",
+            schema: obj(json!({ "slug": s(), "source": s(), "handle": s(), "provenance": s(), "rationale": s() }), &["slug", "source", "handle"]) },
+        ToolDef { name: "unlink_persona_identity", read_only: false,
+            description: "Detach a handle from whichever persona owns it.",
+            schema: obj(json!({ "source": s(), "handle": s() }), &["source", "handle"]) },
+        ToolDef { name: "harvest_persona", read_only: false,
+            description: "Gather evidence for a persona now: their Slack and meeting activity from the signal log, and a bounded page of their GitHub review history.",
+            schema: obj(json!({ "slug": s() }), &["slug"]) },
+        ToolDef { name: "refresh_persona_profile", read_only: false,
+            description: "Re-distil a persona's traits from everything harvested. Returns submitted=false when the profile is already current, which is a success. Pass force to redo it anyway.",
+            schema: obj(json!({ "slug": s(), "force": {"type":"boolean"} }), &["slug"]) },
+        ToolDef { name: "predict_persona", read_only: false,
+            description: "Predict what one or more personas would do about an issue or pull request: the review they would leave, the comment they would write, or whether they would engage at all. Never posted anywhere.",
+            schema: obj(json!({
+                "subject_key": s(), "personas": { "type": "array", "items": s() }, "slug": s(),
+                "kind": s(), "provider": s(), "model": s()
+            }), &["subject_key"]) },
+        ToolDef { name: "add_persona_context", read_only: false,
+            description: "Attach something you know about a person that no excerpt could supply — 'owns the release process', 'prefers async review', or a URL to their team charter. Used verbatim and never filtered, and re-profiles so it takes effect immediately.",
+            schema: obj(json!({ "slug": s(), "content": s() }), &["slug", "content"]) },
+        ToolDef { name: "remove_persona_context", read_only: false,
+            description: "Remove one attached fact from a persona.",
+            schema: obj(json!({ "id": s() }), &["id"]) },
+        ToolDef { name: "who_knows", read_only: true,
+            description: "Who to ask about an area of the codebase — a repo, a path, or a word from one. Ranked across modelled people by where their review activity concentrates, distinguishing established expertise from mere presence. Only knows the people you have modelled, and says so.",
+            schema: obj(json!({ "area": s() }), &["area"]) },
+        ToolDef { name: "list_predictions", read_only: true,
+            description: "Stored persona predictions, for one subject or by one persona.",
+            schema: obj(json!({ "subject_key": s(), "slug": s() }), &[]) },
         ToolDef { name: "chat_context", read_only: true,
             description: "Assemble everything the code index knows about a repo — its card, component cards, dependency edges and recent commit summaries — or about one commit in it (pass `sha`), as a context block ready to hand to a chat. Built deterministically from the store: a model asked to go and find this would invent some of it.",
             schema: obj(json!({ "repo": s(), "sha": s() }), &["repo"]) },
@@ -1939,6 +2675,95 @@ fn opt_str(args: &Value, key: &str) -> Option<String> {
         .and_then(|v| v.as_str())
         .filter(|s| !s.trim().is_empty())
         .map(str::to_string)
+}
+
+/// A required source name, refused rather than defaulted.
+///
+/// Defaulting would attach a Slack user id to GitHub, which harvests nothing and reads as a
+/// quiet colleague rather than as a wrong argument.
+fn req_source(args: &Value, key: &str) -> Result<Source> {
+    let raw = req_str(args, key)?;
+    Source::parse(&raw)
+        .ok_or_else(|| anyhow!("{key} must be github, slack, granola or incident_io (got '{raw}')"))
+}
+
+/// Resolve a typed Slack handle to the workspace's own id.
+///
+/// The operator types `pavel` or `Pavel Cholakov`; the signal log records `U06T7445RHD`. Without
+/// this the link silently harvests nothing, which is the worst available outcome: it looks like
+/// a colleague who never posts. Exact alias match only — a fuzzy match here would produce a
+/// confident wrong join, the one failure the identity model exists to prevent.
+///
+/// Unresolvable handles are left as typed rather than refused. A workspace with no `users:read`
+/// scope has no directory, and a raw `U…` id typed by hand must still work.
+fn resolve_slack_handle(store: &Store, identity: &mut crate::persona::Identity) -> Result<()> {
+    if identity.source != Source::Slack {
+        return Ok(());
+    }
+    if let Some(user) = store.find_slack_user(&identity.handle)? {
+        if !user.id.eq_ignore_ascii_case(&identity.handle) {
+            identity.rationale = Some(format!(
+                "typed '{}', resolved to {} in the Slack directory",
+                identity.handle,
+                user.label()
+            ));
+            identity.handle = user.id;
+        }
+        return Ok(());
+    }
+    // Unknown to the workspace — refused *here*, where the mistake was made.
+    //
+    // The failure this replaces: a persona linked to `lukebond` when the workspace handle is
+    // `luke`. `search.messages` answers 200 with zero matches for a handle nobody has, so the
+    // persona harvested its GitHub half, no Slack, and reported nothing wrong. Catching it at
+    // link time beats a note discovered later, and the near-matches make the fix obvious.
+    let (_, members) = store.slack_directory_age()?;
+    if members == 0 {
+        // No directory to check against — a token without `users:read` must still be able to
+        // link a handle, and the harvest reports what it finds.
+        return Ok(());
+    }
+    let hint = store
+        .slack_users_like(&identity.handle, 5)?
+        .into_iter()
+        .map(|u| u.label())
+        .collect::<Vec<_>>();
+    bail!(
+        "'{}' is not a member of the Slack workspace ({members} cached).{}",
+        identity.handle,
+        if hint.is_empty() {
+            " Check their handle in Slack.".to_string()
+        } else {
+            format!(" Did you mean: {}?", hint.join(", "))
+        }
+    )
+}
+
+/// One `{source, handle, provenance?, rationale?}` identity from the args.
+///
+/// Provenance defaults to `operator`, because the only way an identity reaches this function is
+/// somebody naming it. The *guess* provenance is written by the proposal path, never here.
+fn one_identity(args: &Value) -> Result<crate::persona::Identity> {
+    let provenance = match opt_str(args, "provenance") {
+        Some(p) => crate::persona::IdentityProvenance::parse(&p)
+            .ok_or_else(|| anyhow!("provenance must be operator, exact or proposed (got '{p}')"))?,
+        None => crate::persona::IdentityProvenance::Operator,
+    };
+    let mut identity = crate::persona::Identity::new(
+        req_source(args, "source")?,
+        req_str(args, "handle")?,
+        provenance,
+    );
+    identity.rationale = opt_str(args, "rationale");
+    Ok(identity)
+}
+
+/// The optional `identities: [{source, handle, ...}]` array, for persona creation.
+fn identities_from(args: &Value) -> Result<Vec<crate::persona::Identity>> {
+    let Some(list) = args.get("identities").and_then(|v| v.as_array()) else {
+        return Ok(Vec::new());
+    };
+    list.iter().map(one_identity).collect()
 }
 
 fn str_array(args: &Value, key: &str) -> Vec<String> {
@@ -2076,10 +2901,11 @@ mod tests {
         ));
         Tools {
             agents: Arc::new(crate::agent::AgentSessions::for_tests()),
-            store,
-            ingress: Arc::new(crate::restate::ingress::Ingress::new(
-                &crate::config::RestateConfig::default(),
-            )),
+            store: store.clone(),
+            // Offline: a real ingress here points at 127.0.0.1:8080, which during development
+            // is the operator's own running Restate server — so the suite invoked live handlers
+            // against a database it never touched. See `Ingress::offline`.
+            ingress: Arc::new(crate::restate::ingress::Ingress::offline()),
             scorer: scorer.clone(),
             secrets,
             attributor,
@@ -2091,15 +2917,23 @@ mod tests {
             investigator,
             repos,
             browser,
-            diffs: Arc::new(crate::prdiff::DiffReader::new(None, reasoner.clone(), "local").unwrap()),
+            threads: Arc::new(crate::thread::Analyser::for_tests(store.clone())),
+            diffs: Arc::new(
+                crate::prdiff::DiffReader::new(None, reasoner.clone(), "local").unwrap(),
+            ),
+            personas: Arc::new(crate::persona::Engine::for_tests(store)),
         }
     }
 
-    fn seed(t: &Tools) -> String {
-        let s = Signal {
-            id: Signal::make_id(Source::Slack, "1", None),
+    /// One alert signal, with the entities that make it resolve to a Slack-thread subject.
+    ///
+    /// Extracted from [`seed`] so tests that need a *second* signal — or one with an actor on
+    /// it, which is what persona harvesting reads — can build one without a second copy.
+    fn sample_signal(external_id: &str) -> Signal {
+        Signal {
+            id: Signal::make_id(Source::Slack, external_id, None),
             source: Source::Slack,
-            external_id: "1".into(),
+            external_id: external_id.into(),
             kind: SignalKind::Alert,
             title: "service-foo 5xx spike".into(),
             body: Some("connection pool exhausted".into()),
@@ -2117,7 +2951,11 @@ mod tests {
             subject: None,
             raw: serde_json::json!({ "is_alert": true }),
             tags: Vec::new(),
-        };
+        }
+    }
+
+    fn seed(t: &Tools) -> String {
+        let s = sample_signal("1");
         t.store.insert_signal(&s).unwrap();
         t.attributor
             .attach(&s)
@@ -2162,5 +3000,191 @@ mod tests {
     async fn unknown_tool_errors() {
         let t = tools("noop");
         assert!(t.call("nonexistent", &json!({})).await.is_err());
+    }
+
+    /// A persona's whole lifecycle over the tool surface, plus the two refusals that matter.
+    ///
+    /// The ingress is unreachable in tests, so `armed`/`harvesting` come back false — which is
+    /// deliberate on the write path too: an unreachable Restate must not fail the creation,
+    /// because the boot sweep arms the loop on the next start.
+    #[tokio::test]
+    async fn a_persona_is_created_edited_and_deleted_over_the_tool_surface() {
+        let t = tools("noop");
+        let created = t
+            .call(
+                "create_persona",
+                &json!({
+                    "display_name": "Pavel Cholakov",
+                    "role": "storage lead",
+                    "identities": [{ "source": "github", "handle": "pcholakov" }]
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(created["persona"]["slug"], "pavel-cholakov");
+        assert_eq!(
+            created["persona"]["identities"][0]["provenance"],
+            "operator"
+        );
+
+        // Listed, with the counted stats rather than a modelled summary.
+        let listed = t.call("list_personas", &json!({})).await.unwrap();
+        assert_eq!(listed["personas"].as_array().unwrap().len(), 1);
+        assert_eq!(listed["personas"][0]["stats"]["evidence"], 0);
+        assert_eq!(listed["personas"][0]["traits"], 0);
+
+        // A present-but-empty field clears; an absent one leaves alone. The two have to be
+        // distinguishable or a note can be written and never removed.
+        let edited = t
+            .call(
+                "update_persona",
+                &json!({ "slug": "pavel-cholakov", "notes": "" }),
+            )
+            .await
+            .unwrap();
+        assert!(edited["notes"].is_null());
+        assert_eq!(edited["role"], "storage lead", "role was not touched");
+
+        // A handle already owned by another persona is refused, naming the owner — silently
+        // re-pointing it would build two profiles from one person's writing.
+        t.call(
+            "create_persona",
+            &json!({ "display_name": "Someone Else", "slug": "else" }),
+        )
+        .await
+        .unwrap();
+        let err = t
+            .call(
+                "link_persona_identity",
+                &json!({ "slug": "else", "source": "github", "handle": "pcholakov" }),
+            )
+            .await
+            .expect_err("a taken handle must be refused");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("already belongs to"), "{msg}");
+        assert!(msg.contains("pavel-cholakov"), "{msg}");
+
+        // Profiling before anything is harvested says so, rather than submitting a pass over
+        // nothing.
+        let err = t
+            .call(
+                "refresh_persona_profile",
+                &json!({ "slug": "pavel-cholakov" }),
+            )
+            .await
+            .expect_err("nothing harvested yet");
+        assert!(format!("{err:#}").contains("nothing has been harvested"));
+
+        // Deleting takes the derived material with it: a "deleted" persona that left its
+        // harvested excerpts behind would be a profile of somebody you asked to stop
+        // modelling.
+        t.store
+            .put_persona_evidence(&[crate::persona::Evidence {
+                id: "e1".into(),
+                persona: "pavel-cholakov".into(),
+                source: Source::GitHub,
+                kind: crate::persona::EvidenceKind::Review,
+                subject_key: None,
+                url: None,
+                excerpt: "this needs a test on the retry path".into(),
+                context: None,
+                state: Some("CHANGES_REQUESTED".into()),
+                occurred_at: chrono::Utc::now(),
+                ingested_at: chrono::Utc::now(),
+            }])
+            .unwrap();
+        assert_eq!(
+            t.store
+                .persona_evidence("pavel-cholakov", None)
+                .unwrap()
+                .len(),
+            1
+        );
+        let deleted = t
+            .call("delete_persona", &json!({ "slug": "pavel-cholakov" }))
+            .await
+            .unwrap();
+        assert_eq!(deleted["deleted"], true);
+        assert!(t
+            .store
+            .persona_evidence("pavel-cholakov", None)
+            .unwrap()
+            .is_empty());
+        // The handle is released, so the other persona can now claim it.
+        t.call(
+            "link_persona_identity",
+            &json!({ "slug": "else", "source": "github", "handle": "pcholakov" }),
+        )
+        .await
+        .expect("the handle is free once its persona is gone");
+    }
+
+    /// The prediction kind follows the subject unless overridden, and a subject that does not
+    /// exist is refused before any workflow is submitted.
+    #[tokio::test]
+    async fn predicting_needs_a_real_subject_and_a_real_persona() {
+        let t = tools("noop");
+        let subject = seed(&t);
+
+        let err = t
+            .call(
+                "predict_persona",
+                &json!({ "subject_key": "o/r#999", "slug": "nobody" }),
+            )
+            .await
+            .expect_err("an unknown subject must be refused");
+        assert!(format!("{err:#}").contains("no subject"));
+
+        let err = t
+            .call(
+                "predict_persona",
+                &json!({ "subject_key": subject, "slug": "nobody" }),
+            )
+            .await
+            .expect_err("an unknown persona must be refused");
+        assert!(format!("{err:#}").contains("no persona"));
+
+        let err = t
+            .call(
+                "predict_persona",
+                &json!({ "subject_key": subject, "slug": "nobody", "kind": "telepathy" }),
+            )
+            .await
+            .expect_err("an unknown kind must be refused rather than guessed");
+        assert!(format!("{err:#}").contains("kind must be"));
+    }
+
+    /// Proposals exclude people already modelled — matched on their linked handles as well as
+    /// on the slug, or a persona named `pav` would keep having `pcholakov` proposed at it.
+    #[tokio::test]
+    async fn proposals_skip_handles_already_linked() {
+        let t = tools("noop");
+        for i in 0..4 {
+            let mut s = crate::signal::Signal {
+                actor: Some("U0PAVEL".into()),
+                ..sample_signal(&format!("p{i}"))
+            };
+            s.body = Some("the retry path is the risk here, not the pool size".into());
+            t.store.insert_signal(&s).unwrap();
+        }
+        let before = t.call("propose_personas", &json!({})).await.unwrap();
+        assert_eq!(before["candidates"].as_array().unwrap().len(), 1);
+
+        t.call(
+            "create_persona",
+            &json!({
+                "display_name": "Pav",
+                "slug": "pav",
+                "identities": [{ "source": "slack", "handle": "U0PAVEL" }]
+            }),
+        )
+        .await
+        .unwrap();
+        let after = t.call("propose_personas", &json!({})).await.unwrap();
+        assert!(
+            after["candidates"].as_array().unwrap().is_empty(),
+            "a linked handle must not be proposed back: {}",
+            after["candidates"]
+        );
     }
 }

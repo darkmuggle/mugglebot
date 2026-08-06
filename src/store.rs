@@ -16,6 +16,10 @@ use crate::context::{Context as CtxEntry, ContextSourceKind};
 use crate::correlation::{ContextKind, Edge, Provenance, RelationKind, SubjectContext};
 use crate::live::{FlagType, Hint, HintKind, HintState};
 use crate::memory::Memory;
+use crate::persona::{
+    Evidence, EvidenceKind, Facet, Identity, IdentityProvenance, Persona, PredictedPoint,
+    Prediction, PredictionKind, Profile, Removed, Stats, Trait,
+};
 use crate::signal::{ResolutionKey, Severity, Signal, SignalKind, Source};
 use crate::subject::{Handled, Subject, SubjectKey, SubjectRank};
 use crate::tags::Tag;
@@ -225,6 +229,29 @@ CREATE TABLE IF NOT EXISTS browser_investigations (
 );
 CREATE INDEX IF NOT EXISTS idx_browser_investigations_signal ON browser_investigations(signal_id);
 CREATE INDEX IF NOT EXISTS idx_browser_investigations_status ON browser_investigations(status);
+
+-- One hand-requested Slack thread analysis. Keyed by (channel, thread_ts) so pasting the
+-- same link twice is the same row: the analysis costs two metered model calls, and the
+-- answer only changes when the thread does.
+CREATE TABLE IF NOT EXISTS thread_analyses (
+    id           TEXT PRIMARY KEY,
+    channel      TEXT NOT NULL,
+    thread_ts    TEXT NOT NULL,
+    url          TEXT NOT NULL,
+    -- Reply count at request time. Part of the workflow key, so new replies make a
+    -- re-analysis a *different* invocation rather than a refused duplicate.
+    reply_count  INTEGER NOT NULL DEFAULT 0,
+    status       TEXT NOT NULL,
+    -- The whole `thread::Verdict` as JSON: the thread as read, both analyses, and the
+    -- agreement between them. One blob because nothing queries inside it — this is read
+    -- back whole, by one screen.
+    verdict      TEXT,
+    error        TEXT,
+    created_at   TEXT NOT NULL,
+    updated_at   TEXT NOT NULL,
+    UNIQUE(channel, thread_ts)
+);
+CREATE INDEX IF NOT EXISTS idx_thread_analyses_status ON thread_analyses(status);
 
 -- The repo index: one row per repository in the watched org, characterized from
 -- its **code**. This is the routing table that turns a Slack symptom into the
@@ -470,14 +497,197 @@ CREATE TABLE IF NOT EXISTS subject_root_cause (
     created_at  TEXT NOT NULL,
     updated_at  TEXT NOT NULL
 );
+
+-- ---- personas ---------------------------------------------------------------
+--
+-- The second axis: subjects are what work is about, personas are who it is with. See
+-- `crate::persona` for why a persona is not a subject and does not violate the rule that
+-- `person` is never one.
+--
+-- All of it is in SQLite rather than object state, and the reason is the strongest form of
+-- the standard one: a profile is the *expensive* artifact — hundreds of local model passes
+-- over months of somebody's writing — and `data/restate` is wiped whenever vqueues are
+-- toggled. The `Persona` object holds only its harvest cadence.
+--
+-- These tables need no schema-version bump: `CREATE TABLE IF NOT EXISTS` creates a *missing*
+-- table on an existing database, and it is only a pre-existing table that it silently skips.
+-- (That distinction is what `add_columns` exists for; see the note there.)
+CREATE TABLE IF NOT EXISTS personas (
+    slug               TEXT PRIMARY KEY,
+    display_name       TEXT NOT NULL,
+    -- What they do, and the operator's own notes. Asserted rather than inferred, so they
+    -- bypass trait verification entirely and are fed to the model verbatim.
+    role               TEXT,
+    notes              TEXT,
+    created_at         TEXT NOT NULL,
+    updated_at         TEXT NOT NULL,
+    harvested_at       TEXT,
+    profiled_at        TEXT,
+    -- Newest evidence id at the last profile pass. The `PersonaProfile` workflow is keyed on
+    -- it, so re-distilling a persona nothing new has been seen of is a refused key.
+    evidence_watermark TEXT,
+    -- How far back the GitHub history walk has reached, RFC3339. Stored rather than derived
+    -- from the oldest evidence held: a barren window leaves that unchanged, so a derived
+    -- cursor stalls the walk forever while looking merely slow.
+    harvest_cursor     TEXT,
+    harvest_complete   INTEGER NOT NULL DEFAULT 0,
+    -- Why the last pass came back with less than it looks like it should have: a deferred
+    -- GitHub budget, an unset org, items that could not be read. Persisted rather than
+    -- returned, because the pass runs in a Restate handler minutes after whatever asked for
+    -- it, so its return value reaches nobody. NULL is the good case.
+    --
+    -- Without this, a harvest that made no requests at all and a colleague who genuinely
+    -- writes nothing both render as "0 ev", which is how the feature came to look like a
+    -- button that does nothing.
+    harvest_note       TEXT
+);
+
+-- `(source, handle)` is the primary key, not `(persona, source, handle)`. That is the
+-- constraint that stops one GitHub login belonging to two personas — which would build two
+-- profiles from the same evidence and give the operator two confident, differing answers
+-- about the same human.
+CREATE TABLE IF NOT EXISTS persona_identities (
+    source     TEXT NOT NULL,
+    -- Lowercased, because that is what lookups compare.
+    handle     TEXT NOT NULL,
+    persona    TEXT NOT NULL,
+    -- As the operator typed it, for display.
+    display    TEXT NOT NULL,
+    -- `operator` | `exact` | `proposed`. Only the first two are ever read for evidence.
+    provenance TEXT NOT NULL,
+    rationale  TEXT,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (source, handle)
+);
+CREATE INDEX IF NOT EXISTS idx_persona_identities_persona ON persona_identities(persona);
+
+-- Verbatim excerpts of things the person wrote. The citation store: every trait points here,
+-- and a trait citing nothing is dropped rather than shown.
+CREATE TABLE IF NOT EXISTS persona_evidence (
+    id          TEXT PRIMARY KEY,
+    persona     TEXT NOT NULL,
+    source      TEXT NOT NULL,
+    kind        TEXT NOT NULL,
+    subject_key TEXT,
+    url         TEXT,
+    excerpt     TEXT NOT NULL,
+    context     TEXT,
+    -- APPROVED / CHANGES_REQUESTED / COMMENTED. Counted, never modelled.
+    state       TEXT,
+    occurred_at TEXT NOT NULL,
+    ingested_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_persona_evidence_persona ON persona_evidence(persona, occurred_at);
+CREATE INDEX IF NOT EXISTS idx_persona_evidence_subject ON persona_evidence(subject_key);
+
+-- One falsifiable claim about behaviour. The id is derived from the claim text (see
+-- `persona::profile::trait_id`) so a re-profile that reaches the same conclusion keeps the
+-- same id — otherwise every stored prediction loses its citations on the next refresh.
+CREATE TABLE IF NOT EXISTS persona_traits (
+    id               TEXT PRIMARY KEY,
+    persona          TEXT NOT NULL,
+    facet            TEXT NOT NULL,
+    claim            TEXT NOT NULL,
+    confidence       REAL NOT NULL,
+    evidence         TEXT NOT NULL DEFAULT '[]',
+    counter_evidence TEXT NOT NULL DEFAULT '[]',
+    created_at       TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_persona_traits_persona ON persona_traits(persona);
+
+-- What verification refused, and why. Kept for the same reason as
+-- `subject_explanations.removed`: a filter nobody can see is a filter nobody can debug, and
+-- on a first pass this list is routinely longer than the profile.
+CREATE TABLE IF NOT EXISTS persona_removed (
+    persona    TEXT NOT NULL,
+    facet      TEXT NOT NULL,
+    claim      TEXT NOT NULL,
+    why        TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_persona_removed_persona ON persona_removed(persona);
+
+-- What a persona is predicted to do about one subject. Keyed `(persona, subject, kind)`, so
+-- re-predicting replaces rather than accumulates — and `watermark` records what it was built
+-- from, so a prediction older than the subject is visibly stale rather than quietly wrong.
+CREATE TABLE IF NOT EXISTS persona_predictions (
+    persona        TEXT NOT NULL,
+    subject_key    TEXT NOT NULL,
+    kind           TEXT NOT NULL,
+    watermark      TEXT NOT NULL,
+    would_engage   INTEGER NOT NULL,
+    confidence     REAL NOT NULL,
+    recommendation TEXT,
+    summary        TEXT NOT NULL,
+    points         TEXT NOT NULL DEFAULT '[]',
+    caveats        TEXT NOT NULL DEFAULT '[]',
+    produced_by    TEXT NOT NULL,
+    created_at     TEXT NOT NULL,
+    PRIMARY KEY (persona, subject_key, kind)
+);
+CREATE INDEX IF NOT EXISTS idx_persona_predictions_subject ON persona_predictions(subject_key);
+
+-- Things the operator knows about a person that no excerpt can supply.
+--
+-- "Owns the release process", "prefers async review", "is on sabbatical until March", a link to
+-- their team's charter. **Asserted, not inferred**, and therefore deliberately outside the trait
+-- model: `persona::verify` exists to stop the *model* making unfalsifiable claims, and applying
+-- it to something the operator stated would be the filter second-guessing its own author.
+--
+-- Distinct from `personas.notes`, which is the one-line who-they-are shown beside their name.
+-- These are a list, they accumulate, and each one is individually removable — which is what
+-- makes them usable for the thing that actually happens: learning one more fact about somebody
+-- every few weeks.
+CREATE TABLE IF NOT EXISTS persona_context (
+    id         TEXT PRIMARY KEY,
+    persona    TEXT NOT NULL,
+    -- `text` (used verbatim) or `url` (fetched and summarized through the context library).
+    kind       TEXT NOT NULL,
+    content    TEXT NOT NULL,
+    -- For a URL, what was read from it. NULL for text, whose content is already the summary.
+    summary    TEXT,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_persona_context_persona ON persona_context(persona);
+
+-- The Slack workspace directory, cached.
+--
+-- Slack identifies people by opaque id, and the normalized `raw` a signal carries keeps only
+-- channel/ts/flags — so the signal log knows *that* `U06T7445RHD` said something and nothing
+-- about who that is. Fine for attribution; useless for letting the operator say "model Pavel".
+--
+-- Refreshed lazily on the operator paths that need it (proposing, linking) rather than on a
+-- timer: a workspace directory changes when somebody joins, and reading it on a schedule would
+-- spend a request per interval to learn nothing most of the time.
+CREATE TABLE IF NOT EXISTS slack_users (
+    id           TEXT PRIMARY KEY,
+    -- The `@handle`, without the `@`.
+    name         TEXT NOT NULL,
+    real_name    TEXT,
+    display_name TEXT,
+    -- Only present when the token has `users:read.email`. Absent is normal.
+    email        TEXT,
+    is_bot       INTEGER NOT NULL DEFAULT 0,
+    deleted      INTEGER NOT NULL DEFAULT 0,
+    -- Every string worth matching a typed name or a GitHub login against, as a JSON array.
+    -- Stored rather than recomputed so a lookup is one indexed scan instead of a table walk.
+    aliases      TEXT NOT NULL DEFAULT '[]',
+    updated_at   TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_slack_users_name ON slack_users(name);
 "#;
 
 /// Column list for [`row_to_browser_investigation`]. The subject id is joined off
 /// the signal rather than stored, so a merge that re-homes signals moves the
 /// investigation with them.
 const BROWSER_SELECT: &str = "SELECT b.id, b.signal_id, s.subject, b.url, b.prompt, b.status, \
-     b.findings, b.error, b.attempts, b.created_at, b.updated_at \
+     b.findings, b.error, b.attempts, b.created_at, b.updated_at, \
+     COALESCE(b.method, 'browser'), b.evidence \
      FROM browser_investigations b";
+
+/// Column list for [`row_to_thread_analysis`].
+const THREAD_SELECT: &str = "SELECT id, channel, thread_ts, url, reply_count, status, verdict, \
+     error, created_at, updated_at FROM thread_analyses";
 
 /// Column list for [`row_to_repo`].
 const REPO_SELECT: &str = "SELECT full_name, description, topics, language, archived, pushed_at, \
@@ -493,6 +703,11 @@ const PR_FIX_SELECT: &str = "SELECT issue_key, pr_repo, pr_number, pr_title, pr_
 const TRIAGE_SELECT: &str = "SELECT issue_key, repo, number, title, url, signal_id, status, \
      head_sha, checkout, files, characterization, patches, plain_summary, error, created_at, \
      updated_at FROM issue_triage";
+
+/// Column list for [`row_to_persona_prediction`].
+const PREDICTION_SELECT: &str = "SELECT persona, subject_key, kind, watermark, would_engage, \
+     confidence, recommendation, summary, points, caveats, produced_by, created_at \
+     FROM persona_predictions";
 
 /// Process-unique id fragment. Monotonic counter mixed with a startup nonce —
 /// good enough to key store rows without pulling in a UUID dependency.
@@ -564,6 +779,30 @@ pub struct BrowserInvestigation {
     pub findings: Option<String>,
     pub error: Option<String>,
     pub attempts: i64,
+    pub created_at: String,
+    pub updated_at: String,
+    /// Which tier is on this question: `grafana` (the HTTP API, real series) or
+    /// `browser` (the operator's signed-in Chrome, a rendered page). Rows written before
+    /// the Grafana tier existed read as `browser`, which is what they were.
+    pub method: String,
+    /// The series the conclusion was drawn from, as JSON — `grafana` only. This is what
+    /// makes the conclusion checkable rather than merely plausible.
+    pub evidence: Option<String>,
+}
+
+/// One hand-requested Slack thread analysis.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ThreadAnalysis {
+    pub id: String,
+    pub channel: String,
+    pub thread_ts: String,
+    pub url: String,
+    pub reply_count: i64,
+    /// `pending` → `running` → `completed` | `failed`.
+    pub status: String,
+    /// The `thread::Verdict`, as JSON. Passed to the UI untouched.
+    pub verdict: Option<String>,
+    pub error: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -1151,10 +1390,7 @@ impl Store {
     /// The removal half of "all open incidents tracked, resolved ones removed". Unlike the
     /// GitHub reconcilers this needs no half-selection: the incident source has exactly one
     /// listing and it is authoritative for all of it.
-    pub fn resolve_missing_incidents(
-        &self,
-        active_ids: &BTreeSet<String>,
-    ) -> Result<Vec<Signal>> {
+    pub fn resolve_missing_incidents(&self, active_ids: &BTreeSet<String>) -> Result<Vec<Signal>> {
         let mut conn = self.lock();
         let tx = conn.transaction()?;
         let mut candidates = {
@@ -1259,6 +1495,7 @@ impl Store {
         tx.execute("DELETE FROM subject_explanations", [])?;
         // Keyed by signal id, and every signal has just gone: these are orphans.
         tx.execute("DELETE FROM browser_investigations", [])?;
+        tx.execute("DELETE FROM thread_analyses", [])?;
         tx.execute("DELETE FROM subjects", [])?;
         tx.commit()?;
         Ok((cleared, threads.into_iter().collect()))
@@ -1488,20 +1725,27 @@ impl Store {
     // ---- browser investigations ---------------------------------------------
 
     /// Idempotently queue a browser investigation for one signal's dashboard link.
+    /// Queue one dashboard investigation for a signal, on the named tier.
+    ///
+    /// `ON CONFLICT DO NOTHING` on the unique `signal_id` is the point: a watcher re-emits
+    /// the same alert on every poll, and one question about one alert should be asked once.
+    /// Escalating to another tier is [`Self::escalate_investigation_to_browser`], a
+    /// transition on this row rather than a second row.
     pub fn queue_browser_investigation(
         &self,
         signal_id: &str,
         url: &str,
         prompt: &str,
+        method: &str,
     ) -> Result<BrowserInvestigation> {
         let now = Utc::now().to_rfc3339();
         let id = format!("binv/{}", new_id());
         let conn = self.lock();
         conn.execute(
-            "INSERT INTO browser_investigations (id, signal_id, url, prompt, status, created_at, updated_at) \
-             VALUES (?1, ?2, ?3, ?4, 'pending', ?5, ?5) \
+            "INSERT INTO browser_investigations (id, signal_id, url, prompt, status, method, created_at, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, 'pending', ?6, ?5, ?5) \
              ON CONFLICT(signal_id) DO NOTHING",
-            params![id, signal_id, url, prompt, now],
+            params![id, signal_id, url, prompt, now, method],
         )?;
         Self::browser_investigation_for_signal_locked(&conn, signal_id)?
             .context("browser investigation was not persisted")
@@ -1536,14 +1780,42 @@ impl Store {
     /// A plain read, not a claim: the `BrowserRead` workflow id *is* the claim now, so
     /// the `status` column stopped being a queue — which also ended the failure where
     /// a worker that died left rows marked `running` forever.
-    pub fn list_browser_investigations_pending(&self) -> Result<Vec<String>> {
+    /// Pending investigations as `(id, method)`. The method decides which workflow the
+    /// scheduler submits — the two tiers have different scopes, because one Chrome means
+    /// concurrency 1 and an HTTP read does not.
+    pub fn list_browser_investigations_pending(&self) -> Result<Vec<(String, String)>> {
         let conn = self.lock();
         let mut stmt = conn.prepare(
-            "SELECT id FROM browser_investigations WHERE status IN ('pending', 'running') \
-             ORDER BY created_at ASC",
+            "SELECT id, COALESCE(method, 'browser') FROM browser_investigations \
+             WHERE status IN ('pending', 'running') ORDER BY created_at ASC",
         )?;
-        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
         collect(rows)
+    }
+
+    /// Hand this investigation to the browser tier, recording why the API tier could not
+    /// answer. The `why` lands in `error` so the reason survives on the record even when
+    /// the browser then succeeds — "Grafana had no series for that window" is worth
+    /// knowing about a rule, not just about one firing.
+    pub fn escalate_investigation_to_browser(
+        &self,
+        id: &str,
+        url: &str,
+        prompt: &str,
+        why: &str,
+    ) -> Result<BrowserInvestigation> {
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE browser_investigations SET method='browser', status='pending', url=?2, \
+             prompt=?3, error=?4, attempts=0, updated_at=?5 WHERE id=?1",
+            params![id, url, prompt, why, Utc::now().to_rfc3339()],
+        )?;
+        conn.query_row(
+            &format!("{BROWSER_SELECT} LEFT JOIN signals s ON s.id=b.signal_id WHERE b.id=?1"),
+            [id],
+            row_to_browser_investigation,
+        )
+        .context("investigation not found")
     }
 
     pub fn complete_browser_investigation(
@@ -1551,6 +1823,23 @@ impl Store {
         id: &str,
         findings: &str,
     ) -> Result<BrowserInvestigation> {
+        self.finish_browser_investigation(id, "completed", Some(findings.trim()), None)
+    }
+
+    /// Complete a Grafana read: the conclusion, plus the series it was drawn from.
+    pub fn complete_investigation_with_evidence(
+        &self,
+        id: &str,
+        findings: &str,
+        evidence: &str,
+    ) -> Result<BrowserInvestigation> {
+        {
+            let conn = self.lock();
+            conn.execute(
+                "UPDATE browser_investigations SET evidence=?2 WHERE id=?1",
+                params![id, evidence],
+            )?;
+        }
         self.finish_browser_investigation(id, "completed", Some(findings.trim()), None)
     }
 
@@ -1581,6 +1870,101 @@ impl Store {
             row_to_browser_investigation,
         )
         .context("browser investigation not found")
+    }
+
+    /// Queue (or re-queue) an analysis of one Slack thread.
+    ///
+    /// Re-pasting the same link updates `reply_count` and puts the row back to `pending`
+    /// rather than inserting a second one — because "analyse this again, there are new
+    /// replies" is the same question about the same thread, and the workflow key carries the
+    /// count so the re-run is not refused as a duplicate.
+    pub fn queue_thread_analysis(
+        &self,
+        channel: &str,
+        thread_ts: &str,
+        url: &str,
+        reply_count: i64,
+    ) -> Result<ThreadAnalysis> {
+        let now = Utc::now().to_rfc3339();
+        let id = format!("thr/{}", new_id());
+        let conn = self.lock();
+        conn.execute(
+            "INSERT INTO thread_analyses \
+             (id, channel, thread_ts, url, reply_count, status, created_at, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, 'pending', ?6, ?6) \
+             ON CONFLICT(channel, thread_ts) DO UPDATE SET \
+               reply_count=excluded.reply_count, url=excluded.url, status='pending', \
+               error=NULL, updated_at=excluded.updated_at",
+            params![id, channel, thread_ts, url, reply_count, now],
+        )?;
+        conn.query_row(
+            &format!("{THREAD_SELECT} WHERE channel=?1 AND thread_ts=?2"),
+            params![channel, thread_ts],
+            row_to_thread_analysis,
+        )
+        .context("thread analysis was not persisted")
+    }
+
+    pub fn get_thread_analysis(&self, id: &str) -> Result<Option<ThreadAnalysis>> {
+        let conn = self.lock();
+        match conn.query_row(
+            &format!("{THREAD_SELECT} WHERE id=?1"),
+            [id],
+            row_to_thread_analysis,
+        ) {
+            Ok(v) => Ok(Some(v)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Newest first — the list the Threads view shows.
+    pub fn list_thread_analyses(&self, limit: i64) -> Result<Vec<ThreadAnalysis>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(&format!(
+            "{THREAD_SELECT} ORDER BY updated_at DESC LIMIT ?1"
+        ))?;
+        let rows = stmt.query_map([limit.max(1)], row_to_thread_analysis)?;
+        collect(rows)
+    }
+
+    pub fn list_thread_analyses_pending(&self) -> Result<Vec<String>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id FROM thread_analyses WHERE status IN ('pending','running') \
+             ORDER BY created_at ASC",
+        )?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        collect(rows)
+    }
+
+    pub fn finish_thread_analysis(
+        &self,
+        id: &str,
+        status: &str,
+        verdict: Option<&str>,
+        error: Option<&str>,
+    ) -> Result<ThreadAnalysis> {
+        {
+            let conn = self.lock();
+            conn.execute(
+                "UPDATE thread_analyses SET status=?2, verdict=COALESCE(?3, verdict), \
+                 error=?4, updated_at=?5 WHERE id=?1",
+                params![id, status, verdict, error, Utc::now().to_rfc3339()],
+            )?;
+        }
+        self.get_thread_analysis(id)?
+            .context("thread analysis not found")
+    }
+
+    /// The investigation for one signal, if any. The unique `signal_id` makes this at most
+    /// one row, which is what lets ingest ask "has this alert already been looked at?".
+    pub fn get_browser_investigation_for_signal(
+        &self,
+        signal_id: &str,
+    ) -> Result<Option<BrowserInvestigation>> {
+        let conn = self.lock();
+        Self::browser_investigation_for_signal_locked(&conn, signal_id)
     }
 
     fn browser_investigation_for_signal_locked(
@@ -3429,6 +3813,720 @@ impl Store {
             .execute("DELETE FROM chats WHERE id = ?1", [id])?;
         Ok(())
     }
+
+    // ---- personas -----------------------------------------------------------
+    //
+    // Note on locking throughout this section: [`Self::lock`] takes a non-reentrant
+    // `std::sync::Mutex`, so a method that holds the guard must never call another method
+    // that takes it. Where both are needed the guard is dropped explicitly first.
+
+    /// The newest attributed signal id for a subject — the freshness token every
+    /// per-subject workflow key is versioned on.
+    ///
+    /// Lives here rather than on one caller because two of them now need it and they must
+    /// agree: `RootCause`, `Explain` and `PersonaPredict` all key on "nothing new has
+    /// arrived", and two implementations of that phrase would eventually disagree about
+    /// whether a subject had moved.
+    pub fn subject_watermark(&self, subject_key: &str) -> String {
+        self.signals_for_subject(subject_key)
+            .ok()
+            .and_then(|sigs| sigs.last().map(|s| s.id.clone()))
+            .unwrap_or_else(|| "empty".into())
+    }
+
+    /// Signals authored by one handle on one source, newest first.
+    ///
+    /// The persona harvester's free half: Slack evidence is a re-reading of the signal log
+    /// through one person's handle rather than new API traffic. Compared case-insensitively,
+    /// because the actor field is whatever the watcher captured.
+    pub fn signals_by_actor(
+        &self,
+        source: Source,
+        handle: &str,
+        limit: usize,
+    ) -> Result<Vec<Signal>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(&format!(
+            "{SIGNAL_SELECT} WHERE source = ?1 AND actor IS NOT NULL \
+             AND LOWER(actor) = LOWER(?2) ORDER BY occurred_at DESC LIMIT ?3"
+        ))?;
+        let rows = stmt.query_map(
+            params![source.as_str(), handle, limit as i64],
+            row_to_signal,
+        )?;
+        collect(rows)
+    }
+
+    /// Create or update a persona, including its identities.
+    ///
+    /// `created_at` is preserved across updates. Identities go through
+    /// [`Self::link_persona_identity`], so an attempt to claim a handle another persona
+    /// already owns fails loudly here rather than silently re-pointing it.
+    pub fn put_persona(&self, p: &Persona) -> Result<()> {
+        {
+            let conn = self.lock();
+            conn.execute(
+                "INSERT INTO personas \
+                 (slug, display_name, role, notes, created_at, updated_at, harvested_at, \
+                  profiled_at, evidence_watermark) \
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9) \
+                 ON CONFLICT(slug) DO UPDATE SET \
+                    display_name=excluded.display_name, role=excluded.role, \
+                    notes=excluded.notes, updated_at=excluded.updated_at",
+                params![
+                    p.slug,
+                    p.display_name,
+                    p.role,
+                    p.notes,
+                    p.created_at.to_rfc3339(),
+                    p.updated_at.to_rfc3339(),
+                    p.harvested_at.map(|t| t.to_rfc3339()),
+                    p.profiled_at.map(|t| t.to_rfc3339()),
+                    p.evidence_watermark,
+                ],
+            )?;
+        }
+        for identity in &p.identities {
+            self.link_persona_identity(&p.slug, identity)?;
+        }
+        Ok(())
+    }
+
+    pub fn get_persona(&self, slug: &str) -> Result<Option<Persona>> {
+        let identities = self.persona_identities(slug)?;
+        let conn = self.lock();
+        conn.query_row(
+            "SELECT slug, display_name, role, notes, created_at, updated_at, harvested_at, \
+             profiled_at, evidence_watermark FROM personas WHERE slug = ?1",
+            [slug],
+            |row| row_to_persona(row, identities.clone()),
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    /// Every persona, most recently active first.
+    pub fn list_personas(&self) -> Result<Vec<Persona>> {
+        let slugs: Vec<String> = {
+            let conn = self.lock();
+            let mut stmt = conn.prepare("SELECT slug FROM personas ORDER BY updated_at DESC")?;
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+            collect(rows)?
+        };
+        let mut out = Vec::with_capacity(slugs.len());
+        for slug in slugs {
+            if let Some(p) = self.get_persona(&slug)? {
+                out.push(p);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Remove a persona and everything derived from it.
+    ///
+    /// Deliberately complete: evidence, traits, refusals, predictions and identities all go.
+    /// A "deleted" persona that left its harvested excerpts behind would be a profile of
+    /// somebody the operator asked to stop modelling, which is the one outcome this must not
+    /// have. Returns whether the persona existed.
+    pub fn delete_persona(&self, slug: &str) -> Result<bool> {
+        let conn = self.lock();
+        for table in [
+            "persona_identities",
+            "persona_evidence",
+            "persona_traits",
+            "persona_removed",
+            "persona_predictions",
+            "persona_context",
+        ] {
+            conn.execute(&format!("DELETE FROM {table} WHERE persona = ?1"), [slug])?;
+        }
+        Ok(conn.execute("DELETE FROM personas WHERE slug = ?1", [slug])? > 0)
+    }
+
+    pub fn persona_identities(&self, slug: &str) -> Result<Vec<Identity>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT source, display, provenance, rationale FROM persona_identities \
+             WHERE persona = ?1 ORDER BY source, handle",
+        )?;
+        let rows = stmt.query_map([slug], |row| {
+            let source: String = row.get(0)?;
+            let provenance: String = row.get(2)?;
+            Ok(Identity {
+                source: Source::parse(&source).unwrap_or(Source::GitHub),
+                handle: row.get(1)?,
+                provenance: IdentityProvenance::parse(&provenance)
+                    // An unknown provenance is treated as a guess, which is the safe
+                    // direction: it contributes no evidence until the operator confirms it.
+                    .unwrap_or(IdentityProvenance::Proposed),
+                rationale: row.get(3)?,
+            })
+        })?;
+        collect(rows)
+    }
+
+    /// Attach a handle to a persona.
+    ///
+    /// Fails when another persona already owns the handle, naming it. Silently re-pointing
+    /// would build two profiles from one person's writing and hand the operator two
+    /// confident, differing answers about the same human — with nothing on screen to say
+    /// which one is reading their words.
+    pub fn link_persona_identity(&self, slug: &str, identity: &Identity) -> Result<()> {
+        let handle = identity.handle.trim().to_ascii_lowercase();
+        if handle.is_empty() {
+            anyhow::bail!("an identity needs a handle");
+        }
+        let conn = self.lock();
+        let owner: Option<String> = conn
+            .query_row(
+                "SELECT persona FROM persona_identities WHERE source = ?1 AND handle = ?2",
+                params![identity.source.as_str(), handle],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(owner) = owner.filter(|o| o != slug) {
+            anyhow::bail!(
+                "{} '{}' already belongs to the persona '{owner}'. Unlink it there first — \
+                 two personas sharing a handle would each build a profile from the same \
+                 person's writing.",
+                identity.source.as_str(),
+                identity.handle
+            );
+        }
+        conn.execute(
+            "INSERT INTO persona_identities \
+             (source, handle, persona, display, provenance, rationale, created_at) \
+             VALUES (?1,?2,?3,?4,?5,?6,?7) \
+             ON CONFLICT(source, handle) DO UPDATE SET \
+                persona=excluded.persona, display=excluded.display, \
+                provenance=excluded.provenance, rationale=excluded.rationale",
+            params![
+                identity.source.as_str(),
+                handle,
+                slug,
+                identity.handle.trim(),
+                identity.provenance.as_str(),
+                identity.rationale,
+                Utc::now().to_rfc3339(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Detach a handle. Returns whether it was attached.
+    pub fn unlink_persona_identity(&self, source: Source, handle: &str) -> Result<bool> {
+        let conn = self.lock();
+        Ok(conn.execute(
+            "DELETE FROM persona_identities WHERE source = ?1 AND handle = ?2",
+            params![source.as_str(), handle.trim().to_ascii_lowercase()],
+        )? > 0)
+    }
+
+    /// Which persona a handle belongs to, if any.
+    pub fn persona_for_actor(&self, source: Source, handle: &str) -> Result<Option<String>> {
+        let conn = self.lock();
+        conn.query_row(
+            "SELECT persona FROM persona_identities WHERE source = ?1 AND handle = ?2",
+            params![source.as_str(), handle.trim().to_ascii_lowercase()],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    /// Upsert harvested excerpts. Returns how many rows were written.
+    ///
+    /// Upsert rather than insert, because evidence ids are derived from the upstream identity
+    /// of the excerpt: re-harvesting the same comment must refresh one row rather than append
+    /// a second. An edited comment is the case that makes this matter — the excerpt changes
+    /// and the id does not.
+    pub fn put_persona_evidence(&self, evidence: &[Evidence]) -> Result<usize> {
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        let mut written = 0;
+        for e in evidence {
+            written += tx.execute(
+                "INSERT INTO persona_evidence \
+                 (id, persona, source, kind, subject_key, url, excerpt, context, state, \
+                  occurred_at, ingested_at) \
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11) \
+                 ON CONFLICT(id) DO UPDATE SET \
+                    excerpt=excluded.excerpt, context=excluded.context, state=excluded.state, \
+                    subject_key=excluded.subject_key, url=excluded.url, \
+                    ingested_at=excluded.ingested_at",
+                params![
+                    e.id,
+                    e.persona,
+                    e.source.as_str(),
+                    e.kind.as_str(),
+                    e.subject_key,
+                    e.url,
+                    e.excerpt,
+                    e.context,
+                    e.state,
+                    e.occurred_at.to_rfc3339(),
+                    e.ingested_at.to_rfc3339(),
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(written)
+    }
+
+    /// Harvested excerpts, oldest first.
+    ///
+    /// `limit` keeps the **most recent** N and still returns them oldest-first, which is the
+    /// order a model should read them in. Taking the oldest N instead would hand the
+    /// distiller a profile of who somebody was two years ago.
+    pub fn persona_evidence(&self, slug: &str, limit: Option<usize>) -> Result<Vec<Evidence>> {
+        let conn = self.lock();
+        let mut out = match limit {
+            Some(n) => {
+                let mut stmt = conn.prepare(
+                    "SELECT id, persona, source, kind, subject_key, url, excerpt, context, \
+                     state, occurred_at, ingested_at FROM persona_evidence \
+                     WHERE persona = ?1 ORDER BY occurred_at DESC LIMIT ?2",
+                )?;
+                let rows = stmt.query_map(params![slug, n as i64], row_to_persona_evidence)?;
+                let mut v = collect(rows)?;
+                v.reverse();
+                v
+            }
+            None => {
+                let mut stmt = conn.prepare(
+                    "SELECT id, persona, source, kind, subject_key, url, excerpt, context, \
+                     state, occurred_at, ingested_at FROM persona_evidence \
+                     WHERE persona = ?1 ORDER BY occurred_at ASC",
+                )?;
+                let rows = stmt.query_map([slug], row_to_persona_evidence)?;
+                collect(rows)?
+            }
+        };
+        out.dedup_by(|a, b| a.id == b.id);
+        Ok(out)
+    }
+
+    /// A token that changes whenever the evidence set does.
+    ///
+    /// `{count}@{newest ingested_at}`, and the count is the part that earns its place. The
+    /// obvious token — the newest excerpt's id — does not change when the **backward** walk
+    /// adds older material, and the backward walk is the main way a profile accumulates. So a
+    /// `PersonaProfile` keyed on it would be refused as a duplicate for the entire backfill,
+    /// and the profile would stay frozen at whatever the first pass happened to see. Nothing
+    /// about that failure is visible: the workflow reports "already run at this key", which
+    /// is normally the good answer.
+    pub fn persona_evidence_watermark(&self, slug: &str) -> Result<Option<String>> {
+        let conn = self.lock();
+        let (count, newest): (i64, Option<String>) = conn.query_row(
+            "SELECT COUNT(*), MAX(ingested_at) FROM persona_evidence WHERE persona = ?1",
+            [slug],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        Ok(newest.map(|n| format!("{count}@{n}")))
+    }
+
+    /// Replace a persona's profile: the traits that survived, and what was refused.
+    ///
+    /// One transaction, because the two halves are one fact. A partial write would leave the
+    /// UI showing last pass's traits beside this pass's refusals, which reads as the filter
+    /// having removed claims that are still on screen.
+    pub fn replace_persona_traits(
+        &self,
+        slug: &str,
+        traits: &[Trait],
+        removed: &[Removed],
+    ) -> Result<()> {
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        tx.execute("DELETE FROM persona_traits WHERE persona = ?1", [slug])?;
+        tx.execute("DELETE FROM persona_removed WHERE persona = ?1", [slug])?;
+        for t in traits {
+            tx.execute(
+                "INSERT INTO persona_traits \
+                 (id, persona, facet, claim, confidence, evidence, counter_evidence, created_at) \
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8) \
+                 ON CONFLICT(id) DO UPDATE SET \
+                    claim=excluded.claim, confidence=excluded.confidence, \
+                    evidence=excluded.evidence, counter_evidence=excluded.counter_evidence",
+                params![
+                    t.id,
+                    slug,
+                    t.facet.as_str(),
+                    t.claim,
+                    t.confidence,
+                    json(&t.evidence)?,
+                    json(&t.counter_evidence)?,
+                    t.created_at.to_rfc3339(),
+                ],
+            )?;
+        }
+        for r in removed {
+            tx.execute(
+                "INSERT INTO persona_removed (persona, facet, claim, why, created_at) \
+                 VALUES (?1,?2,?3,?4,?5)",
+                params![slug, r.facet, r.claim, r.why, Utc::now().to_rfc3339()],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn persona_traits(&self, slug: &str) -> Result<Vec<Trait>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id, persona, facet, claim, confidence, evidence, counter_evidence, \
+             created_at FROM persona_traits WHERE persona = ?1 ORDER BY confidence DESC",
+        )?;
+        let rows = stmt.query_map([slug], row_to_persona_trait)?;
+        collect(rows)
+    }
+
+    pub fn persona_removed(&self, slug: &str) -> Result<Vec<Removed>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT facet, claim, why FROM persona_removed WHERE persona = ?1 \
+             ORDER BY facet, created_at",
+        )?;
+        let rows = stmt.query_map([slug], |row| {
+            Ok(Removed {
+                facet: row.get(0)?,
+                claim: row.get(1)?,
+                why: row.get(2)?,
+            })
+        })?;
+        collect(rows)
+    }
+
+    /// The whole profile, assembled: the persona, its verified traits, what was refused, and
+    /// the counted facts. `None` when there is no such persona.
+    pub fn persona_profile(&self, slug: &str) -> Result<Option<Profile>> {
+        let Some(persona) = self.get_persona(slug)? else {
+            return Ok(None);
+        };
+        let evidence = self.persona_evidence(slug, None)?;
+        let traits = self.persona_traits(slug)?;
+        // Computed on read rather than stored: it is a pure function of evidence plus traits,
+        // both of which are already loaded here, and a stored copy would be a third thing to
+        // keep in step with them. Same reasoning as `Stats`.
+        let sme = crate::persona::sme::with_depth(crate::persona::sme::areas(&evidence), &traits);
+        Ok(Some(Profile {
+            persona,
+            traits,
+            removed: self.persona_removed(slug)?,
+            stats: Stats::compute(&evidence),
+            sme,
+            context: self.persona_context(slug)?,
+        }))
+    }
+
+    pub fn touch_persona_harvested(&self, slug: &str) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE personas SET harvested_at = ?2, updated_at = ?2 WHERE slug = ?1",
+            params![slug, Utc::now().to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    pub fn touch_persona_profiled(&self, slug: &str, watermark: Option<&str>) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE personas SET profiled_at = ?2, evidence_watermark = ?3, updated_at = ?2 \
+             WHERE slug = ?1",
+            params![slug, Utc::now().to_rfc3339(), watermark],
+        )?;
+        Ok(())
+    }
+
+    /// Attach a fact about a person. Returns the new entry's id.
+    pub fn add_persona_context(
+        &self,
+        persona: &str,
+        kind: &str,
+        content: &str,
+        summary: Option<&str>,
+    ) -> Result<String> {
+        let id = new_id();
+        let conn = self.lock();
+        conn.execute(
+            "INSERT INTO persona_context (id, persona, kind, content, summary, created_at) \
+             VALUES (?1,?2,?3,?4,?5,?6)",
+            params![id, persona, kind, content, summary, Utc::now().to_rfc3339()],
+        )?;
+        Ok(id)
+    }
+
+    /// Everything the operator has attached to this person, oldest first.
+    pub fn persona_context(&self, persona: &str) -> Result<Vec<crate::persona::Context>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id, persona, kind, content, summary, created_at FROM persona_context \
+             WHERE persona = ?1 ORDER BY created_at ASC",
+        )?;
+        let rows = stmt.query_map([persona], |row| {
+            Ok(crate::persona::Context {
+                id: row.get(0)?,
+                persona: row.get(1)?,
+                kind: row.get(2)?,
+                content: row.get(3)?,
+                summary: row.get(4)?,
+                created_at: parse_time(row, 5)?,
+            })
+        })?;
+        collect(rows)
+    }
+
+    pub fn remove_persona_context(&self, id: &str) -> Result<bool> {
+        let conn = self.lock();
+        Ok(conn.execute("DELETE FROM persona_context WHERE id = ?1", [id])? > 0)
+    }
+
+    // ---- the Slack directory ------------------------------------------------
+
+    /// Replace the cached workspace directory.
+    ///
+    /// Replace rather than merge, so somebody who left the workspace leaves the cache — a
+    /// directory that only ever grows would keep proposing people who are gone.
+    pub fn put_slack_users(&self, users: &[crate::watchers::slack::SlackUser]) -> Result<usize> {
+        let now = Utc::now().to_rfc3339();
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        tx.execute("DELETE FROM slack_users", [])?;
+        for u in users {
+            tx.execute(
+                "INSERT INTO slack_users \
+                 (id, name, real_name, display_name, email, is_bot, deleted, aliases, updated_at) \
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+                params![
+                    u.id,
+                    u.name,
+                    u.real_name,
+                    u.display_name,
+                    u.email,
+                    u.is_bot as i64,
+                    u.deleted as i64,
+                    json(&u.aliases())?,
+                    now,
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(users.len())
+    }
+
+    /// When the directory was last read, and how many entries it holds.
+    pub fn slack_directory_age(&self) -> Result<(Option<DateTime<Utc>>, usize)> {
+        let conn = self.lock();
+        let (count, newest): (i64, Option<String>) = conn.query_row(
+            "SELECT COUNT(*), MAX(updated_at) FROM slack_users",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        Ok((
+            newest
+                .and_then(|n| DateTime::parse_from_rfc3339(&n).ok())
+                .map(|d| d.with_timezone(&Utc)),
+            count as usize,
+        ))
+    }
+
+    /// One Slack user by id.
+    pub fn slack_user(&self, id: &str) -> Result<Option<crate::watchers::slack::SlackUser>> {
+        let conn = self.lock();
+        conn.query_row(
+            "SELECT id, name, real_name, display_name, email, is_bot, deleted \
+             FROM slack_users WHERE id = ?1 COLLATE NOCASE",
+            [id],
+            row_to_slack_user,
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    /// Find a Slack user by anything somebody might type: the id, the `@handle`, their real
+    /// name, or the local part of their email.
+    ///
+    /// This is what lets the operator link "pcholakov" or "Pavel Cholakov" without going to
+    /// find an opaque id first — and what makes an `Exact` cross-source join possible at all,
+    /// since a GitHub login matching an alias is a deterministic match rather than a guess.
+    ///
+    /// Exact alias match only. Fuzzy matching here would produce a *confident wrong join*,
+    /// which is the one failure the identity model exists to prevent.
+    pub fn find_slack_user(
+        &self,
+        needle: &str,
+    ) -> Result<Option<crate::watchers::slack::SlackUser>> {
+        let needle = needle.trim().trim_start_matches('@').to_ascii_lowercase();
+        if needle.is_empty() {
+            return Ok(None);
+        }
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id, name, real_name, display_name, email, is_bot, deleted, aliases \
+             FROM slack_users WHERE deleted = 0",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let aliases: Vec<String> = from_json_or_default(row, 7)?;
+            Ok((row_to_slack_user(row)?, aliases))
+        })?;
+        for row in rows {
+            let (user, aliases) = row?;
+            if aliases.iter().any(|a| a == &needle) {
+                return Ok(Some(user));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Workspace members whose handle or name looks like `needle`.
+    ///
+    /// For the "did you mean" on a failed link. Substring rather than exact, which is the
+    /// opposite of [`Self::find_slack_user`] and deliberately so: this is a *suggestion* the
+    /// operator reads, where that is a *join* nothing checks afterwards, and a loose match is
+    /// helpful in one and dangerous in the other.
+    pub fn slack_users_like(
+        &self,
+        needle: &str,
+        limit: usize,
+    ) -> Result<Vec<crate::watchers::slack::SlackUser>> {
+        let needle = needle.trim().trim_start_matches('@').to_ascii_lowercase();
+        if needle.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Longest common prefix is enough to make `lukebond` suggest `luke`: match on any
+        // member whose name is a prefix of the needle, or vice versa.
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id, name, real_name, display_name, email, is_bot, deleted \
+             FROM slack_users WHERE deleted = 0 AND is_bot = 0 AND ( \
+                 INSTR(LOWER(?1), LOWER(name)) > 0 OR INSTR(LOWER(name), LOWER(?1)) > 0 \
+                 OR INSTR(LOWER(COALESCE(real_name, '')), LOWER(?1)) > 0 \
+             ) ORDER BY LENGTH(name) DESC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![needle, limit as i64], row_to_slack_user)?;
+        collect(rows)
+    }
+
+    /// Record why the last harvest pass came back thin, or clear it on a clean pass.
+    ///
+    /// Clearing on success matters as much as setting it: a note left behind after the budget
+    /// recovered would report a problem that has gone, which is the same class of lie as a
+    /// stale "AI done" flag.
+    pub fn set_persona_harvest_note(&self, slug: &str, note: Option<&str>) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE personas SET harvest_note = ?2 WHERE slug = ?1",
+            params![slug, note],
+        )?;
+        Ok(())
+    }
+
+    pub fn persona_harvest_note(&self, slug: &str) -> Result<Option<String>> {
+        let conn = self.lock();
+        conn.query_row(
+            "SELECT harvest_note FROM personas WHERE slug = ?1",
+            [slug],
+            |r| r.get(0),
+        )
+        .optional()
+        .map(Option::flatten)
+        .map_err(Into::into)
+    }
+
+    /// How far back the GitHub walk has reached, and whether it is finished.
+    pub fn persona_harvest_cursor(&self, slug: &str) -> Result<(Option<String>, bool)> {
+        let conn = self.lock();
+        let row: Option<(Option<String>, i64)> = conn
+            .query_row(
+                "SELECT harvest_cursor, harvest_complete FROM personas WHERE slug = ?1",
+                [slug],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        Ok(row.map(|(c, done)| (c, done != 0)).unwrap_or((None, false)))
+    }
+
+    pub fn set_persona_harvest_cursor(
+        &self,
+        slug: &str,
+        cursor: Option<&str>,
+        complete: bool,
+    ) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE personas SET harvest_cursor = ?2, harvest_complete = ?3 WHERE slug = ?1",
+            params![slug, cursor, complete as i64],
+        )?;
+        Ok(())
+    }
+
+    /// Store a prediction, replacing any previous one for the same
+    /// `(persona, subject, kind)`.
+    pub fn put_persona_prediction(&self, p: &Prediction) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "INSERT INTO persona_predictions \
+             (persona, subject_key, kind, watermark, would_engage, confidence, \
+              recommendation, summary, points, caveats, produced_by, created_at) \
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12) \
+             ON CONFLICT(persona, subject_key, kind) DO UPDATE SET \
+                watermark=excluded.watermark, would_engage=excluded.would_engage, \
+                confidence=excluded.confidence, recommendation=excluded.recommendation, \
+                summary=excluded.summary, points=excluded.points, caveats=excluded.caveats, \
+                produced_by=excluded.produced_by, created_at=excluded.created_at",
+            params![
+                p.persona,
+                p.subject_key,
+                p.kind.as_str(),
+                p.watermark,
+                p.would_engage as i64,
+                p.confidence,
+                p.recommendation,
+                p.summary,
+                json(&p.points)?,
+                json(&p.caveats)?,
+                p.produced_by,
+                p.created_at.to_rfc3339(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_persona_prediction(
+        &self,
+        persona: &str,
+        subject_key: &str,
+        kind: PredictionKind,
+    ) -> Result<Option<Prediction>> {
+        let conn = self.lock();
+        conn.query_row(
+            &format!("{PREDICTION_SELECT} WHERE persona = ?1 AND subject_key = ?2 AND kind = ?3"),
+            params![persona, subject_key, kind.as_str()],
+            row_to_persona_prediction,
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    /// Every prediction made about one subject, newest first — what the detail pane renders.
+    pub fn predictions_for_subject(&self, subject_key: &str) -> Result<Vec<Prediction>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(&format!(
+            "{PREDICTION_SELECT} WHERE subject_key = ?1 ORDER BY created_at DESC"
+        ))?;
+        let rows = stmt.query_map([subject_key], row_to_persona_prediction)?;
+        collect(rows)
+    }
+
+    /// Every prediction made *by* one persona, newest first — what the persona page renders.
+    pub fn predictions_for_persona(&self, persona: &str, limit: usize) -> Result<Vec<Prediction>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(&format!(
+            "{PREDICTION_SELECT} WHERE persona = ?1 ORDER BY created_at DESC LIMIT ?2"
+        ))?;
+        let rows = stmt.query_map(params![persona, limit as i64], row_to_persona_prediction)?;
+        collect(rows)
+    }
 }
 
 // ---- helpers ----------------------------------------------------------------
@@ -3577,6 +4675,23 @@ fn row_to_browser_investigation(row: &Row) -> rusqlite::Result<BrowserInvestigat
         attempts: row.get(8)?,
         created_at: row.get(9)?,
         updated_at: row.get(10)?,
+        method: row.get(11)?,
+        evidence: row.get(12)?,
+    })
+}
+
+fn row_to_thread_analysis(row: &Row) -> rusqlite::Result<ThreadAnalysis> {
+    Ok(ThreadAnalysis {
+        id: row.get(0)?,
+        channel: row.get(1)?,
+        thread_ts: row.get(2)?,
+        url: row.get(3)?,
+        reply_count: row.get(4)?,
+        status: row.get(5)?,
+        verdict: row.get(6)?,
+        error: row.get(7)?,
+        created_at: row.get(8)?,
+        updated_at: row.get(9)?,
     })
 }
 
@@ -3647,6 +4762,121 @@ fn row_to_registry_commit(row: &Row) -> rusqlite::Result<RegistryCommit> {
     })
 }
 
+// ---- persona row mappers -----------------------------------------------------
+//
+// Every enum-valued column is decoded with a fallback rather than a failure. A row written by
+// a newer build — a facet or evidence kind this one has never heard of — must not fail the
+// whole query and blank the profile; the same reasoning as the tolerant wire types in
+// `crate::incident`. Where a fallback would be *unsafe* rather than merely lossy, it errs
+// toward the harmless value: an unknown identity provenance becomes `Proposed`, which
+// contributes no evidence (see `Store::persona_identities`).
+
+fn row_to_persona(row: &Row, identities: Vec<Identity>) -> rusqlite::Result<Persona> {
+    Ok(Persona {
+        slug: row.get(0)?,
+        display_name: row.get(1)?,
+        role: row.get(2)?,
+        notes: row.get(3)?,
+        created_at: parse_time(row, 4)?,
+        updated_at: parse_time(row, 5)?,
+        harvested_at: parse_time_opt(row, 6)?,
+        profiled_at: parse_time_opt(row, 7)?,
+        evidence_watermark: row.get(8)?,
+        identities,
+    })
+}
+
+fn row_to_persona_evidence(row: &Row) -> rusqlite::Result<Evidence> {
+    let source: String = row.get(2)?;
+    let kind: String = row.get(3)?;
+    Ok(Evidence {
+        id: row.get(0)?,
+        persona: row.get(1)?,
+        source: Source::parse(&source).unwrap_or(Source::GitHub),
+        kind: EvidenceKind::parse(&kind).unwrap_or(EvidenceKind::IssueComment),
+        subject_key: row.get(4)?,
+        url: row.get(5)?,
+        excerpt: row.get(6)?,
+        context: row.get(7)?,
+        state: row.get(8)?,
+        occurred_at: parse_time(row, 9)?,
+        ingested_at: parse_time(row, 10)?,
+    })
+}
+
+fn row_to_persona_trait(row: &Row) -> rusqlite::Result<Trait> {
+    let facet: String = row.get(2)?;
+    Ok(Trait {
+        id: row.get(0)?,
+        persona: row.get(1)?,
+        facet: Facet::parse(&facet).unwrap_or(Facet::Style),
+        claim: row.get(3)?,
+        confidence: row.get(4)?,
+        evidence: from_json_or_default(row, 5)?,
+        counter_evidence: from_json_or_default(row, 6)?,
+        created_at: parse_time(row, 7)?,
+    })
+}
+
+fn row_to_persona_prediction(row: &Row) -> rusqlite::Result<Prediction> {
+    let kind: String = row.get(2)?;
+    let points: Vec<PredictedPoint> = from_json_or_default(row, 8)?;
+    Ok(Prediction {
+        persona: row.get(0)?,
+        subject_key: row.get(1)?,
+        kind: PredictionKind::parse(&kind).unwrap_or(PredictionKind::IssueResponse),
+        watermark: row.get(3)?,
+        would_engage: row.get::<_, i64>(4)? != 0,
+        confidence: row.get(5)?,
+        recommendation: row.get(6)?,
+        summary: row.get(7)?,
+        points,
+        caveats: from_json_or_default(row, 9)?,
+        produced_by: row.get(10)?,
+        created_at: parse_time(row, 11)?,
+    })
+}
+
+fn row_to_slack_user(row: &Row) -> rusqlite::Result<crate::watchers::slack::SlackUser> {
+    Ok(crate::watchers::slack::SlackUser {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        real_name: row.get(2)?,
+        display_name: row.get(3)?,
+        email: row.get(4)?,
+        is_bot: row.get::<_, i64>(5)? != 0,
+        deleted: row.get::<_, i64>(6)? != 0,
+    })
+}
+
+/// An RFC3339 column, decoded.
+fn parse_time(row: &Row, idx: usize) -> rusqlite::Result<DateTime<Utc>> {
+    let raw: String = row.get(idx)?;
+    DateTime::parse_from_rfc3339(&raw)
+        .map(|d| d.with_timezone(&Utc))
+        .map_err(|e| rusqlite::Error::FromSqlConversionFailure(idx, Type::Text, Box::new(e)))
+}
+
+fn parse_time_opt(row: &Row, idx: usize) -> rusqlite::Result<Option<DateTime<Utc>>> {
+    let raw: Option<String> = row.get(idx)?;
+    Ok(raw
+        .and_then(|r| DateTime::parse_from_rfc3339(&r).ok())
+        .map(|d| d.with_timezone(&Utc)))
+}
+
+/// A JSON-encoded column, decoded to `T`, defaulting rather than failing.
+///
+/// Distinct from [`from_json`], which propagates a decode failure. These columns are all
+/// lists of ids and strings, and an empty list degrades to "no citations" — which
+/// verification already handles — where a failed row would blank the whole profile.
+fn from_json_or_default<T: serde::de::DeserializeOwned + Default>(
+    row: &Row,
+    idx: usize,
+) -> rusqlite::Result<T> {
+    let raw: String = row.get(idx)?;
+    Ok(serde_json::from_str(&raw).unwrap_or_default())
+}
+
 /// Columns added to tables that already exist, applied idempotently.
 ///
 /// `CREATE TABLE IF NOT EXISTS` **silently skips a table that is already there**, so a column
@@ -3669,6 +4899,14 @@ fn add_columns(conn: &Connection) -> Result<()> {
         ("repo_index", "kind", "TEXT"),
         ("repo_index", "kind_pinned", "INTEGER NOT NULL DEFAULT 0"),
         ("issue_pr_fixes", "review_state", "TEXT"),
+        // A nullable column on a table that already exists in any database created between
+        // the personas feature landing and this fix — exactly the case this mechanism is for.
+        ("personas", "harvest_note", "TEXT"),
+        // The Grafana tier shares this table with the browser tier: one row per signal is
+        // the invariant worth keeping (it is what stops a re-emitted signal re-queuing),
+        // and "which tier is on it" is a state transition on that row, not a second row.
+        ("browser_investigations", "method", "TEXT"),
+        ("browser_investigations", "evidence", "TEXT"),
     ];
     for (table, column, def) in ADDED {
         if has_column(conn, table, column)? {
@@ -4329,7 +5567,8 @@ mod tests {
     /// holding 147 repos and 718 commit summaries.
     #[test]
     fn a_new_column_reaches_a_database_that_predates_it() {
-        let dir = std::env::temp_dir().join(format!("mugglebot-add-column-test-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("mugglebot-add-column-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("older.sqlite");
@@ -4867,6 +6106,118 @@ mod tests {
         );
     }
 
+    /// The two tiers share one row, and the pending list is what routes it: the scheduler
+    /// submits `GrafanaRead` or `BrowserRead` off this method.
+    #[test]
+    fn the_pending_queue_reports_which_tier_each_read_is_on() {
+        let store = Store::open_in_memory().unwrap();
+        for (ext, method) in [("a", "grafana"), ("b", "browser")] {
+            let mut sig = sample(ext);
+            sig.subject = Some("o/r#1".into());
+            store.insert_signal(&sig).unwrap();
+            store
+                .queue_browser_investigation(&sig.id, "https://g/d/1", "{}", method)
+                .unwrap();
+        }
+        let pending = store.list_browser_investigations_pending().unwrap();
+        let methods: Vec<&str> = pending.iter().map(|(_, m)| m.as_str()).collect();
+        assert!(
+            methods.contains(&"grafana") && methods.contains(&"browser"),
+            "{methods:?}"
+        );
+    }
+
+    /// Escalation is a transition on the one row, not a second row — which is what keeps
+    /// "one question per alert" true while still letting the browser answer it. The reason
+    /// Grafana came up short survives on the record.
+    #[test]
+    fn escalating_to_the_browser_keeps_one_row_and_the_reason() {
+        let store = Store::open_in_memory().unwrap();
+        let mut sig = sample("grafana-escalate");
+        sig.subject = Some("o/r#9".into());
+        store.insert_signal(&sig).unwrap();
+        let queued = store
+            .queue_browser_investigation(&sig.id, "https://g/d/1", "{}", "grafana")
+            .unwrap();
+
+        let handed = store
+            .escalate_investigation_to_browser(
+                &queued.id,
+                "https://g/d/abc/tenant-overview",
+                "Investigate one dashboard link…",
+                "the queries returned no points for this window",
+            )
+            .unwrap();
+        assert_eq!(
+            handed.id, queued.id,
+            "the same investigation, on another tier"
+        );
+        assert_eq!(handed.method, "browser");
+        assert_eq!(handed.status, "pending");
+        assert!(handed.url.contains("/d/abc/"));
+        assert!(handed.error.as_deref().unwrap().contains("no points"));
+        assert_eq!(
+            store
+                .browser_investigations_for_subject("o/r#9")
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    /// The conclusion and the series it came from are stored together, because a figure
+    /// nobody can go back and check is the thing this tier exists to avoid.
+    #[test]
+    fn a_grafana_read_stores_its_evidence_beside_its_conclusion() {
+        let store = Store::open_in_memory().unwrap();
+        let mut sig = sample("grafana-evidence");
+        sig.subject = Some("o/r#11".into());
+        store.insert_signal(&sig).unwrap();
+        let queued = store
+            .queue_browser_investigation(&sig.id, "https://g/d/1", "{}", "grafana")
+            .unwrap();
+
+        let done = store
+            .complete_investigation_with_evidence(
+                &queued.id,
+                "Storage reached 0.94 against a 0.9 threshold.",
+                r#"{"series":[{"ref_id":"A","max":0.94}]}"#,
+            )
+            .unwrap();
+        assert_eq!(done.status, "completed");
+        assert_eq!(done.method, "grafana");
+        assert!(done.findings.as_deref().unwrap().contains("0.94"));
+        assert!(done.evidence.as_deref().unwrap().contains("\"max\":0.94"));
+    }
+
+    /// Rows written before the Grafana tier existed are browser reads, which is what they
+    /// were — the `COALESCE` in the select, exercised.
+    #[test]
+    fn a_row_with_no_method_reads_as_a_browser_investigation() {
+        let store = Store::open_in_memory().unwrap();
+        let mut sig = sample("legacy");
+        sig.subject = Some("o/r#12".into());
+        store.insert_signal(&sig).unwrap();
+        let queued = store
+            .queue_browser_investigation(&sig.id, "https://g/d/1", "prompt", "browser")
+            .unwrap();
+        {
+            let conn = store.lock();
+            conn.execute(
+                "UPDATE browser_investigations SET method=NULL WHERE id=?1",
+                params![queued.id],
+            )
+            .unwrap();
+        }
+        let read = store
+            .get_browser_investigation(&queued.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(read.method, "browser");
+        let pending = store.list_browser_investigations_pending().unwrap();
+        assert_eq!(pending[0].1, "browser");
+    }
+
     #[test]
     fn browser_investigation_round_trips_findings() {
         let store = Store::open_in_memory().unwrap();
@@ -4879,12 +6230,13 @@ mod tests {
                 &signal.id,
                 "https://example.grafana.net/alerting/123",
                 "Use @Chrome read-only.",
+                "browser",
             )
             .unwrap();
         assert_eq!(queued.status, "pending");
         // Queueing the same signal is idempotent.
         let duplicate = store
-            .queue_browser_investigation(&signal.id, "https://ignored", "ignored")
+            .queue_browser_investigation(&signal.id, "https://ignored", "ignored", "browser")
             .unwrap();
         assert_eq!(queued.id, duplicate.id);
 
@@ -5291,7 +6643,10 @@ mod tests {
     /// `subject_root_cause`, which was neither the cause nor even mentioned in the error.
     #[test]
     fn an_older_database_is_refused_by_name_rather_than_failing_mid_schema() {
-        let dir = std::env::temp_dir().join(format!("mugglebot-schema-compat-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "mugglebot-schema-compat-test-{}",
+            std::process::id()
+        ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("old.sqlite");
@@ -5331,7 +6686,10 @@ mod tests {
     /// only useful if the happy path is unaffected by it.
     #[test]
     fn a_current_database_reopens_cleanly() {
-        let dir = std::env::temp_dir().join(format!("mugglebot-schema-reopen-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "mugglebot-schema-reopen-test-{}",
+            std::process::id()
+        ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("current.sqlite");
