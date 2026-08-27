@@ -1,6 +1,7 @@
 import { createResource, createSignal, For, Show } from "solid-js";
 import { api } from "../api";
 import type { Memory, MemoryHit } from "../types";
+import { Empty, Field, Form, Item, Panel, Toolbar } from "./ui";
 
 export default function MemoryEditor() {
   const [memories, { refetch }] = createResource(() => api.tool<Memory[]>("list_memories"));
@@ -63,71 +64,117 @@ export default function MemoryEditor() {
   };
 
   return (
-    <div class="page">
-      <section class="panel">
-        <h3>Add memory</h3>
-        <div class="form">
-          <textarea placeholder="A fact, lesson, or confirmed approach…" value={text()} onInput={(e) => setText(e.currentTarget.value)} />
-          <input placeholder="one-line summary (optional)" value={summary()} onInput={(e) => setSummary(e.currentTarget.value)} />
-          <input placeholder="links: signal/thread ids, comma-separated" value={links()} onInput={(e) => setLinks(e.currentTarget.value)} />
-          <input placeholder="tags, comma-separated (optional — auto-suggested if blank)" value={tags()} onInput={(e) => setTags(e.currentTarget.value)} />
-          <button onClick={add}>Save</button>
-        </div>
-      </section>
-
-      <section class="panel">
-        <h3>Search</h3>
-        <div class="row">
-          <input placeholder="semantic recall…" value={query()} onInput={(e) => setQuery(e.currentTarget.value)} onKeyDown={(e) => e.key === "Enter" && search()} />
+    <>
+      <Panel title="Recall">
+        <Toolbar>
+          <input
+            placeholder="Search by meaning, not keyword…"
+            value={query()}
+            onInput={(e) => setQuery(e.currentTarget.value)}
+            onKeyDown={(e) => e.key === "Enter" && search()}
+          />
           <button onClick={search}>Recall</button>
           <Show when={results()}>
-            <button onClick={() => { setQuery(""); setResults(null); }}>CLEAR</button>
+            <button
+              onClick={() => {
+                setQuery("");
+                setResults(null);
+              }}
+            >
+              Clear
+            </button>
           </Show>
-        </div>
+        </Toolbar>
         <Show when={results()}>
-          <For each={results()}>
-            {(m) => (
-              <div class="mem-item">
-                <div class="mem-head"><strong>{m.summary}</strong><span class="muted">{(m.score).toFixed(2)}</span></div>
-                <div>{m.text}</div>
-              </div>
-            )}
-          </For>
+          {/* The score is shown because recall is semantic: a weak match is still returned,
+              and without the number there is no way to tell it from a strong one. */}
+          <div class="stack">
+            <For
+              each={results()}
+              fallback={<Empty kind="clear">Nothing recalled for that.</Empty>}
+            >
+              {(m) => (
+                <Item title={m.summary} actions={<span class="score">{m.score.toFixed(2)}</span>}>
+                  {m.text}
+                </Item>
+              )}
+            </For>
+          </div>
         </Show>
-      </section>
+      </Panel>
 
-      <section class="panel">
-        <h3>MEMORY ({memories()?.length ?? 0})</h3>
-        <For each={memories()} fallback={<p class="muted">Empty.</p>}>
+      <Panel title="Memory" meta={`${memories()?.length ?? 0} stored`}>
+        <For
+          each={memories()}
+          fallback={
+            <Empty kind="clear">
+              Nothing remembered yet. Add a fact below, or distil one from a thread in Chat.
+            </Empty>
+          }
+        >
           {(m) => (
-            <div class="mem-item">
-              <div class="mem-head">
-                <strong>{m.summary}</strong>
-                <span class="tl-actions">
-                  <Show when={editing() !== m.id} fallback={<button onClick={() => saveEdit(m.id)}>save</button>}>
-                    <button onClick={() => { setEditing(m.id); setEditText(m.text); }}>edit</button>
+            <Item
+              title={m.summary}
+              actions={
+                <>
+                  <Show
+                    when={editing() !== m.id}
+                    fallback={<button onClick={() => saveEdit(m.id)}>Save</button>}
+                  >
+                    <button
+                      onClick={() => {
+                        setEditing(m.id);
+                        setEditText(m.text);
+                      }}
+                    >
+                      Edit
+                    </button>
                   </Show>
-                  <button onClick={() => del(m.id)}>delete</button>
-                </span>
-              </div>
-              <Show when={editing() === m.id} fallback={<div>{m.text}</div>}>
+                  <button class="destructive" onClick={() => del(m.id)}>
+                    Delete
+                  </button>
+                </>
+              }
+              foot={
+                <>
+                  <span class="tags">
+                    <For each={m.tags} fallback={<span class="muted">no tags</span>}>
+                      {(t) => <span class="chip tag">{t}</span>}
+                    </For>
+                  </span>
+                  <button class="linkish" onClick={() => editTags(m.id, m.tags)}>
+                    {m.tags_pinned ? "edit tags" : "tags (auto)"}
+                  </button>
+                  <Show when={m.links.length}>
+                    <span>· links: {m.links.join(", ")}</span>
+                  </Show>
+                </>
+              }
+            >
+              <Show when={editing() === m.id} fallback={m.text}>
                 <textarea value={editText()} onInput={(e) => setEditText(e.currentTarget.value)} />
               </Show>
-              <div class="tags">
-                <For each={m.tags} fallback={<span class="muted">no tags</span>}>
-                  {(t) => <span class="chip tag">{t}</span>}
-                </For>
-                <button class="linkish" onClick={() => editTags(m.id, m.tags)}>
-                  {m.tags_pinned ? "edit tags" : "tags (auto)"}
-                </button>
-              </div>
-              <Show when={m.links.length}>
-                <div class="cites">links: {m.links.join(", ")}</div>
-              </Show>
-            </div>
+            </Item>
           )}
         </For>
-      </section>
-    </div>
+      </Panel>
+
+      <Panel title="Add memory" tone="quiet">
+        <Form actions={<button class="primary" onClick={add}>Save</button>}>
+          <Field label="Fact" hint="a lesson, a confirmed approach, something that surprised you">
+            <textarea value={text()} onInput={(e) => setText(e.currentTarget.value)} />
+          </Field>
+          <Field label="Summary" hint="optional — one line; generated if left blank">
+            <input value={summary()} onInput={(e) => setSummary(e.currentTarget.value)} />
+          </Field>
+          <Field label="Links" hint="signal or thread ids, comma-separated">
+            <input value={links()} onInput={(e) => setLinks(e.currentTarget.value)} />
+          </Field>
+          <Field label="Tags" hint="comma-separated — auto-suggested if blank">
+            <input value={tags()} onInput={(e) => setTags(e.currentTarget.value)} />
+          </Field>
+        </Form>
+      </Panel>
+    </>
   );
 }

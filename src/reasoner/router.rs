@@ -1,6 +1,6 @@
 //! The difficulty router — the front door for every task-shaped reasoning call.
 //!
-//! MuggleBot's default model is the **local** one (`deepseek-coder:33b` on Ollama).
+//! MuggleBot's default model is the **local** one (`gemma4:31b` on Ollama).
 //! Most of
 //! what an ops agent asks a model to do is not hard: label a thread, extract search
 //! terms, decide whether two alerts are the same thing, shortlist commits. Sending
@@ -13,7 +13,7 @@
 //!
 //! | Grade | Who answers |
 //! |---|---|
-//! | `easy`, `medium` | local (`deepseek-coder:33b`) alone |
+//! | `easy`, `medium` | local (`gemma4:31b`) alone |
 //! | `hard` | local drafts, then **Sonnet cleans it up** — or Sonnet does it outright if local fails |
 //! | `extra_hard` | **Opus**, directly; local doesn't attempt it |
 //!

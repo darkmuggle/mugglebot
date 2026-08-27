@@ -27,6 +27,7 @@ import type {
   RepoKind,
   RepoIndexProgress,
 } from "../types";
+import { Panel } from "./ui";
 
 /// How often the panel re-reads the parts that have no push behind them.
 ///
@@ -265,11 +266,11 @@ export default function RepoIndexView(props: { onChat?: () => void }) {
   );
 
   return (
-    <div class="page">
+    <>
       <Show
         when={openRepo() === null}
         fallback={
-          <section class="panel repo-index">
+          <Panel class="repo-index">
             {errorStrip()}
             {agentPane()}
             <RepoDetailView
@@ -279,14 +280,15 @@ export default function RepoIndexView(props: { onChat?: () => void }) {
               onAgent={(sha) => void openAgent(openRepo()!, sha)}
               onRetag={(kind) => void retag(openRepo()!, kind)}
             />
-          </section>
+          </Panel>
         }
       >
-        <section class="panel repo-index">
-          <div class="panel-head">
-            <h3>Code index</h3>
-            {/* Whether the numbers are arriving by push. Worth showing, because a stalled index
-                and a dropped WebSocket look identical on a panel of static numbers. */}
+        <Panel
+          class="repo-index"
+          title="Repositories"
+          /* Whether the numbers are arriving by push. Worth showing, because a stalled index
+             and a dropped WebSocket look identical on a panel of static numbers. */
+          meta={
             <span
               class="chip"
               classList={{ "ph-done": pushes() > 0, "ph-idle": pushes() === 0 }}
@@ -298,7 +300,9 @@ export default function RepoIndexView(props: { onChat?: () => void }) {
             >
               {pushes() > 0 ? `LIVE · ${pushes()}` : "LIVE"}
             </span>
-            <div class="row">
+          }
+          actions={
+            <>
               <select
                 class="kind-pick"
                 data-tip="Which agent CLI runs in the checkout"
@@ -314,9 +318,9 @@ export default function RepoIndexView(props: { onChat?: () => void }) {
               <button onClick={() => setShowAll(!showAll())}>
                 {showAll() ? "Hide untouched" : "Show all"}
               </button>
-            </div>
-          </div>
-
+            </>
+          }
+        >
           {errorStrip()}
           {agentPane()}
 
@@ -555,8 +559,8 @@ export default function RepoIndexView(props: { onChat?: () => void }) {
               </>
             )}
           </Show>
-        </section>
+        </Panel>
       </Show>
-    </div>
+    </>
   );
 }

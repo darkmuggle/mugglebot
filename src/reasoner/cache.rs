@@ -262,7 +262,7 @@ mod tests {
     fn the_tier_label_is_part_of_the_key() {
         let req = task("input");
         assert_ne!(
-            cache_key("ollama_local/deepseek-coder:33b", &req),
+            cache_key("ollama_local/gemma4:31b", &req),
             cache_key("claude/claude-opus-4-8", &req)
         );
     }

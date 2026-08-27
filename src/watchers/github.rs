@@ -36,6 +36,9 @@ pub struct GithubWatcher {
     enrich: bool,
     /// Subject-title prefixes that mark a notification as ignorable noise.
     ignore_prefixes: Vec<String>,
+    /// Clears the notifications that do not need you, off the same poll. `None` when
+    /// `[tidy]` is off — see [`crate::tidy`].
+    tidier: Option<std::sync::Arc<crate::tidy::Tidier>>,
     /// `Last-Modified` from the previous response, replayed as `If-Modified-Since`.
     last_modified: Mutex<Option<String>>,
     /// Short-TTL cache of the branch→PR lookup used to attribute CI to its PR.
@@ -71,7 +74,20 @@ impl GithubWatcher {
             last_modified: Mutex::new(None),
             branch_pr_cache: Mutex::new(HashMap::new()),
             ci_log_cache: Mutex::new(HashMap::new()),
+            tidier: None,
         })
+    }
+
+    /// Attach the notification tidier. Separate from [`Self::new`] because it needs the store
+    /// and this watcher otherwise has no reason to know one exists.
+    ///
+    /// It rides *this* poll rather than running its own. A second watcher on `/notifications`
+    /// would double the request cost and could not share the `Last-Modified` cursor that makes
+    /// most polls a 304 — and it would have to re-fetch each subject to learn what is merged,
+    /// which this poll's enrichment already knows.
+    pub fn with_tidier(mut self, tidier: std::sync::Arc<crate::tidy::Tidier>) -> Self {
+        self.tidier = Some(tidier);
+        self
     }
 
     fn classify(reason: &str) -> (SignalKind, Severity) {
@@ -1201,6 +1217,14 @@ impl Watcher for GithubWatcher {
         let active_ids = notifications.iter().map(|n| n.id.clone()).collect();
         let now = Utc::now();
         let mut out = Vec::with_capacity(notifications.len());
+        // Notifications the tidier will be asked about, gathered as this walk goes. They are
+        // collected at two points and swept once at the end: a notification the `watch`
+        // filter drops never reaches enrichment, and those are exactly the CI runs the
+        // tidier is for — so the CI decision (which needs only the reason and the title) is
+        // taken there, and the merged decision (which needs a resolved state) after
+        // enrichment has supplied one.
+        let mut tidy_candidates: Vec<crate::tidy::Candidate> = Vec::new();
+        let tidying = self.tidier.as_ref().is_some_and(|t| t.ready());
         for n in notifications {
             let (kind, mut severity) = Self::classify(&n.reason);
             let ci_outcome = (n.subject.r#type == "CheckSuite").then(|| {
@@ -1228,6 +1252,9 @@ impl Watcher for GithubWatcher {
                 "PullRequest" | "Issue" | "Discussion"
             );
             if !always_show && !self.allowed.is_empty() && !self.allowed.contains(&kind) {
+                if tidying {
+                    tidy_candidates.push(tidy_candidate(&n, None));
+                }
                 continue;
             }
             if ignored_by_prefix(&n.subject.title, &self.ignore_prefixes) {
@@ -1235,6 +1262,9 @@ impl Watcher for GithubWatcher {
                     "github: ignoring notification by prefix: {}",
                     n.subject.title
                 );
+                if tidying {
+                    tidy_candidates.push(tidy_candidate(&n, None));
+                }
                 continue;
             }
 
@@ -1255,6 +1285,12 @@ impl Watcher for GithubWatcher {
                     Enrichment::default(),
                 )
             };
+
+            if tidying {
+                // Enrichment has resolved the lifecycle by here, so `merged` is known
+                // without a second fetch.
+                tidy_candidates.push(tidy_candidate(&n, enrichment.state.as_deref()));
+            }
 
             let occurred_at = chrono::DateTime::parse_from_rfc3339(&n.updated_at)
                 .map(|d| d.with_timezone(&Utc))
@@ -1335,6 +1371,24 @@ impl Watcher for GithubWatcher {
                 tags: Vec::new(),
             });
         }
+        // Swept once, after the walk. Ordering is deliberate: the signals are already built,
+        // so a tidier that errors or hangs cannot cost this poll its batch. Clearing a
+        // notification does not suppress its signal — the board's attention model is
+        // MuggleBot's own, and the CI signals it keeps are what correlate a failing run to
+        // its pull request. The inbox is the thing being cleaned.
+        if let Some(tidier) = self.tidier.as_ref().filter(|_| !tidy_candidates.is_empty()) {
+            let swept = tidier.sweep(&tidy_candidates).await;
+            if swept.matched > 0 {
+                debug!(
+                    "tidy: {} of {} considered, {} cleared, {} failed{}",
+                    swept.matched,
+                    swept.considered,
+                    swept.cleared,
+                    swept.failed,
+                    if tidier.dry_run() { " (dry run)" } else { "" }
+                );
+            }
+        }
         Ok(PollBatch {
             signals: out,
             snapshot: Some(SourceSnapshot {
@@ -1342,6 +1396,20 @@ impl Watcher for GithubWatcher {
                 active_ids,
             }),
         })
+    }
+}
+
+/// A [`crate::tidy::Candidate`] from one notification, with whatever lifecycle the walk has
+/// resolved by the point it is called.
+fn tidy_candidate(n: &GhNotification, state: Option<&str>) -> crate::tidy::Candidate {
+    crate::tidy::Candidate {
+        thread_id: n.id.clone(),
+        reason: n.reason.clone(),
+        subject_type: n.subject.r#type.clone(),
+        title: n.subject.title.clone(),
+        repo: n.repository.full_name.clone(),
+        state: state.map(str::to_string),
+        url: n.subject.url.clone(),
     }
 }
 

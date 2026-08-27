@@ -230,6 +230,122 @@ CREATE TABLE IF NOT EXISTS browser_investigations (
 CREATE INDEX IF NOT EXISTS idx_browser_investigations_signal ON browser_investigations(signal_id);
 CREATE INDEX IF NOT EXISTS idx_browser_investigations_status ON browser_investigations(status);
 
+-- A Restate Cloud entity (`env_…`, `acc_…`, a Nuon install) reduced to the fields worth
+-- showing, cached from `rcc`/`nuon`. See `src/cloud.rs`.
+--
+-- A cache, not a record: every row is reconstructible by re-running the CLI, and `fetched_at`
+-- is what decides whether to. Rows are curated field lists rather than raw virtual-object
+-- state precisely because this table is read into model prompts — see the note on
+-- `cloud::summarize` about which credential-bearing fields that keeps out.
+CREATE TABLE IF NOT EXISTS cloud_entities (
+    id          TEXT PRIMARY KEY,
+    kind        TEXT NOT NULL,
+    name        TEXT,
+    status      TEXT,
+    -- JSON arrays: `[{label, value}]` and `[id]`.
+    fields      TEXT NOT NULL,
+    related     TEXT NOT NULL,
+    -- The ids this one contains, as opposed to the ones it belongs to: an account's people,
+    -- an organization's members and groups. Stored rather than derived because it is the only
+    -- record that a `usr_` exists — nothing lists users, so the estate walk finds them by
+    -- reading this back. See `cloud::Entity::members`.
+    members     TEXT NOT NULL DEFAULT '[]',
+    -- Why the lookup failed, when it did. Cached briefly so an expired token retries soon.
+    error       TEXT,
+    fetched_at  TEXT NOT NULL
+);
+
+-- Which ids a signal's text actually mentioned. Only the mentions — the ancestors reached by
+-- following `cloud_entities.related` are derived on read, so this table stays a statement
+-- about the signal rather than a second copy of the hierarchy that can drift from it.
+CREATE TABLE IF NOT EXISTS signal_cloud_ids (
+    signal_id  TEXT NOT NULL,
+    entity_id  TEXT NOT NULL,
+    PRIMARY KEY (signal_id, entity_id)
+);
+CREATE INDEX IF NOT EXISTS idx_signal_cloud_ids_entity ON signal_cloud_ids(entity_id);
+
+-- One reviewer's pass over one branch at one commit. Several rows per branch: the model's own
+-- read plus a pass per persona, each on whichever model the operator picked — see
+-- `src/ghreview.rs`.
+--
+-- Keyed on the *sha*, not the branch name, because a review is about a commit: when the branch
+-- moves the pass does not follow it, which makes it stale rather than wrong.
+CREATE TABLE IF NOT EXISTS branch_review_passes (
+    id              TEXT PRIMARY KEY,
+    branch_key      TEXT NOT NULL,
+    repo            TEXT NOT NULL,
+    head            TEXT NOT NULL,
+    base            TEXT NOT NULL,
+    head_sha        TEXT NOT NULL,
+    -- `model` or `persona:<slug>`.
+    reviewer        TEXT NOT NULL,
+    provider        TEXT NOT NULL,
+    model           TEXT NOT NULL,
+    status          TEXT NOT NULL,
+    recommendation  TEXT,
+    summary         TEXT,
+    -- The placed comments, as JSON. Read back whole by one view; nothing queries inside them.
+    comments        TEXT,
+    -- Hidden from the diff, kept on the record: a dismissed review is evidence about the
+    -- reviewer, and re-running one you dismissed should be a decision rather than something
+    -- that happens because the record was thrown away.
+    dismissed       INTEGER NOT NULL DEFAULT 0,
+    error           TEXT,
+    created_at      TEXT NOT NULL,
+    updated_at      TEXT NOT NULL,
+    UNIQUE(branch_key, head_sha, reviewer, provider, model)
+);
+CREATE INDEX IF NOT EXISTS idx_branch_passes_key ON branch_review_passes(branch_key);
+
+-- The diff a branch's reviewers read, cached per commit.
+--
+-- Its own table rather than a column on a pass: a panel of five reviewers reads one diff, and
+-- the view still needs it to render comments against after the pass that fetched it has been
+-- dismissed. Keyed on the sha, so a branch that moves gets a new row rather than silently
+-- reusing the old code.
+CREATE TABLE IF NOT EXISTS branch_diffs (
+    branch_key  TEXT NOT NULL,
+    head_sha    TEXT NOT NULL,
+    report      TEXT NOT NULL,
+    fetched_at  TEXT NOT NULL,
+    PRIMARY KEY (branch_key, head_sha)
+);
+CREATE INDEX IF NOT EXISTS idx_branch_passes_status ON branch_review_passes(status);
+
+-- A whole source, quiet until a time. "Not Slack, not now" — see `src/quiet.rs`.
+--
+-- Expiry is a column that gets read, never a timer that gets armed: nothing has to survive a
+-- restart, and there is no scheduled cancellation that can fail to run and leave a source
+-- silenced past its snooze.
+CREATE TABLE IF NOT EXISTS source_snoozes (
+    source     TEXT PRIMARY KEY,
+    until      TEXT NOT NULL,
+    -- Severities BELOW this are held back; this and above land anyway. Normally `critical`,
+    -- so a snooze can never be what hides an outage.
+    floor      TEXT NOT NULL,
+    set_at     TEXT NOT NULL
+);
+
+-- Notifications the tidier decided did not need you. An audit trail, not a queue: the row
+-- is written before the API call, so a crash leaves a record of what was about to happen
+-- rather than a gap, and `cleared` says whether it actually went.
+--
+-- This table exists because the action is outward-facing and awkward to undo. "What did it
+-- take out of my inbox" is a question you have precisely when the notification is no longer
+-- there to look at.
+CREATE TABLE IF NOT EXISTS tidied_notifications (
+    thread_id  TEXT PRIMARY KEY,
+    reason     TEXT NOT NULL,
+    rule       TEXT NOT NULL,
+    repo       TEXT NOT NULL,
+    title      TEXT NOT NULL,
+    url        TEXT,
+    cleared    INTEGER NOT NULL DEFAULT 0,
+    at         TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_tidied_at ON tidied_notifications(at DESC);
+
 -- One hand-requested Slack thread analysis. Keyed by (channel, thread_ts) so pasting the
 -- same link twice is the same row: the analysis costs two metered model calls, and the
 -- answer only changes when the thread does.
@@ -685,6 +801,15 @@ const BROWSER_SELECT: &str = "SELECT b.id, b.signal_id, s.subject, b.url, b.prom
      COALESCE(b.method, 'browser'), b.evidence \
      FROM browser_investigations b";
 
+/// Column list for [`row_to_cloud_entity`].
+const CLOUD_SELECT: &str = "SELECT id, kind, name, status, fields, related, error, fetched_at, \
+     members FROM cloud_entities";
+
+/// Column list for [`row_to_branch_pass`].
+const BRANCH_PASS_SELECT: &str = "SELECT id, branch_key, repo, head, base, head_sha, reviewer, \
+     provider, model, status, recommendation, summary, comments, dismissed, error, created_at, \
+     updated_at FROM branch_review_passes";
+
 /// Column list for [`row_to_thread_analysis`].
 const THREAD_SELECT: &str = "SELECT id, channel, thread_ts, url, reply_count, status, verdict, \
      error, created_at, updated_at FROM thread_analyses";
@@ -788,6 +913,23 @@ pub struct BrowserInvestigation {
     /// The series the conclusion was drawn from, as JSON — `grafana` only. This is what
     /// makes the conclusion checkable rather than merely plausible.
     pub evidence: Option<String>,
+}
+
+/// One notification the tidier cleared, or would have.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TidiedNotification {
+    pub thread_id: String,
+    /// GitHub's notification reason — `ci_activity`, `subscribed`, …
+    pub reason: String,
+    /// Which rule fired: `ci_activity` or `merged`.
+    pub rule: String,
+    pub repo: String,
+    pub title: String,
+    pub url: Option<String>,
+    /// False in a dry run, and false when the API call failed — so this never claims
+    /// something happened that did not.
+    pub cleared: bool,
+    pub at: String,
 }
 
 /// One hand-requested Slack thread analysis.
@@ -1142,6 +1284,13 @@ impl Store {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
+        // WAL lets a reader and a writer coexist, but not two writers: the second gets
+        // `SQLITE_BUSY` immediately unless told to wait. That used to be unreachable — one
+        // daemon owned the file — and stopped being so when the maintenance subcommands
+        // arrived, since `mugglebot cloud-warm` writes a couple of thousand rows alongside a
+        // running daemon. Waiting is the correct answer for every one of those collisions:
+        // they are short transactions, and the alternative is a spurious failure mid-sweep.
+        conn.busy_timeout(std::time::Duration::from_secs(10))?;
         check_compatible(&conn, path)?;
         conn.execute_batch(SCHEMA)?;
         add_columns(&conn)?;
@@ -1495,7 +1644,15 @@ impl Store {
         tx.execute("DELETE FROM subject_explanations", [])?;
         // Keyed by signal id, and every signal has just gone: these are orphans.
         tx.execute("DELETE FROM browser_investigations", [])?;
+        // The mentions go; `cloud_entities` stays. That table is keyed by a platform id
+        // rather than by a signal, and re-reading an account from `rcc` to learn what it
+        // already knows is a subprocess per id for no new information.
+        tx.execute("DELETE FROM signal_cloud_ids", [])?;
         tx.execute("DELETE FROM thread_analyses", [])?;
+        tx.execute("DELETE FROM tidied_notifications", [])?;
+        tx.execute("DELETE FROM source_snoozes", [])?;
+        tx.execute("DELETE FROM branch_review_passes", [])?;
+        tx.execute("DELETE FROM branch_diffs", [])?;
         tx.execute("DELETE FROM subjects", [])?;
         tx.commit()?;
         Ok((cleared, threads.into_iter().collect()))
@@ -1702,6 +1859,82 @@ impl Store {
         Ok(())
     }
 
+    /// Operator triage for many subjects at once, in one transaction.
+    ///
+    /// Not a loop over [`Self::set_handled`], for two reasons that both showed up as soon as
+    /// the board grew a bulk action. Forty-one separate writes is forty-one lock acquisitions
+    /// against a file a live daemon is also writing; and each one is separately visible, so a
+    /// board broadcast landing mid-loop renders a half-triaged board. One transaction makes
+    /// the whole triage a single fact.
+    ///
+    /// Returns how many rows actually changed — which can be fewer than `keys`, since a key
+    /// the caller was looking at may have been merged away or deleted in between.
+    pub fn set_handled_bulk(
+        &self,
+        keys: &[String],
+        handled: Handled,
+        snoozed_until: Option<DateTime<Utc>>,
+    ) -> Result<usize> {
+        if keys.is_empty() {
+            return Ok(0);
+        }
+        let now = Utc::now().to_rfc3339();
+        let until = snoozed_until.map(|d| d.to_rfc3339());
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        let mut changed = 0usize;
+        {
+            let mut stmt = tx.prepare(
+                "UPDATE subjects SET handled = ?2, snoozed_until = ?3, updated_at = ?4 \
+                 WHERE key = ?1",
+            )?;
+            for key in keys {
+                changed += stmt.execute(params![key, handled.as_str(), until, now])?;
+            }
+        }
+        tx.commit()?;
+        Ok(changed)
+    }
+
+    /// Return subjects whose snooze has run out to the board.
+    ///
+    /// The half of "snooze until" that was missing. `snoozed_until` has always been *written*
+    /// — by the per-subject snooze, and by a source snooze taking its subjects off the board —
+    /// and never read: `Projection::views` drops anything whose `handled` is `Snoozed` and
+    /// looks no further. So every snooze with an expiry was in practice indefinite, and the
+    /// only ways back were un-snoozing by hand or a new signal the operator was personally in.
+    /// A duration the operator picks has to mean something, and this is what makes it mean it.
+    ///
+    /// A *sweep* rather than a check on read, because `handled` is what the notifier, the
+    /// correlation engine and the root-cause guard all consult. Waking only when somebody
+    /// looks at the board would leave those three silently suppressing work whose snooze had
+    /// expired hours earlier. Writing the state back keeps every consumer honest without
+    /// teaching any of them about expiry.
+    ///
+    /// Idempotent and restart-safe, so a tick that is late or lost costs latency and nothing
+    /// else — the row still says when it was due. Subjects snoozed with **no** expiry are
+    /// untouched: "off the board until it moves" is a different thing to have asked for.
+    pub fn wake_lapsed_snoozes(&self) -> Result<Vec<String>> {
+        let now = Utc::now().to_rfc3339();
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT key FROM subjects \
+             WHERE handled = 'snoozed' AND snoozed_until IS NOT NULL AND snoozed_until <= ?1",
+        )?;
+        let due: Vec<String> = collect(stmt.query_map([&now], |r| r.get::<_, String>(0))?)?;
+        if due.is_empty() {
+            return Ok(due);
+        }
+        // Back to `open`, not `seen`: the subject was taken off the board without being read,
+        // and returning it as already-seen would hide it in the same breath as un-hiding it.
+        conn.execute(
+            "UPDATE subjects SET handled = 'open', snoozed_until = NULL, updated_at = ?1 \
+             WHERE handled = 'snoozed' AND snoozed_until IS NOT NULL AND snoozed_until <= ?1",
+            [&now],
+        )?;
+        Ok(due)
+    }
+
     /// Operator triage for a subject.
     pub fn set_handled(
         &self,
@@ -1870,6 +2103,709 @@ impl Store {
             row_to_browser_investigation,
         )
         .context("browser investigation not found")
+    }
+
+    // ---- Restate Cloud entities (see `src/cloud.rs`) ----
+
+    /// Record which platform ids a signal's text mentioned. Idempotent: a watcher re-emits
+    /// the same signal on every poll, and the mentions in it do not change.
+    pub fn link_signal_cloud_ids(&self, signal_id: &str, ids: &[String]) -> Result<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        for id in ids {
+            tx.execute(
+                "INSERT INTO signal_cloud_ids (signal_id, entity_id) VALUES (?1, ?2) \
+                 ON CONFLICT DO NOTHING",
+                params![signal_id, id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn put_cloud_entity(&self, e: &crate::cloud::Entity) -> Result<()> {
+        self.lock().execute(
+            "INSERT INTO cloud_entities (id, kind, name, status, fields, related, error, fetched_at, members) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) \
+             ON CONFLICT(id) DO UPDATE SET kind=excluded.kind, name=excluded.name, \
+             status=excluded.status, fields=excluded.fields, related=excluded.related, \
+             error=excluded.error, fetched_at=excluded.fetched_at, members=excluded.members",
+            params![
+                e.id,
+                e.kind,
+                e.name,
+                e.status,
+                serde_json::to_string(&e.fields)?,
+                serde_json::to_string(&e.related)?,
+                e.error,
+                e.fetched_at.to_rfc3339(),
+                serde_json::to_string(&e.members)?,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_cloud_entity(&self, id: &str) -> Result<Option<crate::cloud::Entity>> {
+        self.lock()
+            .query_row(
+                &format!("{CLOUD_SELECT} WHERE id=?1"),
+                [id],
+                row_to_cloud_entity,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    /// Mentioned ids that have never been read, or whose cached copy has expired.
+    ///
+    /// `ttl` applies to successful reads and `error_ttl` to failed ones — a lookup that
+    /// failed because the operator's token expired should come back minutes after they run
+    /// `rcc login`, not six hours later.
+    pub fn stale_cloud_ids(
+        &self,
+        ttl: chrono::Duration,
+        error_ttl: chrono::Duration,
+        limit: i64,
+    ) -> Result<Vec<String>> {
+        let now = Utc::now();
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT m.entity_id FROM signal_cloud_ids m \
+             LEFT JOIN cloud_entities c ON c.id = m.entity_id \
+             WHERE c.id IS NULL \
+                OR (c.error IS NULL     AND c.fetched_at < ?1) \
+                OR (c.error IS NOT NULL AND c.fetched_at < ?2) \
+             LIMIT ?3",
+        )?;
+        let rows = stmt.query_map(
+            params![
+                (now - ttl).to_rfc3339(),
+                (now - error_ttl).to_rfc3339(),
+                limit
+            ],
+            |r| r.get::<_, String>(0),
+        )?;
+        collect(rows)
+    }
+
+    /// Everything worth putting in a subject's context box: the ids its signals mentioned,
+    /// plus every ancestor those reach through `related`.
+    ///
+    /// The ancestors are walked here rather than stored against the signal so the link table
+    /// keeps meaning "this signal said this id". An account that moves to a new organization
+    /// is then correct on the next read of every subject that ever mentioned it, instead of
+    /// leaving each one holding its own stale copy of the hierarchy.
+    ///
+    /// Mentions come first and ancestors follow, breadth-first, which is the order the panel
+    /// wants: the thing somebody asked about, then what it belongs to.
+    pub fn cloud_entities_for_subject(
+        &self,
+        subject_key: &str,
+    ) -> Result<Vec<crate::cloud::Entity>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT m.entity_id FROM signal_cloud_ids m \
+             JOIN signals s ON s.id = m.signal_id \
+             WHERE s.subject = ?1 ORDER BY m.entity_id",
+        )?;
+        let seeds: Vec<String> =
+            collect(stmt.query_map([subject_key], |r| r.get::<_, String>(0))?)?;
+
+        let mut queue = seeds;
+        let mut seen: std::collections::HashSet<String> = queue.iter().cloned().collect();
+        let mut out = Vec::new();
+        let mut i = 0usize;
+        while i < queue.len() {
+            let id = queue[i].clone();
+            i += 1;
+            let found = conn
+                .query_row(
+                    &format!("{CLOUD_SELECT} WHERE id=?1"),
+                    [&id],
+                    row_to_cloud_entity,
+                )
+                .optional()?;
+            // Not yet resolved — the scheduler has it queued. Skipped rather than rendered
+            // as an empty box: a box with nothing in it is worse than no box.
+            let Some(entity) = found else { continue };
+            for r in &entity.related {
+                if seen.insert(r.clone()) {
+                    queue.push(r.clone());
+                }
+            }
+            out.push(entity);
+        }
+        Ok(out)
+    }
+
+    /// Free-text search over the cached entities, optionally narrowed to one kind.
+    ///
+    /// Matches id, name, status **and the curated field values** — which is the point: the
+    /// question an operator actually arrives with is rarely "what is `env_201k…`". It is
+    /// "which environments are on the `replit.3-node.xlarge-vqueues` profile", or "what is
+    /// in `us-east1`", and those live in the fields.
+    ///
+    /// An exact id match sorts first so pasting an id lands on it rather than on whatever
+    /// else happens to mention it. An empty query browses — see [`Self::browse_cloud_entities`],
+    /// which is a different query for a genuinely different question.
+    pub fn search_cloud_entities(
+        &self,
+        query: &str,
+        kind: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<crate::cloud::Entity>> {
+        let q = query.trim();
+        if q.is_empty() && kind.is_none() {
+            return self.browse_cloud_entities(limit);
+        }
+        let like = format!("%{}%", q.to_lowercase());
+        let conn = self.lock();
+        let mut stmt = conn.prepare(&format!(
+            "{CLOUD_SELECT} WHERE (?1 = '' OR lower(id) LIKE ?2 OR lower(COALESCE(name,'')) LIKE ?2 \
+                OR lower(COALESCE(status,'')) LIKE ?2 OR lower(fields) LIKE ?2) \
+               AND (?3 IS NULL OR kind = ?3) \
+             ORDER BY (lower(id) = ?1) DESC, kind, COALESCE(name, id) \
+             LIMIT ?4"
+        ))?;
+        let rows = stmt.query_map(
+            params![q.to_lowercase(), like, kind, limit],
+            row_to_cloud_entity,
+        )?;
+        collect(rows)
+    }
+
+    /// The unfiltered list: a fair share of every kind, rather than the first page of one.
+    ///
+    /// Browsing and searching are different questions and were sharing an `ORDER BY`. With no
+    /// query the list was `ORDER BY kind, name LIMIT 200` over the whole estate — and `account`
+    /// sorts first alphabetically, so on a warmed store the entire first page was 200 of the
+    /// 1013 accounts. Every user, environment, region, group and organization was reachable
+    /// only by clicking a chip or typing something, and nothing on screen said so: a list that
+    /// is all one kind looks like a store that only holds that kind. The complaint it produced
+    /// was "why are there no users in the directory", about 1326 cached users.
+    ///
+    /// So the browse takes an equal slice of each kind and lets the chips carry the real
+    /// counts. `ROW_NUMBER() OVER (PARTITION BY kind …)` rather than a query per kind: one
+    /// statement, and the share adjusts on its own when the platform grows a kind.
+    fn browse_cloud_entities(&self, limit: i64) -> Result<Vec<crate::cloud::Entity>> {
+        let kinds = self.cloud_entity_kinds()?.len().max(1) as i64;
+        // Rounded up, so the slice never collapses to nothing on a large kind count, and the
+        // outer LIMIT trims whatever the rounding over-delivers.
+        let share = ((limit + kinds - 1) / kinds).max(1);
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id, kind, name, status, fields, related, error, fetched_at, members FROM ( \
+                 SELECT *, ROW_NUMBER() OVER ( \
+                     PARTITION BY kind ORDER BY COALESCE(name, id) \
+                 ) AS rn FROM cloud_entities \
+             ) WHERE rn <= ?1 ORDER BY kind, COALESCE(name, id) LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![share, limit], row_to_cloud_entity)?;
+        collect(rows)
+    }
+
+    /// The entities that name `id` as a parent — an account's environments, an organization's
+    /// accounts, a region's environments.
+    ///
+    /// The reverse of `related`, and the half that makes the graph explorable: `related` gets
+    /// you upward from a mention, and this gets you back down. Scanned rather than indexed
+    /// because the whole table is a couple of thousand rows; the quoting makes it an exact
+    /// token match inside the JSON array rather than a prefix collision.
+    pub fn cloud_entity_children(
+        &self,
+        id: &str,
+        limit: i64,
+    ) -> Result<(Vec<crate::cloud::Entity>, i64)> {
+        let needle = format!("%\"{id}\"%");
+        let conn = self.lock();
+        let total: i64 = conn.query_row(
+            "SELECT count(*) FROM cloud_entities WHERE related LIKE ?1",
+            [&needle],
+            |r| r.get(0),
+        )?;
+        let mut stmt = conn.prepare(&format!(
+            "{CLOUD_SELECT} WHERE related LIKE ?1 ORDER BY kind, COALESCE(name, id) LIMIT ?2"
+        ))?;
+        let rows = stmt.query_map(params![needle, limit], row_to_cloud_entity)?;
+        Ok((collect(rows)?, total))
+    }
+
+    /// The entities `id` names in its `members` that do **not** already name it back.
+    ///
+    /// The other half of "what belongs to this", and the half the reverse edge cannot find. A
+    /// user who owns an account names it, so [`Self::cloud_entity_children`] already returns
+    /// them; a user who is merely a member of an organization names *nothing* — their document
+    /// lists `accountMemberships`, and an org member has none. On the real estate that is 884
+    /// of 1326 people: searchable by email, and completely unreachable by walking, which is
+    /// most of what the Cloud page is for.
+    ///
+    /// The `related` exclusion is what keeps an account's owners from appearing twice, and it
+    /// is done in SQL rather than against the capped child list so it stays exact however many
+    /// children there are.
+    pub fn cloud_entity_members(
+        &self,
+        id: &str,
+        member_ids: &[String],
+        limit: i64,
+    ) -> Result<(Vec<crate::cloud::Entity>, i64)> {
+        if member_ids.is_empty() {
+            return Ok((Vec::new(), 0));
+        }
+        let needle = format!("%\"{id}\"%");
+        // A bound parameter per id: these come from a cached document rather than from a
+        // caller, but building an IN list by interpolation is a habit worth not having.
+        let holes = std::iter::repeat_n("?", member_ids.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let mut args: Vec<Box<dyn rusqlite::ToSql>> = member_ids
+            .iter()
+            .map(|m| Box::new(m.clone()) as Box<dyn rusqlite::ToSql>)
+            .collect();
+        args.push(Box::new(needle));
+        let conn = self.lock();
+
+        let total: i64 = conn.query_row(
+            &format!(
+                "SELECT count(*) FROM cloud_entities WHERE id IN ({holes}) AND related NOT LIKE ?"
+            ),
+            rusqlite::params_from_iter(args.iter().map(|a| a.as_ref())),
+            |r| r.get(0),
+        )?;
+
+        args.push(Box::new(limit));
+        let mut stmt = conn.prepare(&format!(
+            "{CLOUD_SELECT} WHERE id IN ({holes}) AND related NOT LIKE ? \
+             ORDER BY kind, COALESCE(name, id) LIMIT ?"
+        ))?;
+        let rows = stmt.query_map(
+            rusqlite::params_from_iter(args.iter().map(|a| a.as_ref())),
+            row_to_cloud_entity,
+        )?;
+        Ok((collect(rows)?, total))
+    }
+
+    /// Every stored signal's id and text, for re-scanning mentions.
+    ///
+    /// Exists because the scanner can be *wrong*, and was: it matched only `env_201k…` while
+    /// every alert label carries `env-201k…`, so 713 real mentions were never recorded. A
+    /// watcher re-emitting a signal would fix its own row, but nothing re-emits an alert from
+    /// last month — and those are exactly the ones worth having a context box on.
+    ///
+    /// Streamed as `(id, text)` rather than as `Signal`s: the scan needs the title and body
+    /// and nothing else, and this runs over the whole table.
+    pub fn signals_for_rescan(&self) -> Result<Vec<(String, String)>> {
+        let conn = self.lock();
+        let mut stmt =
+            conn.prepare("SELECT id, title || char(10) || COALESCE(body, '') FROM signals")?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        collect(rows)
+    }
+
+    /// Find an entity ignoring case, returning its **canonical** id.
+    ///
+    /// Recovers the casing the hyphenated form throws away. Kubernetes names an environment
+    /// `env-201k…`, and that is what alert labels carry; environment ids are lowercase so the
+    /// round trip is exact, but account and organization ids are mixed-case base62, and
+    /// `acc-10vk05bjnjt1nlxvid4zh14` is not a thing `rcc` will ever find. The warmed estate
+    /// knows every real id, so it can put the casing back.
+    ///
+    /// Returns `None` when nothing matches, which is the honest answer: without a warmed
+    /// estate there is nothing to recover it from.
+    pub fn find_cloud_entity_ci(&self, id: &str) -> Result<Option<String>> {
+        self.lock()
+            .query_row(
+                "SELECT id FROM cloud_entities WHERE lower(id) = lower(?1) LIMIT 1",
+                [id],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    /// Kinds present in the cache with their counts — the filter chips, and an honest
+    /// statement of what a search is searching.
+    pub fn cloud_entity_kinds(&self) -> Result<Vec<(String, i64)>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT kind, count(*) FROM cloud_entities GROUP BY kind ORDER BY count(*) DESC",
+        )?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
+        collect(rows)
+    }
+
+    /// Cache the diff a branch's reviewers will read.
+    pub fn set_branch_diff(
+        &self,
+        branch_key: &str,
+        head_sha: &str,
+        report: &crate::prdiff::DiffReport,
+    ) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "INSERT INTO branch_diffs (branch_key, head_sha, report, fetched_at) \
+             VALUES (?1, ?2, ?3, ?4) \
+             ON CONFLICT(branch_key, head_sha) DO UPDATE SET report=excluded.report, \
+             fetched_at=excluded.fetched_at",
+            params![
+                branch_key,
+                head_sha,
+                serde_json::to_string(report)?,
+                Utc::now().to_rfc3339()
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// The cached diff for one commit of one branch.
+    pub fn get_branch_diff(
+        &self,
+        branch_key: &str,
+        head_sha: &str,
+    ) -> Result<Option<crate::prdiff::DiffReport>> {
+        let conn = self.lock();
+        let raw: Option<String> = match conn.query_row(
+            "SELECT report FROM branch_diffs WHERE branch_key=?1 AND head_sha=?2",
+            params![branch_key, head_sha],
+            |r| r.get(0),
+        ) {
+            Ok(v) => Some(v),
+            Err(rusqlite::Error::QueryReturnedNoRows) => None,
+            Err(e) => return Err(e.into()),
+        };
+        Ok(raw.and_then(|r| serde_json::from_str(&r).ok()))
+    }
+
+    /// Queue one reviewer's pass, or hand back the one that already exists.
+    ///
+    /// The unique key is `(branch, sha, reviewer, provider, model)`: asking the same reviewer
+    /// on the same model about the same commit is the same question, and it should cost
+    /// nothing the second time. Re-asking is what `re_open` is for.
+    pub fn queue_branch_pass(&self, p: &crate::ghreview::Pass) -> Result<crate::ghreview::Pass> {
+        {
+            let conn = self.lock();
+            conn.execute(
+                "INSERT INTO branch_review_passes \
+                 (id, branch_key, repo, head, base, head_sha, reviewer, provider, model, \
+                  status, created_at, updated_at) \
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,'pending',?10,?10) \
+                 ON CONFLICT(branch_key, head_sha, reviewer, provider, model) DO NOTHING",
+                params![
+                    p.id,
+                    p.branch_key,
+                    p.repo,
+                    p.head,
+                    p.base,
+                    p.head_sha,
+                    p.by.as_key(),
+                    p.provider,
+                    p.model,
+                    Utc::now().to_rfc3339()
+                ],
+            )?;
+        }
+        self.branch_pass_for(
+            &p.branch_key,
+            &p.head_sha,
+            &p.by.as_key(),
+            &p.provider,
+            &p.model,
+        )?
+        .context("branch review pass was not persisted")
+    }
+
+    fn branch_pass_for(
+        &self,
+        branch_key: &str,
+        head_sha: &str,
+        reviewer: &str,
+        provider: &str,
+        model: &str,
+    ) -> Result<Option<crate::ghreview::Pass>> {
+        let conn = self.lock();
+        match conn.query_row(
+            &format!(
+                "{BRANCH_PASS_SELECT} WHERE branch_key=?1 AND head_sha=?2 AND reviewer=?3 \
+                 AND provider=?4 AND model=?5"
+            ),
+            params![branch_key, head_sha, reviewer, provider, model],
+            row_to_branch_pass,
+        ) {
+            Ok(v) => Ok(Some(v)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    pub fn get_branch_pass(&self, id: &str) -> Result<Option<crate::ghreview::Pass>> {
+        let conn = self.lock();
+        match conn.query_row(
+            &format!("{BRANCH_PASS_SELECT} WHERE id=?1"),
+            [id],
+            row_to_branch_pass,
+        ) {
+            Ok(v) => Ok(Some(v)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Every pass on one branch, newest first. Dismissed ones included — the view shows them
+    /// struck through rather than pretending they were never asked for.
+    pub fn branch_passes(&self, branch_key: &str) -> Result<Vec<crate::ghreview::Pass>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(&format!(
+            "{BRANCH_PASS_SELECT} WHERE branch_key=?1 ORDER BY created_at DESC"
+        ))?;
+        let rows = stmt.query_map([branch_key], row_to_branch_pass)?;
+        collect(rows)
+    }
+
+    /// Branches that have been reviewed, newest activity first.
+    pub fn branch_review_keys(&self, limit: i64) -> Result<Vec<(String, String, String, String)>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT branch_key, repo, head, MAX(updated_at) FROM branch_review_passes \
+             GROUP BY branch_key ORDER BY MAX(updated_at) DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map([limit.max(1)], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+        })?;
+        collect(rows)
+    }
+
+    pub fn list_branch_passes_pending(&self) -> Result<Vec<String>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id FROM branch_review_passes WHERE status IN ('pending','running') \
+             ORDER BY created_at ASC",
+        )?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        collect(rows)
+    }
+
+    pub fn set_branch_pass_status(&self, id: &str, status: &str) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE branch_review_passes SET status=?2, updated_at=?3 WHERE id=?1",
+            params![id, status, Utc::now().to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    /// Record a finished pass.
+    pub fn finish_branch_pass(
+        &self,
+        id: &str,
+        recommendation: Option<&str>,
+        summary: Option<&str>,
+        comments: &[crate::ghreview::Placed],
+    ) -> Result<crate::ghreview::Pass> {
+        {
+            let conn = self.lock();
+            conn.execute(
+                "UPDATE branch_review_passes SET status='done', recommendation=?2, summary=?3, \
+                 comments=?4, error=NULL, updated_at=?5 WHERE id=?1",
+                params![
+                    id,
+                    recommendation,
+                    summary,
+                    serde_json::to_string(comments)?,
+                    Utc::now().to_rfc3339()
+                ],
+            )?;
+        }
+        self.get_branch_pass(id)?.context("pass not found")
+    }
+
+    pub fn fail_branch_pass(&self, id: &str, error: &str) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE branch_review_passes SET status='failed', error=?2, updated_at=?3 \
+             WHERE id=?1",
+            params![id, error, Utc::now().to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    /// Dismiss or restore a pass. A flag, never a delete — see [`crate::ghreview`].
+    pub fn set_branch_pass_dismissed(&self, id: &str, dismissed: bool) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE branch_review_passes SET dismissed=?2, updated_at=?3 WHERE id=?1",
+            params![id, dismissed as i64, Utc::now().to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    /// Put a pass back to `pending` so it runs again — the deliberate re-ask.
+    pub fn reopen_branch_pass(&self, id: &str) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE branch_review_passes SET status='pending', dismissed=0, error=NULL, \
+             comments=NULL, recommendation=NULL, summary=NULL, updated_at=?2 WHERE id=?1",
+            params![id, Utc::now().to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    /// Write (or replace) a source snooze. One row per source: re-snoozing is the later
+    /// snooze winning, not two snoozes stacking.
+    pub fn set_source_snooze(&self, s: &crate::quiet::Snooze) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "INSERT INTO source_snoozes (source, until, floor, set_at) VALUES (?1, ?2, ?3, ?4) \
+             ON CONFLICT(source) DO UPDATE SET until=excluded.until, floor=excluded.floor, \
+             set_at=excluded.set_at",
+            params![
+                s.source.as_str(),
+                s.until.to_rfc3339(),
+                floor_str(s.floor),
+                s.set_at.to_rfc3339()
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Every stored snooze, expired ones included — [`crate::quiet::Quiet`] filters by time,
+    /// so the store never has an opinion about "now".
+    pub fn list_source_snoozes(&self) -> Result<Vec<crate::quiet::Snooze>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare("SELECT source, until, floor, set_at FROM source_snoozes")?;
+        let rows = stmt.query_map([], |r| {
+            let source: String = r.get(0)?;
+            let until: String = r.get(1)?;
+            let floor: String = r.get(2)?;
+            let set_at: String = r.get(3)?;
+            Ok((source, until, floor, set_at))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (source, until, floor, set_at) = row?;
+            // A row naming a source this build does not know is skipped rather than fatal:
+            // it can only come from a newer build, and refusing to read the table would take
+            // the whole rail down over one unknown string.
+            let Some(source) = crate::signal::Source::parse(&source) else {
+                continue;
+            };
+            let Ok(until) = DateTime::parse_from_rfc3339(&until) else {
+                continue;
+            };
+            let set_at = DateTime::parse_from_rfc3339(&set_at)
+                .map(|d| d.with_timezone(&Utc))
+                .unwrap_or_else(|_| Utc::now());
+            out.push(crate::quiet::Snooze {
+                source,
+                until: until.with_timezone(&Utc),
+                floor: parse_floor(&floor),
+                set_at,
+            });
+        }
+        Ok(out)
+    }
+
+    /// End a snooze. `false` when there was nothing to end.
+    pub fn clear_source_snooze(&self, source: crate::signal::Source) -> Result<bool> {
+        let conn = self.lock();
+        let n = conn.execute(
+            "DELETE FROM source_snoozes WHERE source=?1",
+            params![source.as_str()],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Snooze every open subject whose signals come **only** from this source.
+    ///
+    /// `only` is the whole point of the query. A pull request with Slack chatter on it is not
+    /// a Slack notification, and snoozing Slack must not take it off the board — so the
+    /// `NOT EXISTS` clause excludes any subject carrying a signal from anywhere else.
+    ///
+    /// Subjects whose highest severity reaches the floor are left alone: if a thread contains
+    /// something critical, the source snooze is not what should hide it.
+    pub fn snooze_subjects_only_from(
+        &self,
+        source: crate::signal::Source,
+        until: DateTime<Utc>,
+        floor: Option<crate::signal::Severity>,
+    ) -> Result<usize> {
+        let conn = self.lock();
+        let n = conn.execute(
+            "UPDATE subjects SET handled='snoozed', snoozed_until=?2, updated_at=?3 \
+             WHERE handled IN ('open','seen') \
+               AND EXISTS (SELECT 1 FROM signals g WHERE g.subject = subjects.key \
+                           AND g.source = ?1) \
+               AND NOT EXISTS (SELECT 1 FROM signals g WHERE g.subject = subjects.key \
+                               AND g.source <> ?1) \
+               AND NOT EXISTS (SELECT 1 FROM signals g WHERE g.subject = subjects.key \
+                               AND g.severity IN (SELECT value FROM json_each(?4)))",
+            params![
+                source.as_str(),
+                until.to_rfc3339(),
+                Utc::now().to_rfc3339(),
+                serde_json::to_string(&floor.map(at_or_above).unwrap_or_default())?
+            ],
+        )?;
+        Ok(n)
+    }
+
+    /// Record a tidy decision. Idempotent on the thread id: GitHub re-lists an unread
+    /// thread on every poll, and a failed clear will be reconsidered next time.
+    pub fn record_tidy(&self, row: &TidiedNotification) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "INSERT INTO tidied_notifications \
+             (thread_id, reason, rule, repo, title, url, cleared, at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
+             ON CONFLICT(thread_id) DO UPDATE SET \
+               cleared = tidied_notifications.cleared OR excluded.cleared, \
+               at = excluded.at",
+            params![
+                row.thread_id,
+                row.reason,
+                row.rule,
+                row.repo,
+                row.title,
+                row.url,
+                row.cleared as i64,
+                Utc::now().to_rfc3339()
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Walk back a `cleared` claim after the API call failed. The audit trail must not say
+    /// something left the inbox when it is still sitting there.
+    pub fn unrecord_tidy_cleared(&self, thread_id: &str) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE tidied_notifications SET cleared=0 WHERE thread_id=?1",
+            params![thread_id],
+        )?;
+        Ok(())
+    }
+
+    /// What the tidier has taken, or would take — newest first.
+    pub fn list_tidied(&self, limit: i64) -> Result<Vec<TidiedNotification>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT thread_id, reason, rule, repo, title, url, cleared, at \
+             FROM tidied_notifications ORDER BY at DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map([limit.max(1)], |r| {
+            Ok(TidiedNotification {
+                thread_id: r.get(0)?,
+                reason: r.get(1)?,
+                rule: r.get(2)?,
+                repo: r.get(3)?,
+                title: r.get(4)?,
+                url: r.get(5)?,
+                cleared: r.get::<_, i64>(6)? != 0,
+                at: r.get(7)?,
+            })
+        })?;
+        collect(rows)
     }
 
     /// Queue (or re-queue) an analysis of one Slack thread.
@@ -4680,6 +5616,102 @@ fn row_to_browser_investigation(row: &Row) -> rusqlite::Result<BrowserInvestigat
     })
 }
 
+fn row_to_cloud_entity(row: &Row) -> rusqlite::Result<crate::cloud::Entity> {
+    let fields: String = row.get(4)?;
+    let related: String = row.get(5)?;
+    let members: String = row.get(8)?;
+    Ok(crate::cloud::Entity {
+        id: row.get(0)?,
+        kind: row.get(1)?,
+        name: row.get(2)?,
+        status: row.get(3)?,
+        // A row this process wrote with `serde_json::to_string`. A parse failure means the
+        // column was corrupted rather than that the entity has no fields, but an empty box
+        // is a better outcome for the panel than a poisoned query.
+        fields: serde_json::from_str(&fields).unwrap_or_default(),
+        related: serde_json::from_str(&related).unwrap_or_default(),
+        members: serde_json::from_str(&members).unwrap_or_default(),
+        error: row.get(6)?,
+        fetched_at: parse_ts(row, 7)?,
+    })
+}
+
+/// A snooze floor as `source_snoozes.floor` spells it. `None` — silence everything — is
+/// stored as the word `everything` rather than SQL NULL, so a row is never ambiguous about
+/// whether a floor was set or simply lost.
+fn floor_str(f: Option<crate::signal::Severity>) -> &'static str {
+    match f {
+        Some(s) => severity_str(s),
+        None => "everything",
+    }
+}
+
+/// Read a stored floor back. Anything unrecognised is read as `critical`, the safe direction:
+/// a corrupted floor should let outages through, not swallow them.
+fn parse_floor(raw: &str) -> Option<crate::signal::Severity> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "everything" | "all" | "none" => None,
+        other => Some(crate::config::severity_from_str(other)),
+    }
+}
+
+/// A severity as this module's own tables spell it — plain, matching
+/// [`crate::config::severity_from_str`].
+fn severity_str(s: crate::signal::Severity) -> &'static str {
+    use crate::signal::Severity as S;
+    match s {
+        S::Info => "info",
+        S::Notice => "notice",
+        S::Warning => "warning",
+        S::Critical => "critical",
+    }
+}
+
+/// Severities at or above `floor`, in the **JSON-quoted** form the `signals.severity` column
+/// actually holds.
+///
+/// That column is written with `json(&severity)`, so it stores `"warning"` *including the
+/// quotes* — nine characters, not seven. Comparing against a bare `warning` matches nothing
+/// and would silently make the "leave critical threads alone" guard a no-op, which is the
+/// one thing in this feature that must not fail quietly. Serialising through serde is what
+/// keeps the two forms identical by construction.
+fn at_or_above(floor: crate::signal::Severity) -> Vec<String> {
+    use crate::signal::Severity as S;
+    [S::Info, S::Notice, S::Warning, S::Critical]
+        .into_iter()
+        .filter(|s| *s >= floor)
+        .filter_map(|s| serde_json::to_string(&s).ok())
+        .collect()
+}
+
+fn row_to_branch_pass(row: &Row) -> rusqlite::Result<crate::ghreview::Pass> {
+    let comments: Option<String> = row.get(12)?;
+    Ok(crate::ghreview::Pass {
+        id: row.get(0)?,
+        branch_key: row.get(1)?,
+        repo: row.get(2)?,
+        head: row.get(3)?,
+        base: row.get(4)?,
+        head_sha: row.get(5)?,
+        by: crate::ghreview::Reviewer::parse(&row.get::<_, String>(6)?),
+        provider: row.get(7)?,
+        model: row.get(8)?,
+        status: crate::ghreview::PassStatus::parse(&row.get::<_, String>(9)?),
+        recommendation: row.get(10)?,
+        summary: row.get(11)?,
+        // A comments blob that will not parse degrades to no comments rather than failing the
+        // row: the pass's own verdict is still worth showing, and one bad blob must not empty
+        // the view for the other reviewers.
+        comments: comments
+            .and_then(|c| serde_json::from_str(&c).ok())
+            .unwrap_or_default(),
+        dismissed: row.get::<_, i64>(13)? != 0,
+        error: row.get(14)?,
+        created_at: row.get(15)?,
+        updated_at: row.get(16)?,
+    })
+}
+
 fn row_to_thread_analysis(row: &Row) -> rusqlite::Result<ThreadAnalysis> {
     Ok(ThreadAnalysis {
         id: row.get(0)?,
@@ -4907,6 +5939,10 @@ fn add_columns(conn: &Connection) -> Result<()> {
         // and "which tier is on it" is a state transition on that row, not a second row.
         ("browser_investigations", "method", "TEXT"),
         ("browser_investigations", "evidence", "TEXT"),
+        // Downward edges, added when users joined the estate. A default rather than a
+        // nullable column: every read treats it as a list, and an existing cache has no
+        // members recorded for anything — which is the correct answer until the next warm.
+        ("cloud_entities", "members", "TEXT NOT NULL DEFAULT '[]'"),
     ];
     for (table, column, def) in ADDED {
         if has_column(conn, table, column)? {
@@ -5264,6 +6300,482 @@ mod tests {
         }
     }
 
+    fn cloud_entity(id: &str, related: &[&str], age: chrono::Duration) -> crate::cloud::Entity {
+        crate::cloud::Entity {
+            id: id.into(),
+            kind: crate::cloud::kind_of(id).unwrap_or("unknown").into(),
+            name: Some(id.into()),
+            status: None,
+            fields: vec![],
+            related: related.iter().map(|s| s.to_string()).collect(),
+            members: vec![],
+            error: None,
+            fetched_at: Utc::now() - age,
+        }
+    }
+
+    /// The half of "what belongs to this" that the reverse edge cannot see.
+    ///
+    /// An organization's members name nothing — their document lists the accounts they own, and
+    /// an org member owns none — so `cloud_entity_children` returns them not at all. On the real
+    /// estate that was 884 of 1326 people: cached, searchable by email, and unreachable by
+    /// walking. An account's owner *does* name it back, and must not then appear twice.
+    #[test]
+    fn an_organizations_members_are_found_even_though_they_name_nothing() {
+        let store = Store::open_in_memory().unwrap();
+        let zero = chrono::Duration::zero();
+        let org = "org_10vj37k7NcqTaIavuJRsOcv";
+        let owner = "usr_10uXl8CPozSuQiKolKUfqVI";
+        let member = "usr_10vifGx1fTzG4tqpt2pt0Rp";
+        let account = "acc_10vk05bJNjt1nLXvId4zh14";
+
+        let mut org_entity = cloud_entity(org, &[], zero);
+        org_entity.members = vec![owner.into(), member.into()];
+        store.put_cloud_entity(&org_entity).unwrap();
+        // The owner reaches the organization the ordinary way, through an account.
+        store
+            .put_cloud_entity(&cloud_entity(owner, &[org], zero))
+            .unwrap();
+        // The member names nothing at all — the case the reverse lookup cannot serve.
+        store
+            .put_cloud_entity(&cloud_entity(member, &[], zero))
+            .unwrap();
+        store
+            .put_cloud_entity(&cloud_entity(account, &[org], zero))
+            .unwrap();
+
+        let (children, child_total) = store.cloud_entity_children(org, 200).unwrap();
+        assert_eq!(child_total, 2, "only the two that name the organization");
+
+        let (extra, extra_total) = store
+            .cloud_entity_members(org, &org_entity.members, 200)
+            .unwrap();
+        assert_eq!(extra_total, 1);
+        assert_eq!(extra[0].id, member, "the one nothing else would have found");
+        // The owner is in `members` *and* in the reverse lookup, and appears once.
+        assert!(!extra.iter().any(|e| e.id == owner));
+        assert_eq!(children.len() + extra.len(), 3);
+
+        // Nothing named, nothing found — and no query built from an empty IN list.
+        assert_eq!(store.cloud_entity_members(org, &[], 200).unwrap().1, 0);
+    }
+
+    /// The panel wants the hierarchy, and only the *mention* is recorded against the signal.
+    /// Walking `related` on read is what turns one pasted environment into the account,
+    /// organization and Nuon install behind it.
+    #[test]
+    fn a_subjects_cloud_context_is_the_mention_plus_everything_it_reaches() {
+        let store = Store::open_in_memory().unwrap();
+        let mut sig = sample("s1");
+        sig.subject = Some("o/r#1".into());
+        store.insert_signal(&sig).unwrap();
+        store
+            .link_signal_cloud_ids(&sig.id, &["env_201kpvffchrm1sq5p0qph42dqev".into()])
+            .unwrap();
+
+        let zero = chrono::Duration::zero();
+        for e in [
+            cloud_entity(
+                "env_201kpvffchrm1sq5p0qph42dqev",
+                &["acc_10vk05bJNjt1nLXvId4zh14", "rgn_26p9031nve"],
+                zero,
+            ),
+            cloud_entity(
+                "acc_10vk05bJNjt1nLXvId4zh14",
+                &["org_10vj37k7NcqTaIavuJRsOcv"],
+                zero,
+            ),
+            cloud_entity("rgn_26p9031nve", &["inltao53ge1b4pab3zo23si077"], zero),
+            cloud_entity("org_10vj37k7NcqTaIavuJRsOcv", &[], zero),
+            cloud_entity("inltao53ge1b4pab3zo23si077", &[], zero),
+        ] {
+            store.put_cloud_entity(&e).unwrap();
+        }
+
+        let got: Vec<String> = store
+            .cloud_entities_for_subject("o/r#1")
+            .unwrap()
+            .into_iter()
+            .map(|e| e.id)
+            .collect();
+        // Breadth-first from the mention: the environment, then what it names, then what
+        // those name. That order is what the panel renders.
+        assert_eq!(
+            got,
+            vec![
+                "env_201kpvffchrm1sq5p0qph42dqev",
+                "acc_10vk05bJNjt1nLXvId4zh14",
+                "rgn_26p9031nve",
+                "org_10vj37k7NcqTaIavuJRsOcv",
+                "inltao53ge1b4pab3zo23si077",
+            ]
+        );
+    }
+
+    /// An id the sweep has not reached yet is absent, not an empty box — and its absence
+    /// must not stop the ids that *have* resolved from rendering.
+    #[test]
+    fn an_unresolved_mention_is_skipped_rather_than_rendered_blank() {
+        let store = Store::open_in_memory().unwrap();
+        let mut sig = sample("s1");
+        sig.subject = Some("o/r#1".into());
+        store.insert_signal(&sig).unwrap();
+        store
+            .link_signal_cloud_ids(
+                &sig.id,
+                &[
+                    "env_201kpvffchrm1sq5p0qph42dqev".into(),
+                    "acc_10vk05bJNjt1nLXvId4zh14".into(),
+                ],
+            )
+            .unwrap();
+        store
+            .put_cloud_entity(&cloud_entity(
+                "acc_10vk05bJNjt1nLXvId4zh14",
+                &[],
+                chrono::Duration::zero(),
+            ))
+            .unwrap();
+
+        let got = store.cloud_entities_for_subject("o/r#1").unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].id, "acc_10vk05bJNjt1nLXvId4zh14");
+    }
+
+    /// The sweep's work list: never-read ids, plus expired ones. A failed read expires on a
+    /// much shorter clock, so `rcc login` takes effect on the next tick rather than tomorrow.
+    #[test]
+    fn the_sweep_picks_up_unread_and_expired_ids_on_separate_clocks() {
+        let store = Store::open_in_memory().unwrap();
+        let sig = sample("s1");
+        store.insert_signal(&sig).unwrap();
+        let ids: Vec<String> = [
+            "env_201kpvffchrm1sq5p0qph42dqev",
+            "acc_10vk05bJNjt1nLXvId4zh14",
+            "rgn_26p9031nve",
+            "org_10vj37k7NcqTaIavuJRsOcv",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        store.link_signal_cloud_ids(&sig.id, &ids).unwrap();
+
+        // Fresh success; stale success; fresh-ish failure that is nonetheless past its own
+        // shorter clock; and `env_…`, never read at all.
+        store
+            .put_cloud_entity(&cloud_entity(
+                "acc_10vk05bJNjt1nLXvId4zh14",
+                &[],
+                chrono::Duration::minutes(5),
+            ))
+            .unwrap();
+        store
+            .put_cloud_entity(&cloud_entity(
+                "rgn_26p9031nve",
+                &[],
+                chrono::Duration::hours(9),
+            ))
+            .unwrap();
+        let mut failed = cloud_entity(
+            "org_10vj37k7NcqTaIavuJRsOcv",
+            &[],
+            chrono::Duration::minutes(30),
+        );
+        failed.error = Some("token expired".into());
+        store.put_cloud_entity(&failed).unwrap();
+
+        let mut stale = store
+            .stale_cloud_ids(
+                chrono::Duration::hours(6),
+                chrono::Duration::minutes(10),
+                50,
+            )
+            .unwrap();
+        stale.sort();
+        assert_eq!(
+            stale,
+            vec![
+                "env_201kpvffchrm1sq5p0qph42dqev",
+                "org_10vj37k7NcqTaIavuJRsOcv",
+                "rgn_26p9031nve",
+            ],
+            "the five-minute-old success is the only one left alone"
+        );
+    }
+
+    /// The question an operator actually arrives with is rarely "what is `env_201k…`" — it is
+    /// "which environments are on this profile" or "what is in us-east1". Both live in the
+    /// curated fields, so the search has to reach them.
+    #[test]
+    fn searching_the_estate_reaches_field_values_not_just_ids() {
+        let store = Store::open_in_memory().unwrap();
+        let mut env = cloud_entity(
+            "env_201kpvffchrm1sq5p0qph42dqev",
+            &[],
+            chrono::Duration::zero(),
+        );
+        env.name = Some("janeway".into());
+        env.status = Some("PROVISIONING_READY".into());
+        env.fields = vec![
+            crate::cloud::Field {
+                label: "profile".into(),
+                value: "replit.3-node.xlarge-vqueues".into(),
+            },
+            crate::cloud::Field {
+                label: "tier".into(),
+                value: "CUSTOM".into(),
+            },
+        ];
+        store.put_cloud_entity(&env).unwrap();
+        let mut other = cloud_entity(
+            "env_201kpvff44fbhw06x8wza0cptfw",
+            &[],
+            chrono::Duration::zero(),
+        );
+        other.name = Some("worf".into());
+        other.fields = vec![crate::cloud::Field {
+            label: "profile".into(),
+            value: "standard.3-node.large".into(),
+        }];
+        store.put_cloud_entity(&other).unwrap();
+
+        let hits = |q: &str| -> Vec<String> {
+            store
+                .search_cloud_entities(q, None, 50)
+                .unwrap()
+                .into_iter()
+                .map(|e| e.id)
+                .collect()
+        };
+        // By name, by field value, and case-insensitively by status.
+        assert_eq!(hits("janeway"), vec!["env_201kpvffchrm1sq5p0qph42dqev"]);
+        assert_eq!(
+            hits("xlarge-vqueues"),
+            vec!["env_201kpvffchrm1sq5p0qph42dqev"]
+        );
+        assert_eq!(
+            hits("provisioning_ready"),
+            vec!["env_201kpvffchrm1sq5p0qph42dqev"]
+        );
+        // An empty query browses rather than matching nothing.
+        assert_eq!(hits("").len(), 2);
+        // A kind with no rows narrows to nothing rather than ignoring the filter.
+        assert!(store
+            .search_cloud_entities("", Some("organization"), 50)
+            .unwrap()
+            .is_empty());
+    }
+
+    /// The unfiltered list must show the estate, not the alphabetically-first kind of it.
+    ///
+    /// Found by an operator asking why there were no users in the directory, about 1326 cached
+    /// users. Browsing was `ORDER BY kind, name LIMIT 200` over everything, `account` sorts
+    /// first, and there were 1013 accounts — so the whole first page was accounts and every
+    /// other kind was past the end of it. A list that is all one kind reads as a store that
+    /// holds only that kind, which is the sort of wrong that nothing on screen contradicts.
+    #[test]
+    fn browsing_shows_every_kind_rather_than_the_first_one_alphabetically() {
+        let store = Store::open_in_memory().unwrap();
+        let zero = chrono::Duration::zero();
+        // Accounts outnumber everything, exactly as they do on the real estate.
+        for i in 0..40 {
+            store
+                .put_cloud_entity(&cloud_entity(
+                    &format!("acc_10vk05bJNjt1nLXvId4z{i:03}"),
+                    &[],
+                    zero,
+                ))
+                .unwrap();
+        }
+        for i in 0..5 {
+            store
+                .put_cloud_entity(&cloud_entity(
+                    &format!("usr_10uXl8CPozSuQiKolKUf{i:03}"),
+                    &[],
+                    zero,
+                ))
+                .unwrap();
+            store
+                .put_cloud_entity(&cloud_entity(&format!("rgn_26p90311{i:02}"), &[], zero))
+                .unwrap();
+        }
+
+        fn kinds(rows: &[crate::cloud::Entity]) -> Vec<&str> {
+            let mut k: Vec<&str> = rows.iter().map(|e| e.kind.as_str()).collect();
+            k.sort_unstable();
+            k.dedup();
+            k
+        }
+
+        // A limit far below the account count — the exact case that used to return accounts
+        // and nothing else.
+        let browsed = store.search_cloud_entities("", None, 12).unwrap();
+        assert_eq!(kinds(&browsed), vec!["account", "region", "user"]);
+        assert!(browsed.len() <= 12);
+
+        // Picking a kind is still a hard filter, not a sample of it.
+        let users = store.search_cloud_entities("", Some("user"), 50).unwrap();
+        assert_eq!(users.len(), 5);
+        assert_eq!(kinds(&users), vec!["user"]);
+
+        // And a real query still ranks matches rather than sampling kinds.
+        let one = store
+            .search_cloud_entities("usr_10uXl8CPozSuQiKolKUf003", None, 50)
+            .unwrap();
+        assert_eq!(one.len(), 1);
+    }
+
+    /// Pasting an id must land on that id, not on whatever else happens to mention it.
+    #[test]
+    fn an_exact_id_sorts_above_the_things_that_reference_it() {
+        let store = Store::open_in_memory().unwrap();
+        let acc = "acc_10vk05bJNjt1nLXvId4zh14";
+        // Three environments naming the account, plus the account itself.
+        for ext in [
+            "env_201kpvffchrm1sq5p0qph42dqev",
+            "env_201kpvff44fbhw06x8wza0cptfw",
+        ] {
+            let mut e = cloud_entity(ext, &[acc], chrono::Duration::zero());
+            e.name = Some(acc.into()); // worst case: the name matches too
+            store.put_cloud_entity(&e).unwrap();
+        }
+        store
+            .put_cloud_entity(&cloud_entity(acc, &[], chrono::Duration::zero()))
+            .unwrap();
+
+        let first = store.search_cloud_entities(acc, None, 50).unwrap();
+        assert_eq!(first[0].id, acc, "the account itself is the first hit");
+    }
+
+    /// The reverse edge is what makes the graph walkable: `related` goes up from a mention,
+    /// this comes back down. The total is reported separately because the list is capped.
+    #[test]
+    fn children_are_the_things_that_name_this_one_as_a_parent() {
+        let store = Store::open_in_memory().unwrap();
+        let acc = "acc_10vk05bJNjt1nLXvId4zh14";
+        let rgn = "rgn_26p9031nve";
+        for ext in [
+            "env_201kpvffchrm1sq5p0qph42dqev",
+            "env_201kpvff44fbhw06x8wza0cptfw",
+            "env_201kpe1278xqa4ne187w8fbp640",
+        ] {
+            store
+                .put_cloud_entity(&cloud_entity(ext, &[acc, rgn], chrono::Duration::zero()))
+                .unwrap();
+        }
+        store
+            .put_cloud_entity(&cloud_entity(acc, &[], chrono::Duration::zero()))
+            .unwrap();
+
+        let (children, total) = store.cloud_entity_children(acc, 200).unwrap();
+        assert_eq!(total, 3);
+        assert_eq!(children.len(), 3);
+        assert!(children.iter().all(|c| c.kind == "environment"));
+
+        // The cap is honest: the list shortens, the count does not.
+        let (capped, total) = store.cloud_entity_children(acc, 2).unwrap();
+        assert_eq!((capped.len(), total), (2, 3));
+
+        // An entity nobody points at has none — not "everything".
+        assert_eq!(
+            store
+                .cloud_entity_children("org_10vj37k7NcqTaIavuJRsOcv", 200)
+                .unwrap()
+                .1,
+            0
+        );
+    }
+
+    /// Quoting makes the reverse edge an exact token match. Without it, an id that is a
+    /// prefix of another would drag in the other one's children.
+    #[test]
+    fn a_child_lookup_does_not_match_an_id_that_merely_starts_the_same() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .put_cloud_entity(&cloud_entity(
+                "env_201kpvffchrm1sq5p0qph42dqev",
+                &["acc_10vk05bJNjt1nLXvId4zh14extra"],
+                chrono::Duration::zero(),
+            ))
+            .unwrap();
+        assert_eq!(
+            store
+                .cloud_entity_children("acc_10vk05bJNjt1nLXvId4zh14", 200)
+                .unwrap()
+                .1,
+            0
+        );
+    }
+
+    /// The search and the reverse edge against the operator's real, warmed estate — ~2000
+    /// entities of genuine shape rather than four rows this test wrote itself.
+    ///
+    ///   cargo test store::tests::the_real_estate_is_searchable -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn the_real_estate_is_searchable() {
+        let db = std::env::var("MUGGLEBOT_DB").unwrap_or_else(|_| "data/mugglebot.sqlite".into());
+        let store = Store::open(std::path::Path::new(&db)).expect("open the store");
+        for (kind, n) in store.cloud_entity_kinds().unwrap() {
+            println!("{n:>5} {kind}");
+        }
+        let envs = store
+            .search_cloud_entities("", Some("environment"), 5)
+            .unwrap();
+        assert!(
+            !envs.is_empty(),
+            "warm the estate first: mugglebot cloud-warm"
+        );
+        let sample = &envs[0];
+        println!(
+            "\nsample: {} {:?} {:?}",
+            sample.id, sample.name, sample.status
+        );
+        // Walk up, then back down from whatever it belongs to.
+        for parent in &sample.related {
+            let p = store.get_cloud_entity(parent).unwrap();
+            let (kids, total) = store.cloud_entity_children(parent, 3).unwrap();
+            println!(
+                "  ↑ {parent} {:?} — contains {total}, e.g. {:?}",
+                p.and_then(|p| p.name),
+                kids.iter().map(|k| k.id.clone()).collect::<Vec<_>>()
+            );
+            assert!(total > 0, "{parent} is named by {}", sample.id);
+        }
+    }
+
+    /// A board reset drops signals, so the mentions are orphans and go. The entity cache is
+    /// keyed by a platform id rather than by a signal, and re-reading an account from `rcc`
+    /// to learn what it already knows is a subprocess for no new information.
+    #[test]
+    fn resetting_the_board_clears_mentions_but_keeps_the_entity_cache() {
+        let store = Store::open_in_memory().unwrap();
+        let mut sig = sample("s1");
+        sig.subject = Some("o/r#1".into());
+        store.insert_signal(&sig).unwrap();
+        store
+            .link_signal_cloud_ids(&sig.id, &["acc_10vk05bJNjt1nLXvId4zh14".into()])
+            .unwrap();
+        store
+            .put_cloud_entity(&cloud_entity(
+                "acc_10vk05bJNjt1nLXvId4zh14",
+                &[],
+                chrono::Duration::zero(),
+            ))
+            .unwrap();
+
+        store.clear_board_events().unwrap();
+
+        assert!(store
+            .cloud_entities_for_subject("o/r#1")
+            .unwrap()
+            .is_empty());
+        assert!(store
+            .get_cloud_entity("acc_10vk05bJNjt1nLXvId4zh14")
+            .unwrap()
+            .is_some());
+    }
+
     #[test]
     fn tags_roundtrip_and_lookup() {
         use crate::context::{Context as Ctx, ContextSourceKind};
@@ -5435,6 +6947,451 @@ mod tests {
 
     /// Triage is per subject; "gone upstream" is per signal. Conflating the two was
     /// what made the old `state` column mean two unrelated things.
+    fn branch_pass(reviewer: crate::ghreview::Reviewer, model: &str) -> crate::ghreview::Pass {
+        crate::ghreview::Pass {
+            id: format!("bp/{}", new_id()),
+            branch_key: "o/r@bh/otel1".into(),
+            repo: "o/r".into(),
+            head: "bh/otel1".into(),
+            base: "main".into(),
+            head_sha: "abc1234".into(),
+            by: reviewer,
+            provider: "claude".into(),
+            model: model.into(),
+            status: crate::ghreview::PassStatus::Pending,
+            recommendation: None,
+            summary: None,
+            comments: vec![],
+            dismissed: false,
+            error: None,
+            created_at: String::new(),
+            updated_at: String::new(),
+        }
+    }
+
+    /// Asking the same reviewer on the same model about the same commit is the same question,
+    /// and must hand back the existing row rather than queueing a second pass.
+    #[test]
+    fn a_branch_pass_is_unique_per_reviewer_model_and_commit() {
+        let store = Store::open_in_memory().unwrap();
+        use crate::ghreview::Reviewer;
+
+        let first = store
+            .queue_branch_pass(&branch_pass(Reviewer::Model, "claude-opus-5"))
+            .unwrap();
+        let again = store
+            .queue_branch_pass(&branch_pass(Reviewer::Model, "claude-opus-5"))
+            .unwrap();
+        assert_eq!(first.id, again.id, "the same question, once");
+
+        // A different model is a different question…
+        let other_model = store
+            .queue_branch_pass(&branch_pass(Reviewer::Model, "claude-sonnet-5"))
+            .unwrap();
+        assert_ne!(first.id, other_model.id);
+        // …and so is a different reviewer.
+        let persona = store
+            .queue_branch_pass(&branch_pass(
+                Reviewer::Persona("pavel".into()),
+                "claude-opus-5",
+            ))
+            .unwrap();
+        assert_ne!(first.id, persona.id);
+        // …and so is a different commit.
+        let mut moved = branch_pass(Reviewer::Model, "claude-opus-5");
+        moved.head_sha = "def5678".into();
+        let after_push = store.queue_branch_pass(&moved).unwrap();
+        assert_ne!(first.id, after_push.id);
+
+        assert_eq!(store.branch_passes("o/r@bh/otel1").unwrap().len(), 4);
+    }
+
+    /// The full lifecycle, including the part that matters: dismissal hides a pass from the
+    /// diff and keeps the row, so it can be restored and so the record survives.
+    #[test]
+    fn a_branch_pass_finishes_dismisses_restores_and_reruns() {
+        let store = Store::open_in_memory().unwrap();
+        use crate::ghreview::{PassStatus, Placed, Reviewer};
+
+        let queued = store
+            .queue_branch_pass(&branch_pass(
+                Reviewer::Persona("pavel".into()),
+                "claude-opus-5",
+            ))
+            .unwrap();
+        assert_eq!(queued.status, PassStatus::Pending);
+        assert_eq!(
+            store.list_branch_passes_pending().unwrap(),
+            vec![queued.id.clone()]
+        );
+
+        let comments = vec![Placed {
+            path: "src/main.rs".into(),
+            severity: crate::prdiff::Severity::Concern,
+            note: "He'd ask why this can't fail loudly.".into(),
+            anchor: Some("+    unwrap_or_default();".into()),
+            patch_index: Some(4),
+            by: Reviewer::Persona("pavel".into()),
+            because: vec!["pavel/style/1".into()],
+        }];
+        let done = store
+            .finish_branch_pass(&queued.id, Some("request_changes"), Some("note"), &comments)
+            .unwrap();
+        assert_eq!(done.status, PassStatus::Done);
+        assert_eq!(done.comments.len(), 1);
+        assert_eq!(done.comments[0].patch_index, Some(4));
+        assert_eq!(done.comments[0].by, Reviewer::Persona("pavel".into()));
+        assert_eq!(done.recommendation.as_deref(), Some("request_changes"));
+        assert!(store.list_branch_passes_pending().unwrap().is_empty());
+
+        // Dismiss: gone from the diff, still on the record, comments intact.
+        store.set_branch_pass_dismissed(&queued.id, true).unwrap();
+        let hidden = store.get_branch_pass(&queued.id).unwrap().unwrap();
+        assert!(hidden.dismissed);
+        assert_eq!(hidden.comments.len(), 1, "dismissal is not a delete");
+        assert!(crate::ghreview::visible(std::slice::from_ref(&hidden)).is_empty());
+
+        // Restore.
+        store.set_branch_pass_dismissed(&queued.id, false).unwrap();
+        assert!(
+            !store
+                .get_branch_pass(&queued.id)
+                .unwrap()
+                .unwrap()
+                .dismissed
+        );
+
+        // Re-ask: back to pending, and the old answer cleared so a half-finished rerun cannot
+        // read as the new one.
+        store.reopen_branch_pass(&queued.id).unwrap();
+        let reopened = store.get_branch_pass(&queued.id).unwrap().unwrap();
+        assert_eq!(reopened.status, PassStatus::Pending);
+        assert!(reopened.comments.is_empty());
+        assert_eq!(reopened.recommendation, None);
+        assert!(!reopened.dismissed);
+    }
+
+    #[test]
+    fn a_failed_branch_pass_carries_its_reason() {
+        let store = Store::open_in_memory().unwrap();
+        let queued = store
+            .queue_branch_pass(&branch_pass(crate::ghreview::Reviewer::Model, "m"))
+            .unwrap();
+        store
+            .fail_branch_pass(
+                &queued.id,
+                "bh/otel1 moved to def5678 while this was queued",
+            )
+            .unwrap();
+        let failed = store.get_branch_pass(&queued.id).unwrap().unwrap();
+        assert_eq!(failed.status, crate::ghreview::PassStatus::Failed);
+        assert!(failed.error.unwrap().contains("moved to"));
+    }
+
+    /// A comments blob that will not parse must not take the row down: the pass's verdict is
+    /// still worth showing, and one bad blob must not empty the view for other reviewers.
+    #[test]
+    fn an_unparseable_comments_blob_degrades_to_no_comments() {
+        let store = Store::open_in_memory().unwrap();
+        let queued = store
+            .queue_branch_pass(&branch_pass(crate::ghreview::Reviewer::Model, "m"))
+            .unwrap();
+        {
+            let conn = store.lock();
+            conn.execute(
+                "UPDATE branch_review_passes SET status='done', summary='s', comments='{{{' \
+                 WHERE id=?1",
+                params![queued.id],
+            )
+            .unwrap();
+        }
+        let read = store.get_branch_pass(&queued.id).unwrap().unwrap();
+        assert!(read.comments.is_empty());
+        assert_eq!(read.summary.as_deref(), Some("s"));
+    }
+
+    /// The bulk half of a source snooze, and the query where it could most easily do the
+    /// wrong thing quietly.
+    ///
+    /// Four subjects, one of each shape that matters:
+    ///   - purely Slack → snoozed
+    ///   - Slack *and* GitHub → left alone (a PR with chatter on it is not a Slack
+    ///     notification)
+    ///   - purely GitHub → left alone
+    ///   - purely Slack but carrying a Critical → left alone, because a source snooze is not
+    ///     what should hide an outage
+    #[test]
+    fn a_source_snooze_takes_only_the_subjects_that_are_purely_that_source() {
+        source_snooze_case();
+    }
+
+    /// The board's bulk snooze, and the sweep that gives its duration meaning.
+    ///
+    /// `snoozed_until` was written by both snooze paths from the beginning and read by
+    /// neither — `Projection::views` drops anything whose `handled` is `Snoozed` and looks no
+    /// further — so every "snooze for two hours" was in practice indefinite. These two halves
+    /// are what make the duration a term rather than a decoration.
+    #[test]
+    fn a_bulk_snooze_expires_and_an_open_ended_one_does_not() {
+        let store = Store::open_in_memory().unwrap();
+        let mk = |n: u64| {
+            let key = SubjectKey::issue("o/r", n);
+            let sig = sample(&format!("s{n}"));
+            store.insert_signal(&sig).unwrap();
+            store
+                .upsert_subject(&Subject::new(key.clone(), &sig, Utc::now()))
+                .unwrap();
+            key.as_str().to_string()
+        };
+        let (lapsed, live, forever) = (mk(1), mk(2), mk(3));
+        let handled = |k: &str| store.get_subject(k).unwrap().unwrap().handled;
+
+        // Two snoozed together with an expiry, and one snoozed open-endedly — the `s` key's
+        // "off the board until it moves", which is a different thing to have asked for.
+        let changed = store
+            .set_handled_bulk(
+                &[lapsed.clone(), live.clone()],
+                Handled::Snoozed,
+                Some(Utc::now() - chrono::Duration::minutes(1)),
+            )
+            .unwrap();
+        assert_eq!(changed, 2);
+        store.set_handled(&forever, Handled::Snoozed, None).unwrap();
+        // Push one of the pair back into the future, so the sweep has to discriminate rather
+        // than simply waking everything it finds.
+        store
+            .set_handled(
+                &live,
+                Handled::Snoozed,
+                Some(Utc::now() + chrono::Duration::hours(2)),
+            )
+            .unwrap();
+
+        let woken = store.wake_lapsed_snoozes().unwrap();
+        assert_eq!(woken, vec![lapsed.clone()]);
+        // Back to `open`, not `seen`: it left the board unread, and returning it as already
+        // seen would hide it in the same breath as un-hiding it.
+        assert_eq!(handled(&lapsed), Handled::Open);
+        assert!(store
+            .get_subject(&lapsed)
+            .unwrap()
+            .unwrap()
+            .snoozed_until
+            .is_none());
+        assert_eq!(handled(&live), Handled::Snoozed, "not due yet");
+        assert_eq!(handled(&forever), Handled::Snoozed, "no expiry to lapse");
+
+        // Idempotent, so a tick that fires twice — or fires again after a restart — costs
+        // nothing and wakes nobody a second time.
+        assert!(store.wake_lapsed_snoozes().unwrap().is_empty());
+
+        // A key that has since gone is not an error; the count is what actually changed.
+        let changed = store
+            .set_handled_bulk(
+                &[live.clone(), "o/r#404".into()],
+                Handled::Snoozed,
+                Some(Utc::now() + chrono::Duration::hours(1)),
+            )
+            .unwrap();
+        assert_eq!(changed, 1);
+        assert_eq!(
+            store.set_handled_bulk(&[], Handled::Snoozed, None).unwrap(),
+            0
+        );
+    }
+
+    /// The body of the test above, kept out of line only so the bulk-snooze test could sit
+    /// beside it without displacing its documentation.
+    fn source_snooze_case() {
+        let store = Store::open_in_memory().unwrap();
+
+        let mk = |key: SubjectKey, sigs: Vec<(Source, Severity, &str)>| {
+            let mut first: Option<Signal> = None;
+            for (i, (source, severity, ext)) in sigs.into_iter().enumerate() {
+                let mut sig = sample(&format!("{}-{i}", ext));
+                sig.source = source;
+                sig.id = Signal::make_id(source, &format!("{}-{i}", ext), None);
+                sig.severity = severity;
+                sig.subject = Some(key.as_str().to_string());
+                store.insert_signal(&sig).unwrap();
+                if first.is_none() {
+                    first = Some(sig);
+                }
+            }
+            store
+                .upsert_subject(&Subject::new(key, &first.unwrap(), Utc::now()))
+                .unwrap();
+        };
+
+        let slack_only = SubjectKey::issue("o/r", 1);
+        let mixed = SubjectKey::issue("o/r", 2);
+        let github_only = SubjectKey::issue("o/r", 3);
+        let slack_critical = SubjectKey::issue("o/r", 4);
+        mk(
+            slack_only.clone(),
+            vec![(Source::Slack, Severity::Warning, "a")],
+        );
+        mk(
+            mixed.clone(),
+            vec![
+                (Source::Slack, Severity::Notice, "b"),
+                (Source::GitHub, Severity::Notice, "c"),
+            ],
+        );
+        mk(
+            github_only.clone(),
+            vec![(Source::GitHub, Severity::Warning, "d")],
+        );
+        mk(
+            slack_critical.clone(),
+            vec![
+                (Source::Slack, Severity::Notice, "e"),
+                (Source::Slack, Severity::Critical, "f"),
+            ],
+        );
+
+        let until = Utc::now() + chrono::Duration::hours(2);
+        let n = store
+            .snooze_subjects_only_from(Source::Slack, until, Some(Severity::Critical))
+            .unwrap();
+        assert_eq!(n, 1, "only the purely-Slack, non-critical subject");
+
+        let handled = |k: &SubjectKey| store.get_subject(k.as_str()).unwrap().unwrap().handled;
+        assert_eq!(handled(&slack_only), Handled::Snoozed);
+        assert_eq!(
+            handled(&mixed),
+            Handled::Open,
+            "a PR with chatter is not Slack"
+        );
+        assert_eq!(handled(&github_only), Handled::Open);
+        assert_eq!(
+            handled(&slack_critical),
+            Handled::Open,
+            "a snooze must not be what hides something critical"
+        );
+
+        // And it comes back on its own, at the snooze's own expiry.
+        let snoozed = store.get_subject(slack_only.as_str()).unwrap().unwrap();
+        assert_eq!(
+            snoozed.snoozed_until.map(|d| d.timestamp()),
+            Some(until.timestamp())
+        );
+    }
+
+    /// Total silence — the literal "snooze all slack notifications" — takes the critical
+    /// subject too. The same board, the same query, one argument different.
+    #[test]
+    fn total_silence_takes_the_critical_subject_as_well() {
+        let store = Store::open_in_memory().unwrap();
+        let key = SubjectKey::issue("o/r", 5);
+        for (i, sev) in [Severity::Notice, Severity::Critical]
+            .into_iter()
+            .enumerate()
+        {
+            let mut sig = sample(&format!("crit-{i}"));
+            sig.source = Source::Slack;
+            sig.id = Signal::make_id(Source::Slack, &format!("crit-{i}"), None);
+            sig.severity = sev;
+            sig.subject = Some(key.as_str().to_string());
+            store.insert_signal(&sig).unwrap();
+            if i == 0 {
+                store
+                    .upsert_subject(&Subject::new(key.clone(), &sig, Utc::now()))
+                    .unwrap();
+            }
+        }
+        let until = Utc::now() + chrono::Duration::hours(1);
+
+        // With the safe floor it is left alone…
+        assert_eq!(
+            store
+                .snooze_subjects_only_from(Source::Slack, until, Some(Severity::Critical))
+                .unwrap(),
+            0
+        );
+        // …and with no floor it goes.
+        assert_eq!(
+            store
+                .snooze_subjects_only_from(Source::Slack, until, None)
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            store.get_subject(key.as_str()).unwrap().unwrap().handled,
+            Handled::Snoozed
+        );
+    }
+
+    /// A floor stored as `everything` reads back as no floor. Stored as a word rather than
+    /// SQL NULL so a row is never ambiguous about whether a floor was set or lost.
+    #[test]
+    fn a_total_silence_floor_round_trips_through_the_store() {
+        let store = Store::open_in_memory().unwrap();
+        let s = crate::quiet::Snooze {
+            source: Source::Slack,
+            until: Utc::now() + chrono::Duration::hours(1),
+            floor: None,
+            set_at: Utc::now(),
+        };
+        store.set_source_snooze(&s).unwrap();
+        let back = store.list_source_snoozes().unwrap();
+        assert_eq!(back.len(), 1);
+        assert_eq!(back[0].floor, None);
+        assert!(back[0].total());
+        // And an unrecognised floor fails safe: outages get through, not swallowed.
+        assert_eq!(parse_floor("wat"), Some(Severity::Notice));
+        assert_eq!(parse_floor("critical"), Some(Severity::Critical));
+        assert_eq!(parse_floor("everything"), None);
+    }
+
+    /// Already-handled subjects are not re-snoozed: an acknowledged thread has been dealt
+    /// with, and rewriting its state would move it from "I've seen this" to "hidden".
+    #[test]
+    fn a_source_snooze_leaves_already_handled_subjects_alone() {
+        let store = Store::open_in_memory().unwrap();
+        let key = SubjectKey::issue("o/r", 9);
+        let mut sig = sample("ack");
+        sig.source = Source::Slack;
+        sig.id = Signal::make_id(Source::Slack, "ack", None);
+        sig.subject = Some(key.as_str().to_string());
+        store.insert_signal(&sig).unwrap();
+        store
+            .upsert_subject(&Subject::new(key.clone(), &sig, Utc::now()))
+            .unwrap();
+        store
+            .set_handled(key.as_str(), Handled::Acknowledged, None)
+            .unwrap();
+
+        let n = store
+            .snooze_subjects_only_from(
+                Source::Slack,
+                Utc::now() + chrono::Duration::hours(1),
+                Some(Severity::Critical),
+            )
+            .unwrap();
+        assert_eq!(n, 0);
+        assert_eq!(
+            store.get_subject(key.as_str()).unwrap().unwrap().handled,
+            Handled::Acknowledged
+        );
+    }
+
+    /// The encoding trap. `signals.severity` is stored JSON-quoted (`"warning"`, nine
+    /// characters), so a comparison against a bare `warning` matches nothing and would make
+    /// the critical guard above a silent no-op.
+    #[test]
+    fn the_severity_comparison_uses_the_form_the_column_actually_holds() {
+        assert_eq!(
+            at_or_above(Severity::Warning),
+            vec!["\"warning\"".to_string(), "\"critical\"".to_string()]
+        );
+        assert_eq!(
+            at_or_above(Severity::Critical),
+            vec!["\"critical\"".to_string()]
+        );
+        assert_eq!(at_or_above(Severity::Info).len(), 4);
+    }
+
     #[test]
     fn triage_is_per_subject_and_upstream_absence_is_per_signal() {
         let store = Store::open_in_memory().unwrap();

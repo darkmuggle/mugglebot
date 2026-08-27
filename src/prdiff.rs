@@ -164,6 +164,16 @@ pub enum Recommendation {
 }
 
 impl Recommendation {
+    /// The wire form, matching the `serde` rename so a stored recommendation and a rendered
+    /// one are the same string.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Approve => "approve",
+            Self::Comment => "comment",
+            Self::RequestChanges => "request_changes",
+        }
+    }
+
     fn parse(raw: &str) -> Self {
         match raw
             .trim()
@@ -325,6 +335,63 @@ impl DiffReader {
         DiffReport {
             repo: repo.to_string(),
             number,
+            head_sha,
+            file_count: files.len(),
+            truncated: files.len() >= MAX_DIFF_FILES,
+            files: files.into_iter().map(DiffFile::from).collect(),
+            additions,
+            deletions,
+            summary,
+            error: None,
+        }
+    }
+
+    /// Read a **branch's** diff, `base...head`.
+    ///
+    /// Same [`DiffReport`] as a pull request produces, so one reviewer reads both and the pane
+    /// renders both. `number` is 0: a branch has no PR number, and inventing one would make a
+    /// branch review look like a review of a pull request that does not exist.
+    ///
+    /// Same failure shape too — an unreadable branch comes back as a report carrying its error
+    /// rather than as an `Err`, so the view can say *why* instead of going blank.
+    pub async fn read_branch(&self, repo: &str, base: &str, head: &str) -> DiffReport {
+        let empty = |error: Option<String>| DiffReport {
+            repo: repo.to_string(),
+            number: 0,
+            files: Vec::new(),
+            file_count: 0,
+            additions: 0,
+            deletions: 0,
+            summary: None,
+            truncated: false,
+            error,
+            head_sha: None,
+        };
+        let Some(gh) = &self.github else {
+            return empty(Some("reading a diff needs a stored GitHub token".into()));
+        };
+        let (head_sha, _) = match gh.branch_head(repo, head).await {
+            Ok(v) => (Some(v.0), v.1),
+            Err(e) => return empty(Some(format!("{e:#}"))),
+        };
+        let files = match gh
+            .compare_files(repo, base, head, MAX_DIFF_FILES, MAX_PATCH_CHARS)
+            .await
+        {
+            Ok(f) => f,
+            Err(e) => return empty(Some(format!("{e:#}"))),
+        };
+        if files.is_empty() {
+            return empty(Some(format!(
+                "{head} has no changes against {base} — nothing to review"
+            )));
+        }
+        let summary = self.summarize(repo, 0, &files).await;
+        let additions = files.iter().map(|f| f.additions).sum();
+        let deletions = files.iter().map(|f| f.deletions).sum();
+        DiffReport {
+            repo: repo.to_string(),
+            number: 0,
             head_sha,
             file_count: files.len(),
             truncated: files.len() >= MAX_DIFF_FILES,
@@ -1743,10 +1810,10 @@ mod tests {
 
         // A model name containing a slash still resolves — `split_once` takes the first, so
         // provider and model separate at the right place.
-        let ollama = with_model(wm, "ollama_local", "deepseek-coder:33b");
+        let ollama = with_model(wm, "ollama_local", "gemma4:31b");
         assert_eq!(
             split_model(&ollama),
-            (wm, Some(("ollama_local", "deepseek-coder:33b")))
+            (wm, Some(("ollama_local", "gemma4:31b")))
         );
 
         // Half a spec is not enough to build a reasoner. Falling back to the default tier is

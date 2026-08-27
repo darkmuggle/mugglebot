@@ -249,8 +249,13 @@ impl LiveEngine {
             \"suggestions\":[{\"text\":\"\",\"citations\":[]}],\
             \"flags\":[{\"signal_id\":\"\",\"flag_type\":\"factual_error|risky_action\",\"text\":\"\",\
             \"rationale\":\"\",\"confidence\":0.0,\"citations\":[]}]}.";
+        // What the platform says about the ids in these messages. Above the grounding
+        // because it is the one part of the prompt that is *looked up* rather than recalled:
+        // a suggestion about `env_…` should rest on which account and region it is actually
+        // in, not on the model's guess from the name.
+        let cloud = crate::cloud::prompt_block(&view.cloud);
         let prompt = format!(
-            "Subject: {}\n\nSignals:\n{ev}\n\nGrounding:\n{grounding}",
+            "Subject: {}\n\nSignals:\n{ev}\n{cloud}\nGrounding:\n{grounding}",
             view.subject.title
         );
         let req = CompletionRequest::single(prompt)

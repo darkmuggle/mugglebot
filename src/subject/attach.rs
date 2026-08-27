@@ -24,12 +24,17 @@ use crate::store::Store;
 pub struct Attributor {
     store: Arc<Store>,
     board: Board,
+    /// Source snoozes — "not Slack, not now". Built from the same store rather than passed
+    /// in, because a snooze is store state and threading it through every construction site
+    /// would be a parameter that only ever has one value.
+    quiet: crate::quiet::Quiet,
 }
 
 impl Attributor {
     pub fn new(store: Arc<Store>) -> Self {
         Self {
             board: Board::new(store.clone()),
+            quiet: crate::quiet::Quiet::new(store.clone()),
             store,
         }
     }
@@ -111,6 +116,23 @@ impl Attributor {
             None => {
                 let subject = Subject::new(key.clone(), s, now);
                 self.store.upsert_subject(&subject)?;
+                // A source snooze covers what arrives *next*, not only what was on the board
+                // when it was set — Slack polls every 30 seconds, so without this the board
+                // refills before the operator has looked away.
+                //
+                // Snoozed to the snooze's own expiry, so it surfaces on its own when the
+                // source does. `until_for` returns `None` for a severity at or above the
+                // floor, which is what keeps a firing incident visible through a Slack snooze.
+                if let Some(until) = self.quiet.until_for(s.source, s.severity) {
+                    self.store
+                        .set_handled(key.as_str(), crate::quiet::AS, Some(until))?;
+                    debug!(
+                        "{} held back: {} is snoozed ({:?} is below its floor)",
+                        key.as_str(),
+                        s.source.as_str(),
+                        s.severity
+                    );
+                }
                 if let Some(parent) = self.parent_for(&key, &attribution) {
                     self.store
                         .set_subject_parent(key.as_str(), Some(parent.as_str()))?;

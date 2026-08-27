@@ -128,6 +128,32 @@ pub fn queue_dashboard_investigation(
     }
 }
 
+/// Record which Restate Cloud ids this signal's text mentions.
+///
+/// Scanning only — the `rcc` lookups happen on the scheduler's sweep, not here. A signal can
+/// name half a hierarchy, each id is a subprocess, and the poll path is the one place in
+/// MuggleBot where a few seconds of shelling out would be paid on every message in the
+/// channel. What this leaves behind is a set of ids the resolver picks up within a tick.
+///
+/// Idempotent, and deliberately outside the insert-dedup check for the same reason
+/// [`queue_issue_triage`] is: a signal that was ingested before the operator configured
+/// `rcc` should still get its ids on the next poll.
+pub fn cloud_ids(sig: &signal::Signal, store: &Store) {
+    let mut text = sig.title.clone();
+    if let Some(body) = &sig.body {
+        text.push('\n');
+        text.push_str(body);
+    }
+    let ids = crate::cloud::scan(&text);
+    if ids.is_empty() {
+        return;
+    }
+    match store.link_signal_cloud_ids(&sig.id, &ids) {
+        Ok(()) => debug!("cloud: {} mentions {}", sig.id, ids.join(", ")),
+        Err(e) => warn!("recording cloud ids for {} failed: {e:#}", sig.id),
+    }
+}
+
 /// Queue triage for a signal that represents an issue assigned to the user.
 ///
 /// The watcher re-emits every assigned issue on every poll, so this is called
@@ -298,6 +324,77 @@ mod tests {
             .get_browser_investigation_for_signal(&sig.id)
             .unwrap()
             .is_none());
+    }
+
+    /// The ingest path records the mention and stops there. Anything that shelled out here
+    /// would be paid on every message in the channel.
+    #[test]
+    fn a_mentioned_environment_is_recorded_from_the_title_and_the_body() {
+        let store = Store::open_in_memory().unwrap();
+        let mut sig = alert();
+        sig.title = "acc_10vk05bJNjt1nLXvId4zh14 escalation".into();
+        sig.body = Some("env_201kpvffchrm1sq5p0qph42dqev is 500ing".into());
+        store.insert_signal(&sig).unwrap();
+        cloud_ids(&sig, &store);
+
+        let mut stale = store
+            .stale_cloud_ids(
+                chrono::Duration::hours(6),
+                chrono::Duration::minutes(10),
+                50,
+            )
+            .unwrap();
+        stale.sort();
+        assert_eq!(
+            stale,
+            vec![
+                "acc_10vk05bJNjt1nLXvId4zh14",
+                "env_201kpvffchrm1sq5p0qph42dqev"
+            ]
+        );
+    }
+
+    /// A watcher re-emits every signal on every poll, so this runs repeatedly on the same
+    /// message. It must not accumulate rows, and it must not fail the second time.
+    #[test]
+    fn re_ingesting_the_same_message_records_the_mention_once() {
+        let store = Store::open_in_memory().unwrap();
+        let mut sig = alert();
+        sig.body = Some("env_201kpvffchrm1sq5p0qph42dqev again".into());
+        store.insert_signal(&sig).unwrap();
+        cloud_ids(&sig, &store);
+        cloud_ids(&sig, &store);
+        assert_eq!(
+            store
+                .stale_cloud_ids(
+                    chrono::Duration::hours(6),
+                    chrono::Duration::minutes(10),
+                    50
+                )
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    /// The poll path's own protection: a message full of `env_vars` talk is not a queue of
+    /// subprocesses.
+    #[test]
+    fn a_message_with_no_platform_ids_queues_nothing() {
+        let store = Store::open_in_memory().unwrap();
+        let mut sig = alert();
+        sig.title = "env_vars are unset in the key_management job".into();
+        sig.body = Some("see org_name in the acc_id column".into());
+        store.insert_signal(&sig).unwrap();
+        cloud_ids(&sig, &store);
+        assert!(store
+            .stale_cloud_ids(
+                chrono::Duration::hours(6),
+                chrono::Duration::minutes(10),
+                50
+            )
+            .unwrap()
+            .is_empty());
     }
 
     /// A watcher re-emits the same alert on every poll. One question, asked once.

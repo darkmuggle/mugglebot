@@ -2,6 +2,7 @@ import { createResource, createSignal, For, onCleanup, Show } from "solid-js";
 import { api } from "../api";
 import { PredictionCard } from "./Personas";
 import type { PersonaPrediction, PersonaSummary, PersonaTrait } from "../types";
+import { Panel } from "./ui";
 
 /// "How will this land?" — select personas against this subject and read the predictions.
 ///
@@ -127,15 +128,16 @@ export default function PersonaPredict(props: { subjectKey: string }) {
   );
 
   return (
-    <section class="panel">
-      <div class="panel-head">
-        <h3>How will this land?</h3>
+    <Panel
+      title="How will this land?"
+      actions={
         <Show when={selected().length}>
-          <button disabled={busy()} onClick={predict}>
-            {busy() ? "submitting…" : `PREDICT (${selected().length})`}
+          <button class="primary" disabled={busy()} onClick={predict}>
+            {busy() ? "Submitting…" : `Predict (${selected().length})`}
           </button>
         </Show>
-      </div>
+      }
+    >
 
       <Show
         when={personas()?.enabled !== false}
@@ -199,6 +201,6 @@ export default function PersonaPredict(props: { subjectKey: string }) {
           )}
         </For>
       </Show>
-    </section>
+    </Panel>
   );
 }

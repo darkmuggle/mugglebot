@@ -593,25 +593,34 @@ fn is_public_url(raw: &str) -> bool {
     }
 }
 
-/// Walk `<root>/<tag>/**` and yield each regular file paired with its
-/// normalized top-level-subdirectory tag. Files sitting directly in `root`
-/// (no subdirectory) carry no tag and are skipped — the subdir *is* the tag.
-/// Hidden entries (dotfiles) are ignored.
+/// Walk `<root>/**` and yield each regular file paired with its normalized
+/// top-level-subdirectory tag. Hidden entries (dotfiles) are ignored.
+///
+/// Files sitting directly in `root` are ingested **untagged** — the subdirectory is the tag,
+/// and having none is a missing tag rather than a reason to skip the file. That matters most
+/// for the directories pointed at by [`crate::config::ContextLibrary::dirs`], which are
+/// documentation checkouts laid out by whoever wrote the docs rather than for MuggleBot: a
+/// repo's `docs/` typically has its overviews at the top and its `runbooks/`, `sop/` and
+/// `design/` beneath, and dropping the top level would lose exactly the orientation material.
 fn managed_files(root: &std::path::Path) -> Vec<(std::path::PathBuf, Option<String>)> {
     let mut out = Vec::new();
     let Ok(entries) = std::fs::read_dir(root) else {
         return out;
     };
-    for tag_dir in entries.flatten() {
-        let path = tag_dir.path();
-        if !path.is_dir() || is_hidden(&path) {
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if is_hidden(&path) {
             continue;
         }
-        let tag = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .and_then(tags::normalize_tag);
-        collect_files(&path, &tag, &mut out);
+        if path.is_dir() {
+            let tag = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .and_then(tags::normalize_tag);
+            collect_files(&path, &tag, &mut out);
+        } else if path.is_file() {
+            out.push((path, None));
+        }
     }
     out
 }
@@ -851,6 +860,52 @@ mod tests {
             store.list_context().unwrap().is_empty(),
             "deleted file removed"
         );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A documentation checkout is laid out by whoever wrote the docs, not for MuggleBot:
+    /// `docs/` typically has its overviews at the top and its `runbooks/` beneath. Both
+    /// halves have to come in, or pointing `[context].dirs` at a real repo silently drops
+    /// exactly the orientation material.
+    #[tokio::test]
+    async fn a_docs_checkout_ingests_its_top_level_files_untagged() {
+        use crate::embed::HashEmbedder;
+        use crate::reasoner::MockReasoner;
+
+        let root = std::env::temp_dir().join(format!("mb-docsdir-{}", crate::store::new_id()));
+        std::fs::create_dir_all(root.join("runbooks")).unwrap();
+        std::fs::write(root.join("setup-rcc.md"), "how to set up rcc").unwrap();
+        std::fs::write(
+            root.join("runbooks").join("public-api-5xx.md"),
+            "what to do when the public API 5xxes",
+        )
+        .unwrap();
+
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let reasoner: Arc<dyn Reasoner> = Arc::new(MockReasoner::new(r#"[]"#));
+        let mgr = ContextManager::new(
+            store.clone(),
+            crate::secrets::Secrets::for_tests(store.clone()),
+            Arc::new(HashEmbedder),
+            reasoner.clone(),
+            reasoner,
+            "6h".into(),
+        );
+        mgr.sync_dir(&root).await.unwrap();
+
+        let sources = store.list_context().unwrap();
+        assert_eq!(sources.len(), 2, "both levels ingested");
+        let runbook = sources
+            .iter()
+            .find(|c| c.location.ends_with("public-api-5xx.md"))
+            .expect("the runbook is in the library");
+        assert_eq!(runbook.tags, vec!["runbooks".to_string()]);
+        let top = sources
+            .iter()
+            .find(|c| c.location.ends_with("setup-rcc.md"))
+            .expect("the top-level guide is in the library");
+        assert!(top.tags.is_empty(), "no subdirectory means no tag");
 
         std::fs::remove_dir_all(&root).ok();
     }

@@ -369,6 +369,15 @@ pub struct SubjectView {
     /// board writes on its own, and the cloud one if the operator asked for a second
     /// opinion. Both, so the panel can show them side by side and label which is which.
     pub explanations: Vec<crate::store::Explanation>,
+    /// Restate Cloud entities this subject's signals named, plus everything those reach:
+    /// the environment somebody pasted, and the account, organization, region and Nuon
+    /// install behind it. See [`crate::cloud`].
+    ///
+    /// On the view rather than fetched separately for the same reason `pull_requests` is —
+    /// "whose environment is this and where does it run" is part of what the subject *is*,
+    /// and the correlation and live-assist prompts want the same answer the panel shows.
+    #[serde(default)]
+    pub cloud: Vec<crate::cloud::Entity>,
     /// Does this need the operator, and has the AI actually looked at it?
     pub attention: Attention,
 }

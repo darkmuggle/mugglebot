@@ -28,6 +28,11 @@ pub const GITHUB: &str = "github";
 /// One Chrome, one investigation at a time. Replaces a claim-a-row worker loop.
 pub const BROWSER: &str = "browser";
 
+/// Branch review passes. A panel is several reviewers over one diff, and each is a handful of
+/// model calls over the same batches — two at a time keeps a five-persona panel from arriving as
+/// twenty concurrent requests while still finishing in a useful time.
+pub const REVIEW: &str = "review";
+
 /// A thread analysis: two cloud models on one conversation. Its own scope rather than
 /// [`CLOUD_LLM`] because it is *operator-initiated and paired* — a limit of 1 here means two
 /// pasted links queue instead of putting four concurrent model calls on the same subscription,

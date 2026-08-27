@@ -356,9 +356,9 @@ mod tests {
     /// This is what makes "map incidents to code" work with no separate pipeline: the gate
     /// admits anything that looks broken — `SignalKind::Alert`, or severity at Warning or
     /// above — and an incident is both. So ingest → debounced analyse → `RootCause` runs on
-    /// its own, and that workflow is the same engine that maps an issue to code: deepseek
-    /// extracts the symptoms and shortlists the candidates, and the deep ranking pass judges
-    /// them on `claude-opus-5`.
+    /// its own, and that workflow is the same engine that maps an issue to code: the local
+    /// model extracts the symptoms and shortlists the candidates, and the deep ranking pass
+    /// judges them on `claude-opus-5`.
     ///
     /// Asserted here because it is load-bearing *and* invisible — nothing in this file calls
     /// the investigator, so a change to the gate could quietly stop incidents being mapped

@@ -11,7 +11,7 @@
 //! client (or the MCP gate) can treat them differently. Nothing here mutates a
 //! production system — the writes are all to MuggleBot's own store.
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, bail, Context as _, Result};
 use serde_json::{json, Value};
 use std::sync::Arc;
 use tracing::debug;
@@ -58,6 +58,10 @@ pub struct Tools {
     pub investigator: Arc<crate::rootcause::Investigator>,
     pub repos: Arc<crate::repos::RepoIndex>,
     pub browser: Arc<crate::browser::BrowserDriver>,
+    /// Source snoozes — "not Slack, not now".
+    pub quiet: Arc<crate::quiet::Quiet>,
+    /// Reviews a GitHub branch: the model's read plus a pass per persona.
+    pub reviews: Arc<crate::ghreview::Runner>,
     /// Reads a pasted Slack thread with two models. Held here because requesting one is an
     /// operator action, and the fetch runs inline so a bad link is an error on the button
     /// rather than a queued row that fails a minute later.
@@ -66,6 +70,8 @@ pub struct Tools {
     pub diffs: Arc<crate::prdiff::DiffReader>,
     /// Personas: the modelled people, their profiles, and the predictions made from them.
     pub personas: Arc<crate::persona::Engine>,
+    /// Reads the Restate Cloud estate. See [`crate::cloud`].
+    pub cloud: Arc<crate::cloud::Resolver>,
 }
 
 /// Pull the indexing invocations out of a raw Restate introspection result.
@@ -137,7 +143,65 @@ impl Tools {
             "search" => self.search(args),
             "list_alerts" => self.list_alerts(args),
             "list_browser_investigations" => self.list_browser_investigations(args),
+            "search_cloud_entities" => self.search_cloud_entities(args),
+            "explore_cloud_entity" => self.explore_cloud_entity(args),
+            "cloud_entity_raw" => self.cloud_entity_raw(args).await,
+            "refresh_cloud_entity" => {
+                let id = req_str(args, "id")?;
+                let entity = self.cloud.refresh(&id).await?;
+                let grafana = crate::cloud::grafana_url(&entity, &self.grafana_host());
+                Ok(json!({ "entity": entity, "grafana": grafana }))
+            }
             "analyse_thread" => self.analyse_thread(args).await,
+            "review_branch" => self.review_branch(args).await,
+            "list_branch_reviews" => Ok(json!(self
+                .store
+                .branch_review_keys(args.get("limit").and_then(|v| v.as_i64()).unwrap_or(25))?
+                .into_iter()
+                .map(|(key, repo, head, at)| json!({
+                    "branch_key": key, "repo": repo, "head": head, "updated_at": at
+                }))
+                .collect::<Vec<_>>())),
+            "get_branch_review" => self.get_branch_review(args),
+            "dismiss_branch_review" => {
+                let id = req_str(args, "id")?;
+                let dismissed = args
+                    .get("dismissed")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(true);
+                self.store.set_branch_pass_dismissed(&id, dismissed)?;
+                Ok(json!(self.store.get_branch_pass(&id)?))
+            }
+            "rerun_branch_review" => {
+                let id = req_str(args, "id")?;
+                self.store.reopen_branch_pass(&id)?;
+                self.ingress.start_scheduler("browser-queue").await.ok();
+                Ok(json!(self.store.get_branch_pass(&id)?))
+            }
+            "snooze_source" => self.snooze_source(args),
+            "wake_source" => {
+                let source = req_source(args, "source")?;
+                Ok(json!({ "source": source.as_str(), "was_snoozed": self.quiet.wake(source)? }))
+            }
+            "list_source_snoozes" => {
+                let now = chrono::Utc::now();
+                Ok(json!(self
+                    .quiet
+                    .all_active()
+                    .into_iter()
+                    .map(|s| json!({
+                        "source": s.source.as_str(),
+                        "until": s.until,
+                        "remaining": s.remaining(now),
+                        "floor": s.floor_label(),
+                        "total": s.total(),
+                        "set_at": s.set_at,
+                    }))
+                    .collect::<Vec<_>>()))
+            }
+            "list_tidied_notifications" => Ok(json!(self
+                .store
+                .list_tidied(args.get("limit").and_then(|v| v.as_i64()).unwrap_or(50))?)),
             "list_thread_analyses" => Ok(json!(self
                 .store
                 .list_thread_analyses(args.get("limit").and_then(|v| v.as_i64()).unwrap_or(30))?)),
@@ -430,6 +494,100 @@ impl Tools {
             .browser_investigations_for_subject(&subject_key)?))
     }
 
+    /// Search the cached Restate Cloud entities. See [`crate::cloud`].
+    fn search_cloud_entities(&self, args: &Value) -> Result<Value> {
+        let query = args.get("query").and_then(Value::as_str).unwrap_or("");
+        let kind = args
+            .get("kind")
+            .and_then(Value::as_str)
+            .filter(|k| !k.trim().is_empty());
+        let limit = args
+            .get("limit")
+            .and_then(Value::as_i64)
+            .unwrap_or(100)
+            .clamp(1, 500);
+        Ok(json!({
+            "results": self.store.search_cloud_entities(query, kind, limit)?,
+            // Sent with every search so the filter chips stay honest about what is cached
+            // — a kind with no rows is a kind the estate has not been warmed for.
+            "kinds": self.store.cloud_entity_kinds()?
+                .into_iter()
+                .map(|(kind, count)| json!({ "kind": kind, "count": count }))
+                .collect::<Vec<_>>(),
+        }))
+    }
+
+    /// The Grafana stack these entities' metrics live in: configured, or implied by the realm.
+    fn grafana_host(&self) -> String {
+        let configured = self.config.cloud.grafana_url.trim();
+        if configured.is_empty() {
+            crate::cloud::grafana_host(&self.config.cloud.context).to_string()
+        } else {
+            configured.to_string()
+        }
+    }
+
+    /// One entity with the graph around it: what it belongs to, and what belongs to it.
+    fn explore_cloud_entity(&self, args: &Value) -> Result<Value> {
+        let id = req_str(args, "id")?;
+        // Case-insensitively, because an entity chip on an alert may have come from the
+        // hyphenated Kubernetes form — which is lowercase, while account and organization ids
+        // are mixed-case. The warmed estate is where the real casing lives.
+        let id = self
+            .store
+            .find_cloud_entity_ci(&id)?
+            .unwrap_or_else(|| id.clone());
+        let entity = self
+            .store
+            .get_cloud_entity(&id)?
+            .with_context(|| format!("no cached cloud entity {id}"))?;
+        // Parents come from the entity's own `related`; anything not yet cached is simply
+        // absent rather than rendered as a blank row.
+        let parents: Vec<crate::cloud::Entity> = entity
+            .related
+            .iter()
+            .filter_map(|r| self.store.get_cloud_entity(r).ok().flatten())
+            .collect();
+        // "What belongs to this" comes from two places, and it has to. The reverse of `related`
+        // finds an account's environments and the people who own it — anything that names this
+        // id. It cannot find an organization's members: an org member's document lists
+        // `accountMemberships`, and they have none, so they name nothing at all. Those are read
+        // from this entity's own `members` instead, with anything already found excluded so an
+        // account's owners appear once. Merged rather than shown as a third list, because to
+        // the operator they are one question.
+        let (mut children, mut child_total) = self.store.cloud_entity_children(&id, 200)?;
+        let (extra, extra_total) = self.store.cloud_entity_members(
+            &id,
+            &entity.members,
+            (200 - children.len() as i64).max(0),
+        )?;
+        children.extend(extra);
+        child_total += extra_total;
+        children.sort_by(|a, b| {
+            (&a.kind, a.name.as_deref().unwrap_or(&a.id))
+                .cmp(&(&b.kind, b.name.as_deref().unwrap_or(&b.id)))
+        });
+        // Where to watch it, for the kinds that have somewhere. Derived on read rather than
+        // stored on the entity: the host is configuration, and a URL baked into the cache
+        // would need a full re-warm to correct if the realm ever changed.
+        let grafana = crate::cloud::grafana_url(&entity, &self.grafana_host());
+        Ok(json!({
+            "entity": entity,
+            "parents": parents,
+            "children": children,
+            "grafana": grafana,
+            // The honest count, because the list is capped: an organization with 900
+            // accounts must not silently render as 200.
+            "child_total": child_total,
+        }))
+    }
+
+    /// The complete virtual-object document for one id, read live rather than from the cache.
+    async fn cloud_entity_raw(&self, args: &Value) -> Result<Value> {
+        let id = req_str(args, "id")?;
+        self.cloud.raw_state(&id).await
+    }
+
     async fn record_browser_investigation(&self, args: &Value) -> Result<Value> {
         let id = req_str(args, "id")?;
         let findings = req_str(args, "findings")?;
@@ -469,6 +627,106 @@ impl Tools {
             "browser",
         )?;
         Ok(json!(queued))
+    }
+
+    /// Queue a review panel over one branch.
+    ///
+    /// The branch is resolved *here*, before any row is written: a typo'd branch or a repo the
+    /// token cannot see becomes an error on the button, which is where the operator is looking.
+    /// Resolving once also pins every pass in the panel to the same commit — otherwise two
+    /// reviewers could read different code and their disagreement would be an artifact.
+    async fn review_branch(&self, args: &Value) -> Result<Value> {
+        if !self.reviews.ready() {
+            bail!("reviewing a branch needs a stored `github` credential");
+        }
+        let branch = crate::ghreview::parse_branch(&req_str(args, "branch")?)?;
+        let personas: Vec<String> = args
+            .get("personas")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.trim().to_string()))
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let provider = opt_str(args, "provider").unwrap_or_else(|| "claude".into());
+        let provider = crate::reasoner::provider_label(&provider).to_string();
+        // Falls back to whatever the config already pins for the cloud tier, so "review this
+        // branch" with no model named uses the model the operator has already chosen once.
+        let model = opt_str(args, "model").unwrap_or_else(|| match provider.as_str() {
+            "chatgpt" => self.config.threads.chatgpt_model.clone(),
+            "claude" => self.config.threads.claude_model.clone(),
+            _ => self.config.reasoner.ollama_model.clone(),
+        });
+        // Default on: the model's read and a persona's prediction answer different questions,
+        // and seeing them against each other is the point. Turn it off for the rehearsal alone.
+        let generic = args
+            .get("generic")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+        let asks = crate::ghreview::asks(&personas, &provider, &model, generic);
+        let (passes, resolved, pr) = self.reviews.request(&branch, &asks).await?;
+        self.ingress.start_scheduler("browser-queue").await.ok();
+        Ok(json!({
+            // The *resolved* branch: a pasted pull request link has become its head branch by
+            // here, and returning the placeholder would send the view looking for `#1334`.
+            "branch_key": resolved.key(),
+            "repo": resolved.repo,
+            "head": resolved.head,
+            "base": resolved.base,
+            // Said rather than hidden: a branch already under review on GitHub is worth
+            // knowing about before adding a second opinion nobody asked for.
+            "open_pull_request": pr,
+            "passes": passes,
+        }))
+    }
+
+    /// Every pass on one branch, plus the diff to render them against.
+    fn get_branch_review(&self, args: &Value) -> Result<Value> {
+        let key = req_str(args, "branch_key")?;
+        let passes = self.store.branch_passes(&key)?;
+        let head_sha = passes
+            .first()
+            .map(|p| p.head_sha.clone())
+            .unwrap_or_default();
+        Ok(json!({
+            "branch_key": key,
+            "head_sha": head_sha,
+            "repo": passes.first().map(|p| p.repo.clone()),
+            "head": passes.first().map(|p| p.head.clone()),
+            "base": passes.first().map(|p| p.base.clone()),
+            // The diff the comments are anchored to. Without it the view has nothing to render
+            // them against, and an inline comment with no line is just a list.
+            "diff": passes
+                .first()
+                .and_then(|p| self.store.get_branch_diff(&key, &p.head_sha).ok().flatten()),
+            "tally": crate::ghreview::tally(&passes)
+                .into_iter()
+                .map(|(label, n)| json!({ "reviewer": label, "comments": n }))
+                .collect::<Vec<_>>(),
+            "visible": crate::ghreview::visible(&passes),
+            "passes": passes,
+        }))
+    }
+
+    /// Snooze a source for a while.
+    fn snooze_source(&self, args: &Value) -> Result<Value> {
+        let source = req_source(args, "source")?;
+        let spec = opt_str(args, "for").unwrap_or_else(|| self.config.quiet.default.clone());
+        let std = crate::config::parse_duration(&spec)
+            .with_context(|| format!("`for`: {spec:?} is not a duration like `30m` or `2h`"))?;
+        let how_long = chrono::Duration::from_std(std)
+            .map_err(|_| anyhow!("`for`: {spec:?} is longer than a snooze can be"))?;
+        // `everything` is the literal reading of "snooze all notifications": nothing gets
+        // through, criticals included. Askable, never the default.
+        let raw = opt_str(args, "floor").unwrap_or_else(|| self.config.quiet.floor.clone());
+        let floor = match raw.trim().to_ascii_lowercase().as_str() {
+            "everything" | "all" | "none" => None,
+            other => Some(crate::config::severity_from_str(other)),
+        };
+        let out = self.quiet.snooze(source, how_long, floor)?;
+        Ok(json!(out))
     }
 
     /// Queue an analysis of one pasted Slack thread.
@@ -2390,9 +2648,51 @@ pub fn definitions() -> Vec<ToolDef> {
         ToolDef { name: "list_browser_investigations", read_only: true,
             description: "Browser investigations of dashboard links on one subject, with status (pending/running/completed/failed) and the findings read off each page. MuggleBot drives the operator's signed-in Chrome read-only; it never mutates a dashboard.",
             schema: obj(json!({ "subject_key": s() }), &["subject_key"]) },
+        ToolDef { name: "search_cloud_entities", read_only: true,
+            description: "Search the cached Restate Cloud estate — environments, accounts, organizations, regions, Nuon installs, users, groups, api keys. Matches id, name, status AND the curated field values, so \"which environments are on this profile\" or \"what is in us-east1\" are answerable, not just \"what is env_…\". `kind` narrows to one kind; an empty query browses. Returns the matches plus the kind counts held in the cache. Reads the cache only — it never shells out.",
+            schema: obj(json!({ "query": s(), "kind": s(), "limit": {"type":"integer"} }), &[]) },
+        ToolDef { name: "explore_cloud_entity", read_only: true,
+            description: "One Restate Cloud entity with the graph around it: `parents` is what it belongs to (an environment's account and region, an account's organization, a region's Nuon install) and `children` is what belongs to it (an account's environments, an organization's accounts). `child_total` is the true count, which can exceed the returned list. This is how to answer \"whose environment is this\" and \"what else is in this account\" without a single CLI call.",
+            schema: obj(json!({ "id": s() }), &["id"]) },
+        ToolDef { name: "refresh_cloud_entity", read_only: true,
+            description: "Re-read ONE Restate Cloud entity from `rcc`/`nuon` right now, ignoring the cache's six-hour TTL, and store what comes back. Use after a change has been reconciled, or after fixing an expired `rcc` credential — the cached copy is otherwise correct for hours. Read-only against the platform: it runs the same lookups as the automatic sweep. A failed read keeps the last known good copy and reports the error alongside it rather than blanking the entity.",
+            schema: json!({"type":"object","properties":{"id":{"type":"string","description":"A platform id (env_…, acc_…, rgn_…, usr_…, org_…, grp_…, key_…) or a Nuon install id."}},"required":["id"]}) },
+        ToolDef { name: "cloud_entity_raw", read_only: true,
+            description: "The COMPLETE virtual-object document for one Restate Cloud id, read live via `rcc get` rather than from the cache. Use when the curated fields on `explore_cloud_entity` are not enough and you need the whole state. Uncurated, so unlike everything else here it can contain credential-bearing fields; it is never cached and never stored.",
+            schema: obj(json!({ "id": s() }), &["id"]) },
         ToolDef { name: "analyse_thread", read_only: false,
             description: "Analyse one Slack thread from a pasted permalink (Slack's \"Copy link\"). Two models — Claude and ChatGPT — read it independently and blind to each other, using any persona profiles the participants have; the result marks which findings both models reached and which only one did. Every finding cites the messages it rests on, and a finding quoting words nobody wrote is discarded. Includes a candid section about the operator's own part in the thread. Reads Slack only; never posts.",
             schema: obj(json!({ "link": s() }), &["link"]) },
+        ToolDef { name: "review_branch", read_only: false,
+            description: "Review a GitHub branch. `branch` is `owner/repo@branch`, a GitHub branch URL, or a compare URL (which is the only shape that names its own base). Queues one pass per reviewer: the model's own read of the code, plus a predicted review per persona named in `personas`. Every comment is anchored to the line its author quoted and rendered inline on the diff. A persona pass is a REHEARSAL — what that colleague would probably say — never their words, and it is never posted anywhere. Passes are pinned to the branch's current commit, so re-asking the same reviewer on the same model about the same commit costs nothing.",
+            schema: obj(json!({
+                "branch": s(), "personas": { "type": "array", "items": s() },
+                "provider": s(), "model": s(), "generic": { "type": "boolean" }
+            }), &["branch"]) },
+        ToolDef { name: "list_branch_reviews", read_only: true,
+            description: "Branches that have review passes, newest activity first.",
+            schema: obj(json!({ "limit": {"type":"integer"} }), &[]) },
+        ToolDef { name: "get_branch_review", read_only: true,
+            description: "Every review pass on one branch (`branch_key` = `owner/repo@branch`), with each reviewer's verdict, their inline comments resolved onto the diff, and whether the pass has been dismissed or is now behind the branch's head. Includes the diff itself so the comments can be rendered against it.",
+            schema: obj(json!({ "branch_key": s() }), &["branch_key"]) },
+        ToolDef { name: "dismiss_branch_review", read_only: false,
+            description: "Hide one review pass from the diff, or restore it with `dismissed: false`. The row is kept either way — a dismissed review is evidence about that reviewer, and re-running one you dismissed should be a decision rather than something that happens because the record was thrown away.",
+            schema: obj(json!({ "id": s(), "dismissed": {"type":"boolean"} }), &["id"]) },
+        ToolDef { name: "rerun_branch_review", read_only: false,
+            description: "Ask one reviewer again — clears their pass and re-queues it. The deliberate re-ask, for when the branch has moved or the model was having a bad day.",
+            schema: obj(json!({ "id": s() }), &["id"]) },
+        ToolDef { name: "snooze_source", read_only: false,
+            description: "Silence a whole source for a while — \"not Slack, not now\". Takes subjects whose signals come ONLY from that source off the board (a pull request with Slack chatter on it is untouched), and keeps newly-arriving work from it off the board until the snooze expires. Signals at or above the floor (default `critical`) still land regardless, so a snooze can never be what hides an outage. `for` is a duration like `30m`, `2h`, `8h`; 24h is the maximum, because longer than that is a disabled source rather than a snooze. `floor` names the lowest severity that still gets through (default `critical`); pass `everything` to silence the source completely, criticals included — which is the literal reading of \"snooze all notifications\" and is never the default.",
+            schema: obj(json!({ "source": s(), "for": s(), "floor": s() }), &["source"]) },
+        ToolDef { name: "wake_source", read_only: false,
+            description: "End a source snooze now, so new work from it reaches the board again. Subjects the snooze already took off the board stay off until their own expiry — waking is about what arrives next, not about dumping the backlog back on.",
+            schema: obj(json!({ "source": s() }), &["source"]) },
+        ToolDef { name: "list_source_snoozes", read_only: true,
+            description: "Sources currently snoozed, with how long is left and the severity floor still getting through.",
+            schema: none() },
+        ToolDef { name: "list_tidied_notifications", read_only: true,
+            description: "GitHub notifications the tidier cleared from your inbox, or would have in a dry run — newest first. Each row carries the notification reason, which rule fired (ci_activity or merged), the repo and title, and whether it was actually cleared. This is the audit trail: it is the only record of what left your inbox, since the notification itself is gone.",
+            schema: obj(json!({ "limit": {"type":"integer"} }), &[]) },
         ToolDef { name: "list_thread_analyses", read_only: true,
             description: "Slack thread analyses requested so far, newest first, with status (pending/running/completed/failed).",
             schema: obj(json!({ "limit": {"type":"integer"} }), &[]) },
@@ -2779,6 +3079,74 @@ fn str_array(args: &Value, key: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+
+    /// **Every advertised tool must dispatch.**
+    ///
+    /// This exists because it happened twice in a row: a `ToolDef` was added to the catalog
+    /// while the arm in `call`'s match was silently lost, and the feature shipped with its UI
+    /// wired to a tool that answered `unknown tool 'review_branch'`. Nothing caught it —
+    /// `definitions()` was complete, the handler compiled and was reachable from nowhere, and
+    /// the type system has no opinion about a match arm that does not exist.
+    ///
+    /// So the catalog is the contract, and this asserts the code honours it. It calls every
+    /// advertised tool with empty arguments: a missing argument, a bad id, or a disabled
+    /// feature are all fine — the *only* failure this rejects is `unknown tool`, which is the
+    /// one that means the name is a lie.
+    #[tokio::test]
+    async fn every_advertised_tool_actually_dispatches() {
+        let tools = tools("{}");
+        let mut unreachable: Vec<String> = Vec::new();
+        for def in definitions() {
+            let out = tools.call(def.name, &json!({})).await;
+            if let Err(e) = out {
+                if format!("{e:#}").contains("unknown tool") {
+                    unreachable.push(def.name.to_string());
+                }
+            }
+        }
+        assert!(
+            unreachable.is_empty(),
+            "advertised but not dispatched: {unreachable:?}"
+        );
+    }
+
+    /// The catalog is what the chat prompt and every MCP client read, so a tool with no
+    /// description or a malformed schema is one they cannot use.
+    ///
+    /// Deliberately not a minimum length: `"Browse memory entries."` says everything there is
+    /// to say about `list_memories`, and a threshold would be this test inventing a house rule
+    /// nobody adopted rather than checking one that exists.
+    #[test]
+    fn every_tool_in_the_catalog_is_described_and_typed() {
+        for def in definitions() {
+            assert!(
+                !def.description.trim().is_empty(),
+                "{} has no description",
+                def.name
+            );
+            assert_eq!(
+                def.schema.get("type").and_then(|t| t.as_str()),
+                Some("object"),
+                "{} has no object schema",
+                def.name
+            );
+            assert!(
+                def.schema.get("properties").is_some(),
+                "{} has no properties",
+                def.name
+            );
+        }
+    }
+
+    /// No duplicate names. Two `ToolDef`s with one name means the second is advertised and
+    /// unreachable — the same failure the dispatch test catches, arriving from the other side.
+    #[test]
+    fn tool_names_are_unique() {
+        let mut seen = std::collections::BTreeSet::new();
+        for def in definitions() {
+            assert!(seen.insert(def.name), "{} is defined twice", def.name);
+        }
+    }
     /// A truncated diff must say so.
     ///
     /// A diff that silently stops is how a reader concludes a change is smaller than it is, which
@@ -2917,11 +3285,14 @@ mod tests {
             investigator,
             repos,
             browser,
+            quiet: Arc::new(crate::quiet::Quiet::new(store.clone())),
+            reviews: Arc::new(crate::ghreview::Runner::for_tests(store.clone())),
             threads: Arc::new(crate::thread::Analyser::for_tests(store.clone())),
             diffs: Arc::new(
                 crate::prdiff::DiffReader::new(None, reasoner.clone(), "local").unwrap(),
             ),
-            personas: Arc::new(crate::persona::Engine::for_tests(store)),
+            personas: Arc::new(crate::persona::Engine::for_tests(store.clone())),
+            cloud: Arc::new(crate::cloud::Resolver::new(Default::default(), store)),
         }
     }
 

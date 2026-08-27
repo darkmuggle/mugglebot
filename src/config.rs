@@ -24,7 +24,11 @@ pub struct Config {
     pub personas: Personas,
     pub browser: Browser,
     pub grafana: Grafana,
+    pub cloud: Cloud,
+    pub context: ContextLibrary,
     pub threads: Threads,
+    pub tidy: Tidy,
+    pub quiet: QuietCfg,
     pub mcp: Mcp,
     pub ui: Ui,
 }
@@ -135,6 +139,8 @@ pub struct RestateLimits {
     pub grafana: u32,
     /// Thread analyses. One at a time: each is already two concurrent cloud calls.
     pub thread: u32,
+    /// Branch review passes. A panel of several reviewers should not arrive as one burst.
+    pub review: u32,
     pub checkout: u32,
     /// **One org crawl at a time.** Two would enumerate the same repos, pick the same
     /// uncarded ones in the same order, and clone them into the same directory — a corrupt
@@ -151,6 +157,7 @@ impl Default for RestateLimits {
             browser: 1,
             grafana: 3,
             thread: 1,
+            review: 2,
             checkout: 2,
             repo_index: 1,
         }
@@ -650,6 +657,166 @@ impl Default for Grafana {
     }
 }
 
+/// Restate Cloud entity resolution: `env_…` in a ticket becomes a box of facts.
+///
+/// See [`crate::cloud`]. This holds no credentials and cannot obtain any — it shells out to
+/// the `rcc` and `nuon` CLIs the operator has already configured, read-only, and inherits
+/// whatever they can see. If `rcc` is not logged in, lookups fail and say so; nothing else
+/// changes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Cloud {
+    pub enabled: bool,
+    /// The `rcc` wrapper. A leading `~` is expanded.
+    pub rcc_path: String,
+    pub nuon_path: String,
+    /// Admin API realm passed as `rcc -c`: `dev`, `us`, or `eu`. Empty leaves `rcc` on its
+    /// own default, which is `us`.
+    pub context: String,
+    /// Grafana stack for the entity deep links, overriding what the realm implies.
+    ///
+    /// Empty derives it from `context` — `dev` is the dev stack, everything else is prod —
+    /// which is right whenever `rcc` and Grafana agree about which estate you are looking at.
+    /// Its own setting rather than borrowing `[grafana] base_url`: that one says where your
+    /// *alerts* come from, and the two are only incidentally the same host. Pointing an
+    /// environment link at the wrong stack renders a dashboard perfectly with no data in it,
+    /// which is worse than no link.
+    pub grafana_url: String,
+    /// AWS profile passed as `rcc --aws-profile`, for the DynamoDB table that holds user
+    /// names and email addresses — the one part of a `usr_` that is not in the state store.
+    /// Empty leaves `rcc` on its own default for the realm, which is what you want unless
+    /// your profiles are named differently. A user resolves either way; without credentials
+    /// they simply have no name.
+    pub aws_profile: String,
+    /// How long a successful lookup stays fresh. Long by default: an environment's account,
+    /// region and profile change on the order of never, and the whole point of the cache is
+    /// that a busy thread mentioning one id fifty times costs one subprocess.
+    pub ttl: String,
+    /// Hard cap on one `rcc`/`nuon` invocation.
+    pub timeout: String,
+    /// Ceiling on the resolved closure per sweep, so one message pasting a list of thirty
+    /// environments cannot turn into a hundred subprocesses.
+    pub max_entities: usize,
+    /// `refresh-kube-token.sh` from the BYOC repo, for minting an ephemeral kubectl token
+    /// against a Nuon install. Empty disables the button. A leading `~` is expanded.
+    pub kube_token_script: String,
+    /// The editor `rcc edit` opens inside the web terminal.
+    ///
+    /// Supplied explicitly rather than inherited: a daemon may have no `EDITOR` at all, and
+    /// a GUI editor would hang the pane waiting for a window that never appears there. It
+    /// must be something that works in a terminal.
+    pub editor: String,
+}
+
+impl Default for Cloud {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            rcc_path: "~/bin/rcc".into(),
+            nuon_path: "nuon".into(),
+            context: String::new(),
+            grafana_url: String::new(),
+            aws_profile: String::new(),
+            ttl: "6h".into(),
+            timeout: "30s".into(),
+            max_entities: 12,
+            kube_token_script: String::new(),
+            editor: "vim".into(),
+        }
+    }
+}
+
+/// The context library: curated reference material — runbooks, design docs, on-call guides.
+/// See [`crate::context`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ContextLibrary {
+    /// How often a source is re-fetched when it does not set its own interval.
+    pub refresh_default: String,
+    /// Extra directories to sync alongside the managed `<data_dir>/contexts` tree, for
+    /// documentation that lives in a checkout rather than being copied into MuggleBot's
+    /// own directory — a repo's `docs/` is the case this exists for, and it stays current
+    /// with `git pull` rather than needing a re-copy.
+    ///
+    /// Same layout rule as the managed tree: each top-level subdirectory is a pinned tag on
+    /// the files beneath it, so `docs/runbooks/foo.md` is tagged `runbooks`. A leading `~`
+    /// is expanded. Read-only — nothing here is ever written to.
+    pub dirs: Vec<String>,
+}
+
+impl Default for ContextLibrary {
+    fn default() -> Self {
+        Self {
+            refresh_default: "6h".into(),
+            dirs: Vec::new(),
+        }
+    }
+}
+
+/// Snoozing a whole source — "not Slack, not now". See [`crate::quiet`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct QuietCfg {
+    /// How long the one-click snooze lasts. The API takes any duration up to 24h; this is
+    /// what the button in the rail uses.
+    pub default: String,
+    /// Severities **below** this are held back while a source is snoozed; this and above land
+    /// anyway.
+    ///
+    /// `critical` by default, and that default is the point: Slack is where a firing incident
+    /// arrives, so a Slack snooze that swallowed everything would be able to hide an outage.
+    /// It is the same rule `general.quiet_hours` already follows.
+    pub floor: String,
+}
+
+impl Default for QuietCfg {
+    fn default() -> Self {
+        Self {
+            default: "2h".into(),
+            floor: "critical".into(),
+        }
+    }
+}
+
+/// Clearing GitHub notifications that do not need you — the one thing this codebase writes.
+///
+/// See [`crate::tidy`] for why the "nothing is written back to GitHub" invariant survives
+/// this: everything that invariant protects is something a colleague can see, and your own
+/// notification inbox is not.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Tidy {
+    pub enabled: bool,
+    /// Report what would be cleared instead of clearing it. **Defaults to true**, so
+    /// switching this on produces a list rather than an emptied inbox.
+    pub dry_run: bool,
+    /// `read` marks the thread read (GitHub's default state change); `done` marks it done,
+    /// which is what the UI's Done button does and is harder to undo — hence not the default.
+    pub mode: String,
+    pub clear_ci: bool,
+    pub clear_merged: bool,
+    /// Keep `ci_activity` notifications whose run failed.
+    ///
+    /// On by default, and this is a judgement about the *purpose* rather than the letter of
+    /// "clear any ci_activity": a red run on a branch you own is the canonical thing that
+    /// needs your attention, and it arrives under the same reason as every green one. Set
+    /// false for the literal rule.
+    pub keep_failed_ci: bool,
+}
+
+impl Default for Tidy {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            dry_run: true,
+            mode: "read".into(),
+            clear_ci: true,
+            clear_merged: true,
+            keep_failed_ci: true,
+        }
+    }
+}
+
 /// Slack thread analysis — asked for by hand, answered by two models.
 ///
 /// Both are cloud tiers, which breaks the local-by-default rule on purpose: this only ever
@@ -791,7 +958,7 @@ impl Default for Reasoner {
     fn default() -> Self {
         Self {
             local: "ollama_local".into(),
-            local_model: "deepseek-coder:33b".into(),
+            local_model: "gemma4:31b".into(),
             vision_model: "qwen2.5vl:7b".into(),
             cloud: "claude".into(),
             cloud_model: "claude-opus-5".into(),
@@ -805,7 +972,7 @@ impl Default for Reasoner {
             cache: Cache::default(),
             ollama_url: "http://127.0.0.1:11434".into(),
             ollama_cloud_url: "https://ollama.com".into(),
-            ollama_model: "deepseek-coder:33b".into(),
+            ollama_model: "gemma4:31b".into(),
             embed_model: "nomic-embed-text".into(),
             local_only_sources: vec![],
         }
@@ -954,7 +1121,7 @@ mod tests {
         // except by an explicit ask, and difficulty routing — the one thing that would
         // escalate on its own — ships off.
         assert_eq!(cfg.reasoner.local, "ollama_local");
-        assert_eq!(cfg.reasoner.local_model, "deepseek-coder:33b");
+        assert_eq!(cfg.reasoner.local_model, "gemma4:31b");
         assert_eq!(cfg.reasoner.cloud_model, "claude-opus-4-8");
         assert!(
             !cfg.reasoner.routing.enabled,
@@ -979,7 +1146,7 @@ mod tests {
         // to the sub-table and fall back to defaults here — assert on a value the
         // example sets to something other than its default, so that ordering
         // mistake fails the build instead of quietly dropping settings.
-        assert_eq!(cfg.reasoner.ollama_model, "deepseek-coder:33b");
+        assert_eq!(cfg.reasoner.ollama_model, "gemma4:31b");
         assert_eq!(cfg.assigned.max_files, 6);
         assert_eq!(cfg.assigned.max_cache_mb, 5_000);
         assert_eq!(cfg.investigation.org, "restatedev");

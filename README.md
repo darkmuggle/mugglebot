@@ -76,7 +76,7 @@ See [AGENTS.md](AGENTS.md) for the full design and roadmap.
 
 **The local model does the work.** Every pass MuggleBot runs on its own —
 correlation, root cause, explanation, code indexing, tagging, live assist, chat —
-runs on `deepseek-coder:33b` via Ollama and nowhere else.
+runs on `gemma4:31b` via Ollama and nowhere else.
 
 **One exception: assigned-issue triage.** It runs on `claude-sonnet-5` through the
 subscription CLI bridge (`[reasoner] triage`), and the reason is queueing rather than
@@ -149,7 +149,7 @@ license to invent a link either.
 
 With no reachable reasoner at all, correlation, live-assist, and investigation
 degrade to deterministic behavior and the daemon keeps working. Pull the local
-model with `ollama pull deepseek-coder:33b`.
+model with `ollama pull gemma4:31b`.
 
 ## Assigned issues
 

@@ -33,9 +33,89 @@ use crate::signal::{ResolutionKey, Severity, Signal, SignalKind, Source};
 const API: &str = "https://slack.com/api";
 
 /// Keywords that escalate an alert-channel post to Critical.
+/// Words that make an unlabelled alert critical.
+///
+/// A **fallback**, consulted only when the alert carries no severity of its own — see
+/// [`alert_severity`]. Matched on whole words, because these were substring matches and it
+/// showed: `down` fired on `RegionEnvMeltdown` and `page` fired on the phrase "a real OOM,
+/// not reclaimable page cache". Both of those are alert *descriptions*, not alert severities.
 const CRITICAL_WORDS: &[&str] = &[
     "down", "outage", "critical", "page", "sev1", "sev0", "firing", "paging",
 ];
+
+/// Whole-word containment. Boundaries are anything not alphanumeric, so `down` matches
+/// "service down" and not "meltdown", and `sev1` still matches inside `[sev1]`.
+fn has_word(haystack: &str, needle: &str) -> bool {
+    let mut from = 0;
+    while let Some(rel) = haystack[from..].find(needle) {
+        let start = from + rel;
+        let end = start + needle.len();
+        let before_ok = haystack[..start]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !c.is_alphanumeric());
+        let after_ok = haystack[end..]
+            .chars()
+            .next()
+            .is_none_or(|c| !c.is_alphanumeric());
+        if before_ok && after_ok {
+            return true;
+        }
+        from = end;
+    }
+    false
+}
+
+/// The severity an alert states about *itself*, e.g. Grafana's `severity = warning` label.
+///
+/// Preferred over any keyword guess, because it is the alert author's own answer to the
+/// question being guessed at. 518 of 680 real Slack signals were classified Critical by the
+/// keyword fallback while carrying `severity = warning` in plain text a few lines down.
+fn labelled_severity(lower: &str) -> Option<Severity> {
+    let at = lower.find("severity")?;
+    let rest = lower[at + "severity".len()..].trim_start();
+    let rest = rest.strip_prefix('=').or_else(|| rest.strip_prefix(':'))?;
+    let value: String = rest
+        .trim_start()
+        .chars()
+        .take_while(|c| c.is_alphanumeric())
+        .collect();
+    match value.as_str() {
+        "critical" | "crit" | "fatal" | "emergency" | "page" => Some(Severity::Critical),
+        // `error` is a warning here rather than critical: it is the level most alert authors
+        // use for "somebody look at this today", and treating it as an outage is what made
+        // this classifier untrustworthy in the first place.
+        "warning" | "warn" | "error" | "high" | "major" => Some(Severity::Warning),
+        "info" | "informational" | "low" | "minor" | "none" => Some(Severity::Info),
+        _ => None,
+    }
+}
+
+/// Has this alert already recovered?
+///
+/// A resolved alert is news that something *stopped* being wrong. It was being classified
+/// Critical — `[RESOLVED] RegionEnvMeltdown` hit `down` inside "Meltdown" — which is the
+/// clearest possible case of a severity meaning the opposite of what it says.
+fn is_resolved(lower: &str) -> bool {
+    lower.contains("[resolved]") || lower.contains("**resolved**") || lower.contains("[ok]")
+}
+
+/// What severity an alert message deserves: what it says about itself, else a keyword guess.
+fn alert_severity(lower: &str) -> Severity {
+    // Resolution wins over everything, including a `severity = critical` label: the label
+    // describes the condition, and the condition is over.
+    if is_resolved(lower) {
+        return Severity::Info;
+    }
+    if let Some(s) = labelled_severity(lower) {
+        return s;
+    }
+    if CRITICAL_WORDS.iter().any(|w| has_word(lower, w)) {
+        Severity::Critical
+    } else {
+        Severity::Warning
+    }
+}
 
 pub struct SlackWatcher {
     client: reqwest::Client,
@@ -568,12 +648,7 @@ pub fn normalize_message(
     let keyword_hit = keywords.iter().any(|k| lower.contains(k.as_str()));
 
     let (kind, severity) = if is_alert {
-        let sev = if CRITICAL_WORDS.iter().any(|w| lower.contains(w)) {
-            Severity::Critical
-        } else {
-            Severity::Warning
-        };
-        (SignalKind::Alert, sev)
+        (SignalKind::Alert, alert_severity(&lower))
     } else if mentions_me {
         (SignalKind::Mention, Severity::Notice)
     } else if keyword_hit {
@@ -1007,6 +1082,161 @@ fn ts_to_datetime(ts: &str) -> Option<DateTime<Utc>> {
         .and_then(|f| f.parse().ok())
         .unwrap_or(0);
     DateTime::from_timestamp(secs, micros * 1000)
+}
+
+#[cfg(test)]
+mod severity_tests {
+    use super::{alert_severity, has_word, is_resolved, labelled_severity};
+    use crate::signal::Severity;
+
+    /// The alert's own label beats any guess from its prose. This exact shape — a Grafana
+    /// notification stating `severity = warning` — was being classified Critical, and 518 of
+    /// 680 real Slack signals were in that state.
+    #[test]
+    fn an_alert_that_states_its_own_severity_is_believed() {
+        let body = "[firing:1] tenantstoragehigh restate cloud alerts (environment env-201k                     tenant warning)\nvalue: pct_used=91.2\nlabels:\n - alertname =                     tenantstoragehigh\n - scope = tenant\n - severity = warning\n";
+        assert_eq!(labelled_severity(body), Some(Severity::Warning));
+        assert_eq!(
+            alert_severity(body),
+            Severity::Warning,
+            "the label must beat the `firing` keyword"
+        );
+    }
+
+    #[test]
+    fn a_labelled_critical_alert_is_critical() {
+        let body = "[firing:1] regionenvnotready\nlabels:\n - severity = critical\n";
+        assert_eq!(alert_severity(body), Severity::Critical);
+    }
+
+    /// The clearest case of a severity meaning the opposite of what it says.
+    /// `[RESOLVED] RegionEnvMeltdown` was Critical, because `down` matched inside "Meltdown".
+    #[test]
+    fn a_resolved_alert_is_not_critical() {
+        let body = "[resolved] regionenvmeltdown doss-prod-us-central1\n**resolved**\n                    labels:\n - severity = critical\n";
+        assert!(is_resolved(body));
+        assert_eq!(
+            alert_severity(body),
+            Severity::Info,
+            "resolution beats even a critical label — the condition is over"
+        );
+    }
+
+    /// The two real substring collisions, both inside alert *descriptions*.
+    #[test]
+    fn keywords_match_whole_words_only() {
+        // `down` inside "Meltdown".
+        assert!(!has_word("regionenvmeltdown doss-prod", "down"));
+        assert!(has_word("the region is down right now", "down"));
+        // `page` inside "page cache" is a real word — but the alert that tripped on it also
+        // stated its own severity, which is what now decides.
+        let oom = "tenantpodoomkilled — a real oom, not reclaimable page cache. the pod                    recovered.\nlabels:\n - severity = warning\n";
+        assert_eq!(alert_severity(oom), Severity::Warning);
+    }
+
+    #[test]
+    fn word_matching_still_finds_bracketed_and_alphanumeric_tokens() {
+        assert!(has_word("[sev1] payments failing", "sev1"));
+        assert!(has_word("service outage, paging on-call", "paging"));
+        assert!(!has_word("severity1 is not sev1x", "sev1"));
+    }
+
+    /// An alert with no label of its own still gets the keyword fallback — that path is the
+    /// reason the list exists, not something being removed.
+    #[test]
+    fn an_unlabelled_alert_falls_back_to_keywords() {
+        let body = "*firing*\nvalue: fire=1, pct_used=50.57";
+        assert_eq!(labelled_severity(body), None);
+        assert_eq!(alert_severity(body), Severity::Critical);
+        // And an unlabelled alert with no keyword at all is a warning, not a guess upward.
+        assert_eq!(alert_severity("disk usage is at 61%"), Severity::Warning);
+    }
+
+    /// A rule that says it has no severity label must not be read as having one.
+    #[test]
+    fn the_words_no_severity_label_are_not_a_severity() {
+        let body = "this rule pages (no severity label set) when the region trips";
+        assert_eq!(labelled_severity(body), None);
+        // Falls through to keywords, where `pages` is not the word `page`.
+        assert_eq!(alert_severity(body), Severity::Warning);
+    }
+}
+
+/// Re-classify every real Slack alert in the store and report how the counts move.
+///
+/// The keyword classifier put 518 of 680 signals at Critical, which made a Slack snooze a
+/// no-op — everything claimed to be an outage, and the snooze's floor lets outages through.
+/// This measures the same corpus against the same code that now ships.
+///
+/// ```text
+/// cargo test reclassifies_the_real_slack_corpus -- --ignored --nocapture
+/// ```
+#[cfg(test)]
+mod corpus {
+    use super::alert_severity;
+    use crate::signal::Severity;
+    use std::collections::BTreeMap;
+
+    #[test]
+    #[ignore]
+    fn reclassifies_the_real_slack_corpus() {
+        let db = std::env::var("MUGGLEBOT_DB").unwrap_or_else(|_| "data/mugglebot.sqlite".into());
+        let conn = rusqlite::Connection::open(&db).expect("open the store");
+        let mut stmt = conn
+            .prepare(
+                "SELECT severity, COALESCE(body, title) FROM signals \
+                 WHERE source='slack' AND kind='\"alert\"'",
+            )
+            .unwrap();
+        let rows: Vec<(String, String)> = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect();
+        assert!(!rows.is_empty(), "no Slack alerts in {db}");
+
+        let mut before: BTreeMap<String, usize> = BTreeMap::new();
+        let mut after: BTreeMap<String, usize> = BTreeMap::new();
+        for (stored, text) in &rows {
+            *before
+                .entry(stored.trim_matches('"').to_string())
+                .or_default() += 1;
+            let sev = alert_severity(&text.to_ascii_lowercase());
+            *after.entry(format!("{sev:?}").to_lowercase()).or_default() += 1;
+        }
+        println!("{} Slack alert signal(s)\n", rows.len());
+        println!("{:<10} {:>8} {:>8}", "severity", "before", "after");
+        for level in ["info", "notice", "warning", "critical"] {
+            println!(
+                "{level:<10} {:>8} {:>8}",
+                before.get(level).copied().unwrap_or(0),
+                after.get(level).copied().unwrap_or(0)
+            );
+        }
+        let crit_before = before.get("critical").copied().unwrap_or(0);
+        let crit_after = after.get("critical").copied().unwrap_or(0);
+        println!(
+            "\ncritical: {crit_before} -> {crit_after} ({:.0}% -> {:.0}% of the feed)",
+            100.0 * crit_before as f64 / rows.len() as f64,
+            100.0 * crit_after as f64 / rows.len() as f64
+        );
+        assert!(
+            crit_after < crit_before,
+            "the whole point is that fewer things claim to be outages"
+        );
+        // And the ones still critical must be genuinely so — spot-check that none of them is
+        // a resolved alert, which is the case that was most obviously wrong.
+        for (_, text) in &rows {
+            let lower = text.to_ascii_lowercase();
+            if alert_severity(&lower) == Severity::Critical {
+                assert!(
+                    !super::is_resolved(&lower),
+                    "a resolved alert is still critical: {}",
+                    lower.chars().take(80).collect::<String>()
+                );
+            }
+        }
+    }
 }
 
 #[cfg(test)]

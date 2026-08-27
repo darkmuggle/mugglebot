@@ -1079,6 +1079,7 @@ mod tests {
             children: vec![],
             pull_requests: vec![],
             explanations: vec![],
+            cloud: vec![],
             attention: crate::subject::Attention {
                 needed: false,
                 reason: None,

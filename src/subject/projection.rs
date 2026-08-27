@@ -70,6 +70,10 @@ impl Board {
         // board renders.
         let pull_requests = self.store.pr_fixes_for_issue(key.as_str())?;
         let explanations = self.store.explanations(key.as_str())?;
+        // Cache reads only — the `rcc` lookups happen on the scheduler's sweep. An id the
+        // sweep has not reached yet is simply absent, so a view is never blocked on a
+        // subprocess.
+        let cloud = self.store.cloud_entities_for_subject(key.as_str())?;
         // Passed in rather than re-queried: `attention` needs the same critiques to
         // count judged PRs and attribute their cost, and the board renders every subject
         // on every push.
@@ -109,6 +113,7 @@ impl Board {
             children,
             pull_requests,
             explanations,
+            cloud,
             attention,
         }))
     }

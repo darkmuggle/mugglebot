@@ -31,6 +31,11 @@ pub const CONTEXT_REFRESH: &str = "context-refresh";
 pub const CONTEXTS_DIR: &str = "contexts-dir";
 pub const BROWSER_QUEUE: &str = "browser-queue";
 pub const TRIAGE_QUEUE: &str = "triage-queue";
+/// Reads the Restate Cloud ids ingest has seen. See [`crate::cloud`].
+pub const CLOUD_RESOLVE: &str = "cloud-resolve";
+/// Returns subjects to the board when their snooze runs out. See
+/// [`crate::store::Store::wake_lapsed_snoozes`].
+pub const SNOOZE_LAPSE: &str = "snooze-lapse";
 /// Arms a `RepoIndexer` per repo. A task rather than a boot-time loop because the org's
 /// repo list grows: a repo added after boot has to get an indexer without a restart.
 pub const CODE_INDEX: &str = "code-index";
@@ -69,6 +74,14 @@ fn cadence(task: &str) -> Duration {
         // be tight.
         CONTEXTS_DIR => Duration::from_secs(15),
         BROWSER_QUEUE | TRIAGE_QUEUE => Duration::from_secs(15),
+        // Tight, because the box is wanted while the operator is still reading the message
+        // that mentioned the id — but not on the 15s queues' cadence, since a tick that
+        // finds work shells out to a CLI several times and the cache makes idle ticks free.
+        CLOUD_RESOLVE => Duration::from_secs(30),
+        // A minute is the resolution a snooze is worth. Nobody picks "30 minutes" and means
+        // it to the second, and an idle tick is one indexed read that finds nothing — but
+        // waking half an hour late would make the duration a suggestion rather than a term.
+        SNOOZE_LAPSE => Duration::from_secs(60),
         // Arming is idempotent and cheap; each indexer then runs on its own cadence.
         CODE_INDEX => Duration::from_secs(600),
         _ => Duration::from_secs(300),
@@ -227,6 +240,21 @@ async fn dispatch(ops: &IngestOps, task: &str) -> u64 {
                 tracing::warn!("contexts dir sync failed: {e:#}");
             }
         }
+        CLOUD_RESOLVE => {
+            // Like the contexts-dir sweep, this is work rather than a submission: reading an
+            // id is one bounded subprocess whose result is a cache row, so wrapping each in a
+            // workflow would buy durability for something a retry reproduces exactly.
+            if let Err(e) = ops.resolve_cloud_entities().await {
+                tracing::warn!("cloud entity resolution failed: {e:#}");
+            }
+        }
+        SNOOZE_LAPSE => {
+            // Work rather than a submission, like the two above: it is one UPDATE, and a
+            // retry reproduces it exactly.
+            if let Err(e) = ops.wake_lapsed_snoozes() {
+                tracing::warn!("waking lapsed snoozes failed: {e:#}");
+            }
+        }
         BROWSER_QUEUE => {
             // One queue, two tiers. Which workflow reads an investigation is a property of
             // the row, so a Grafana read escalated to the browser is picked up here on the
@@ -243,6 +271,12 @@ async fn dispatch(ops: &IngestOps, task: &str) -> u64 {
             // a separate scheduler for one more list would be a second thing to keep armed.
             for id in ops.pending_thread_analyses() {
                 started += submit(ops, "ThreadAnalyse", &id, scopes::THREAD).await;
+            }
+            // Branch review passes ride the same 15s sweep. Operator-initiated, so the latency
+            // that matters is seconds — and a panel of five personas queues in its own scope
+            // rather than arriving as one burst.
+            for id in ops.pending_branch_passes() {
+                started += submit(ops, "BranchReview", &id, scopes::REVIEW).await;
             }
         }
         COMMIT_POLL => {

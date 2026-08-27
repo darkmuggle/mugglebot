@@ -54,6 +54,7 @@ pub async fn serve(
         .bind(workflows::rest::BrowserRead::new(wf.clone()))
         .bind(workflows::rest::GrafanaRead::new(wf.clone()))
         .bind(workflows::rest::ThreadAnalyse::new(wf.clone()))
+        .bind(workflows::rest::BranchReview::new(wf.clone()))
         .bind(workflows::rest::PrCritique::new(wf.clone()))
         .bind(workflows::rest::PrDiff::new(wf.clone()))
         .bind(workflows::rest::RepoIndex::new(wf.clone()))

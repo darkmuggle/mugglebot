@@ -8,6 +8,8 @@ import {
   Show,
 } from "solid-js";
 import { api } from "../api";
+import { ago, stamp } from "../format";
+import { Empty, Page } from "./ui";
 import {
   isBusy,
   patchHandled,
@@ -137,18 +139,6 @@ function provenance(t: SubjectView): string {
   const n = t.signals.length;
   const events = `${n} event${n === 1 ? "" : "s"}`;
   return actor ? `${actor} · ${events}` : events;
-}
-
-/// Coarse relative time. On a row the question is "is this today's problem", not
-/// which second it landed — the exact timestamp is one hover away.
-function ago(iso: string): string {
-  const mins = Math.round((Date.now() - new Date(iso).getTime()) / 60000);
-  if (mins < 1) return "now";
-  if (mins < 60) return `${mins}m`;
-  const hours = Math.round(mins / 60);
-  if (hours < 24) return `${hours}h`;
-  const days = Math.round(hours / 24);
-  return days < 7 ? `${days}d` : `${Math.round(days / 7)}w`;
 }
 
 /// One subject as one row: what it is, what it wants, who moved it, when.
@@ -302,7 +292,7 @@ function Card(props: {
             </span>
           </span>
         </Show>
-        <time class="card-when" data-tip={new Date(t().updated_at).toLocaleString()}>
+        <time class="card-when" data-tip={stamp(t().updated_at)}>
           {ago(t().updated_at)}
         </time>
       </div>
@@ -414,6 +404,18 @@ async function triage(t: SubjectView, handled: "acknowledged" | "snoozed") {
   await api.setHandled(t.key, handled).catch(() => {});
 }
 
+/// Snooze many subjects at once, for a while.
+///
+/// One request rather than one per row: the single-subject route rebuilds and rebroadcasts
+/// the whole board on every call, so looping it would redraw a part-triaged board forty-one
+/// times. The optimistic patch is still per key, because that is what makes the rows leave
+/// the instant the button is pressed.
+async function snoozeMany(keys: string[], minutes: number) {
+  const until = new Date(Date.now() + minutes * 60_000).toISOString();
+  for (const k of keys) patchHandled(k, "snoozed");
+  await api.setHandledBulk(keys, "snoozed", until).catch(() => {});
+}
+
 /// Bring handled work back onto the board, fully open.
 ///
 /// Un-handling means un-handled. This used to set `acknowledged`, which is *still
@@ -423,26 +425,63 @@ async function reopen(t: SubjectView) {
   await api.setHandled(t.key, "open").catch(() => {});
 }
 
+/// The sources a subject can carry a signal from, for the board's own filter strip.
+const SOURCES = ["github", "slack", "granola", "incident_io"] as const;
+
+/// How long a bulk snooze runs for, and the default.
+///
+/// Durations rather than the indefinite snooze the `s` key applies, because the two are
+/// different acts. Pressing `s` on a row you have read is a judgement about that thread —
+/// "off the board until it moves". Clearing forty alert threads you have *not* read is
+/// "not now", and not-now needs an end: an indefinite bulk snooze is how a board silently
+/// becomes a list of things nobody will ever look at again.
+const SNOOZE_FOR = [
+  { label: "30 minutes", mins: 30 },
+  { label: "2 hours", mins: 120 },
+  { label: "8 hours", mins: 480 },
+  { label: "24 hours", mins: 1440 },
+];
+const SNOOZE_DEFAULT = 120;
+
+/// Whether a subject is critical, by the same aggregate the lanes already sort on.
+///
+/// The board's own version of the guard `quiet.rs` puts on a source snooze: silencing Slack
+/// must not be able to hide a firing incident, and Slack is exactly where one arrives. A bulk
+/// snooze is the same risk with more of the operator's attention removed — nobody reads
+/// forty rows before clearing them — so criticals are held back by default and *named*,
+/// rather than either swept up silently or made unsnoozable.
+const isCritical = (t: SubjectView) => t.severity === "critical";
+
 export default function Board(props: {
   onOpen: (id: string) => void;
   // When set, show only threads carrying a signal from this source.
   sourceFilter?: string | null;
+  onSourceFilter: (src: string | null) => void;
 }) {
   // Resolved and snoozed subjects are handled — off the main board (the backend
   // already excludes them; doing it here too makes triage feel instant). A subject
   // merged away forwards its activity to the canonical one, so it isn't a row either.
-  const active = createMemo(() =>
-    Object.values(subjects)
-      .filter(
-        (t) =>
-          t.handled !== "resolved" && t.handled !== "snoozed" && !t.same_as,
-      )
-      .filter(
-        (t) =>
-          !props.sourceFilter ||
-          t.signals.some((s) => s.source === props.sourceFilter),
-      ),
+  const unfiltered = createMemo(() =>
+    Object.values(subjects).filter(
+      (t) => t.handled !== "resolved" && t.handled !== "snoozed" && !t.same_as,
+    ),
   );
+
+  const active = createMemo(() =>
+    unfiltered().filter(
+      (t) =>
+        !props.sourceFilter ||
+        t.signals.some((s) => s.source === props.sourceFilter),
+    ),
+  );
+
+  /// How many subjects each source would leave on the board.
+  ///
+  /// On the chip rather than only in the rail, because the number that matters when choosing a
+  /// filter is "how much is behind this", and a filter that turns out to be empty is a click
+  /// you should not have had to make to find out.
+  const sourceCount = (src: string) =>
+    unfiltered().filter((t) => t.signals.some((s) => s.source === src)).length;
 
   // A lane, split by type and newest-first within each.
   //
@@ -496,6 +535,11 @@ export default function Board(props: {
     if (next) await loadHandled();
     else setHandled([]);
   }
+
+  // The bulk-snooze modal. A modal rather than a `confirm()` like the board reset, because
+  // this one has choices to make — how long, and whether the criticals come too — and a
+  // confirm dialog can only ask yes or no about a decision already taken.
+  const [bulkSnooze, setBulkSnooze] = createSignal(false);
 
   // Reset the board: delete persisted events and their derived analysis. The
   // authoritative `board` WS event reconciles the store on its own.
@@ -599,57 +643,118 @@ export default function Board(props: {
       : {};
 
   return (
-    <div class="board">
-      <div class="board-head">
-        <h1 class="board-title">Board</h1>
-        <span class="board-counts">
+    <Page
+      class="board"
+      title="Board"
+      subtitle={
+        <>
           {active().length} open
           <Show when={decideCount()}>
             {" · "}
-            <b>{decideCount()} to decide</b>
+            <b class="board-decide">{decideCount()} to decide</b>
           </Show>
-          <Show when={props.sourceFilter}>
-            {" · "}
-            {props.sourceFilter}
+        </>
+      }
+      actions={
+        <>
+          {/* Pick the person once, then sweep. Reviewing as somebody is a mode you work in for
+              a few minutes — per-row pickers would mean choosing them again on every card, and
+              the question ("where would Pavel push back?") is about the lane, not the row. */}
+          <Show when={profiled().length}>
+            <select
+              class="review-as"
+              classList={{ on: !!reviewAs() }}
+              value={reviewAs() ?? ""}
+              data-tip="Predict how one person would respond to each issue and pull request"
+              onChange={(e) => setReviewAs(e.currentTarget.value || null)}
+            >
+              <option value="">review as…</option>
+              <For each={profiled()}>
+                {(p) => <option value={p.slug}>as {p.display_name}</option>}
+              </For>
+            </select>
           </Show>
-        </span>
-        <span class="board-spacer" />
-        {/* Pick the person once, then sweep. Reviewing as somebody is a mode you work in for a
-            few minutes — per-row pickers would mean choosing them again on every card, and the
-            question ("where would Pavel push back?") is about the lane, not the row. */}
-        <Show when={profiled().length}>
-          <select
-            class="review-as"
-            classList={{ on: !!reviewAs() }}
-            value={reviewAs() ?? ""}
-            data-tip="Predict how one person would respond to each issue and pull request"
-            onChange={(e) => setReviewAs(e.currentTarget.value || null)}
+          <button classList={{ on: showHandled() }} onClick={toggleHandled}>
+            {showHandled() ? "Hide handled" : "Show handled"}
+          </button>
+          <Show when={showHandled()}>
+            <button onClick={loadHandled}>Refresh</button>
+          </Show>
+          <button class="destructive" disabled={resetting()} onClick={resetBoard}>
+            {resetting() ? "Resetting…" : "Reset board"}
+          </button>
+        </>
+      }
+    >
+      {/* Which sources the board is showing. This used to live in the navigation rail, where
+          clicking a source both filtered the board *and* navigated you to it from wherever you
+          were — a global control that moved you. Filtering a list belongs on the list; what
+          stayed in the rail is the part that is genuinely global, whether a source is healthy
+          and whether it is snoozed. */}
+      <div class="board-filter">
+        <button
+          class="chip chip-link"
+          classList={{ active: !props.sourceFilter }}
+          onClick={() => props.onSourceFilter(null)}
+        >
+          all
+        </button>
+        <For each={SOURCES}>
+          {(src) => (
+            <button
+              class={`chip chip-link src src-${src}`}
+              classList={{ active: props.sourceFilter === src }}
+              onClick={() =>
+                props.onSourceFilter(props.sourceFilter === src ? null : src)
+              }
+            >
+              {src}
+              <span class="chip-count">{sourceCount(src)}</span>
+            </button>
+          )}
+        </For>
+
+        {/* The bulk action sits on the filter strip because the filter is what scopes it.
+            "Snooze everything showing" is only a sentence you can act on next to the thing
+            that decides what showing means — put anywhere else it would be a button whose
+            blast radius you have to go and look up. */}
+        <Show when={active().length > 1}>
+          <button
+            class="chip chip-link bulk-snooze"
+            onClick={() => setBulkSnooze(true)}
+            data-tip={`Snooze the ${active().length} threads this filter is showing`}
           >
-            <option value="">review as…</option>
-            <For each={profiled()}>
-              {(p) => <option value={p.slug}>as {p.display_name}</option>}
-            </For>
-          </select>
+            {/* Named after the filter, because that is the sentence the operator arrived
+                with. "snooze all slack" is a thing you come to the board wanting to do; a
+                control labelled `snooze showing…` is the right *mechanism* for it and does
+                not answer to the name, so it reads as unrelated and goes unfound. The count
+                comes too — it is the difference between a button and a promise. */}
+            snooze {active().length}
+            {props.sourceFilter ? ` ${props.sourceFilter}` : ""}…
+          </button>
         </Show>
-        <button classList={{ on: showHandled() }} onClick={toggleHandled}>
-          {showHandled() ? "Hide handled" : "Show handled"}
-        </button>
-        <Show when={showHandled()}>
-          <button onClick={loadHandled}>Refresh</button>
-        </Show>
-        <button class="danger" disabled={resetting()} onClick={resetBoard}>
-          {resetting() ? "Resetting…" : "Reset board"}
-        </button>
       </div>
+
+      <Show when={bulkSnooze()}>
+        <BulkSnoozeModal
+          showing={active()}
+          scope={props.sourceFilter}
+          onCancel={() => setBulkSnooze(false)}
+          onConfirm={(keys, minutes) => {
+            setBulkSnooze(false);
+            void snoozeMany(keys, minutes);
+          }}
+        />
+      </Show>
 
       <Show
         when={active().length}
         fallback={
-          <div class="empty">
+          <Empty kind={props.sourceFilter ? "clear" : "waiting"}>
             {props.sourceFilter
               ? `Nothing from ${props.sourceFilter}.`
               : "Awaiting signals…"}
-          </div>
+          </Empty>
         }
       >
         <For each={LANES}>
@@ -753,6 +858,148 @@ export default function Board(props: {
           </Show>
         </section>
       </Show>
+    </Page>
+  );
+}
+
+/// How long, and whether the criticals come too.
+///
+/// The two things this has to say before anything happens are *how many* and *which ones are
+/// being kept back*, because a bulk snooze is the one triage action taken without reading the
+/// rows. Everything else here is a duration.
+function BulkSnoozeModal(props: {
+  /// Exactly what the board is showing under the current filter — the scope of the action.
+  showing: SubjectView[];
+  /// The source filter that scoped it, for naming what "showing" means.
+  scope: string | null | undefined;
+  onCancel: () => void;
+  onConfirm: (keys: string[], minutes: number) => void;
+}) {
+  const [minutes, setMinutes] = createSignal(SNOOZE_DEFAULT);
+  // Off by default, and a deliberate second act to turn on — the same shape as the source
+  // snooze's `everything` floor, which is askable but never the default.
+  const [includeCritical, setIncludeCritical] = createSignal(false);
+
+  const critical = createMemo(() => props.showing.filter(isCritical));
+  const chosen = createMemo(() =>
+    includeCritical() ? props.showing : props.showing.filter((t) => !isCritical(t)),
+  );
+
+  const onKey = (e: KeyboardEvent) => {
+    if (e.key === "Escape") props.onCancel();
+  };
+  document.addEventListener("keydown", onKey);
+  onCleanup(() => document.removeEventListener("keydown", onKey));
+
+  const forLabel = () =>
+    SNOOZE_FOR.find((d) => d.mins === minutes())?.label ?? `${minutes()}m`;
+
+  return (
+    <div class="modal-backdrop" onClick={props.onCancel}>
+      <div
+        class="modal snooze-modal"
+        role="dialog"
+        aria-modal="true"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div class="modal-head">
+          <span class="cloud-kind">bulk triage</span>
+          <button class="modal-close" data-tip="Close (Esc)" onClick={props.onCancel}>
+            ✕
+          </button>
+        </div>
+        <h3 class="modal-title">
+          Snooze {chosen().length} thread{chosen().length === 1 ? "" : "s"}
+        </h3>
+        <div class="modal-meta">
+          {props.scope ? (
+            <>
+              everything showing from <code>{props.scope}</code>
+            </>
+          ) : (
+            <>everything showing on the board</>
+          )}
+        </div>
+
+        <div class="modal-field">
+          <span class="modal-label">For</span>
+          <div class="modal-options">
+            <For each={SNOOZE_FOR}>
+              {(d) => (
+                <button
+                  class="chip"
+                  classList={{ active: minutes() === d.mins }}
+                  onClick={() => setMinutes(d.mins)}
+                >
+                  {d.label}
+                </button>
+              )}
+            </For>
+          </div>
+          {/* Said before the button is pressed: this is the half of "snooze until" that only
+              works because the daemon sweeps for lapsed snoozes. Without that sentence a
+              duration reads like a guess about when you will next look. */}
+          <p class="muted modal-note">
+            They come back on their own in {forLabel()}. Re-entering one — a reply, a review,
+            anything you are personally in — brings it back sooner.
+          </p>
+        </div>
+
+        <Show when={critical().length}>
+          <div class="modal-field">
+            <span class="modal-label">Critical</span>
+            <div class="modal-options">
+              <button
+                class="chip"
+                classList={{ active: !includeCritical() }}
+                onClick={() => setIncludeCritical(false)}
+              >
+                keep {critical().length} on the board
+              </button>
+              <button
+                class="chip destructive"
+                classList={{ active: includeCritical() }}
+                onClick={() => setIncludeCritical(true)}
+              >
+                snooze them too
+              </button>
+            </div>
+            {/* The guard, and the reason it can be overridden. A safe default that cannot be
+                argued with is a tool arguing with its operator — but silencing a firing
+                incident should take a second click and be named while you take it. */}
+            <p class="muted modal-note">
+              <Show
+                when={includeCritical()}
+                fallback={
+                  <>
+                    Critical threads stay — a snooze should not be what hides an outage. This
+                    is the same floor the source snooze applies.
+                  </>
+                }
+              >
+                <strong>{critical().length} critical</strong> will be silenced too. Whatever is
+                firing goes off the board for {forLabel()}.
+              </Show>
+            </p>
+          </div>
+        </Show>
+
+        <div class="modal-actions">
+          <button onClick={props.onCancel}>cancel</button>
+          <button
+            class="mutating"
+            disabled={!chosen().length}
+            data-tip={
+              chosen().length
+                ? `Takes ${chosen().length} off the board for ${forLabel()}`
+                : "Nothing left to snooze once the criticals are kept"
+            }
+            onClick={() => props.onConfirm(chosen().map((t) => t.key), minutes())}
+          >
+            snooze {chosen().length}
+          </button>
+        </div>
+      </div>
     </div>
   );
 }

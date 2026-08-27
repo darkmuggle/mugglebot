@@ -76,6 +76,81 @@ impl BrowserRead {
     }
 }
 
+// ---- BranchReview ------------------------------------------------------------
+
+/// One reviewer's pass over one branch — the model's own read, or a persona's predicted one.
+///
+/// Keyed by pass id. The *duplicate* suppression lives in the table's unique
+/// `(branch, sha, reviewer, provider, model)`, which is where it belongs: asking the same
+/// reviewer on the same model about the same commit hands back the existing row instead of
+/// queueing a second pass, so the key here only has to identify the work.
+pub struct BranchReview {
+    ops: Arc<WorkflowOps>,
+}
+
+impl BranchReview {
+    pub fn new(ops: Arc<WorkflowOps>) -> Self {
+        Self { ops }
+    }
+    pub const SCOPE: &'static str = scopes::REVIEW;
+}
+
+#[restate_sdk::workflow]
+impl BranchReview {
+    /// Two attempts. A review is several model calls; retrying a panel four times over a
+    /// transient blip is a lot of work for a question asked once, and the failure is recorded
+    /// on the pass where the operator can see it and ask again.
+    #[handler(invocation_retry_policy(max_attempts = 2))]
+    async fn run(&self, ctx: WorkflowContext<'_>) -> HandlerResult<Json<serde_json::Value>> {
+        let key = ctx.key().to_string();
+        super::tracked("BranchReview", &key, self.review(ctx)).await
+    }
+}
+
+impl BranchReview {
+    async fn review(&self, ctx: WorkflowContext<'_>) -> HandlerResult<Json<serde_json::Value>> {
+        let id = ctx.key().to_string();
+        let ops = self.ops.clone();
+        let value = ctx
+            .run(|| {
+                let ops = ops.clone();
+                let id = id.clone();
+                async move {
+                    let out = ops.branch_review(&id).await.map_err(review_classify)?;
+                    Ok(Json(out))
+                }
+            })
+            .await?
+            .into_inner();
+        Ok(Json(value))
+    }
+}
+
+/// A missing branch, a missing persona, or a branch that moved will not start working on a
+/// retry — and the reason is already on the pass, so the operator reads it rather than four
+/// copies of it. A model timing out is worth one more go.
+fn review_classify(e: anyhow::Error) -> HandlerError {
+    let msg = format!("{e:#}");
+    let lower = msg.to_ascii_lowercase();
+    let terminal = [
+        "no such review pass",
+        "no branch",
+        "no persona",
+        "nothing to review",
+        "needs a stored",
+        "while this was queued",
+        "is the base branch",
+        "404",
+    ]
+    .iter()
+    .any(|m| lower.contains(m));
+    if terminal {
+        HandlerError::from(TerminalError::new(msg))
+    } else {
+        HandlerError::from(anyhow::anyhow!(msg))
+    }
+}
+
 // ---- ThreadAnalyse -----------------------------------------------------------
 
 /// Read one Slack thread with two models and record what they said.

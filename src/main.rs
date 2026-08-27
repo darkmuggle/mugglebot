@@ -13,6 +13,7 @@ mod agent;
 mod browser;
 mod chat;
 mod checkout;
+mod cloud;
 mod codeindex;
 mod comments;
 mod components;
@@ -25,6 +26,7 @@ mod ecosystem;
 mod embed;
 mod enrich;
 mod event;
+mod ghreview;
 mod github;
 mod grafana;
 mod incident;
@@ -36,6 +38,8 @@ mod notify;
 mod persona;
 mod prdiff;
 mod prfix;
+mod pty;
+mod quiet;
 mod reasoner;
 mod repos;
 mod restate;
@@ -48,11 +52,12 @@ mod store;
 mod subject;
 mod tags;
 mod thread;
+mod tidy;
 mod tools;
 mod triage;
 mod watchers;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use clap::Parser;
 use std::sync::Arc;
 use std::time::Duration;
@@ -89,10 +94,65 @@ struct Cli {
     /// Path to the TOML config file.
     #[arg(short, long, env = "MUGGLEBOT_CONFIG", default_value = "config.toml")]
     config: String,
+    /// A one-shot maintenance command. Omit to run the daemon.
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(clap::Subcommand)]
+enum Command {
+    /// Pre-cache every Restate Cloud entity, so the first mention of an id renders a full
+    /// context box instead of an empty one waiting on a subprocess.
+    ///
+    /// Enumerates the estate through `rcc regions` / `rcc list-envs` and reads each entity
+    /// once. Safe to interrupt and safe to re-run: anything already cached and fresh is
+    /// skipped, so a second pass costs only what expired.
+    CloudWarm {
+        /// Concurrent `rcc`/`nuon` invocations.
+        #[arg(long, default_value_t = 8)]
+        concurrency: usize,
+    },
+    /// Apply a resource override to an environment state document — **`rcc edit`'s editor**,
+    /// not a command to run by hand.
+    ///
+    /// `rcc edit` is GetState → `$EDITOR <file>` → PutState, optimistically locked and
+    /// validated server-side. That is the only supported way to change stored state, and it
+    /// is interactive by construction. Standing in as the editor is what makes it scriptable
+    /// without inventing a second write path: the lock, the validation, the redacted-secret
+    /// round trip and the delete-confirmation are all still `rcc`'s.
+    ///
+    /// Exits non-zero to abort, which `rcc` handles by writing nothing at all.
+    #[command(hide = true)]
+    CloudSetResources {
+        /// Memory per node, GiB — sets the request and the limit together.
+        #[arg(long)]
+        memory: Option<u32>,
+        /// Storage floor, GiB. A floor, not a size: volumes never shrink.
+        #[arg(long)]
+        storage: Option<u32>,
+        /// The document `rcc` is editing. Appended by `rcc` itself.
+        file: std::path::PathBuf,
+    },
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Before *anything* is set up, because this one is not MuggleBot starting — it is
+    // `rcc`'s `$EDITOR`, running for a few milliseconds inside a terminal the operator is
+    // watching, on a temp file. It needs no config, no data directory and no store, and
+    // taking them would be actively wrong: the banner and the store path would land in the
+    // middle of the edit, and opening the SQLite file would put a second writer on it for no
+    // reason while the daemon that launched this is still running.
+    let cli = Cli::parse();
+    if let Some(Command::CloudSetResources {
+        memory,
+        storage,
+        file,
+    }) = &cli.command
+    {
+        return set_resources(*memory, *storage, file);
+    }
+
     // Logs go to stderr so stdout stays clean for the MCP stdio transport, through
     // a writer that rewrites known secret values out of the stream. Field-level
     // redaction only protects the call sites that remember to ask for it; the
@@ -106,7 +166,6 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    let cli = Cli::parse();
     let cfg =
         Config::load(&cli.config).with_context(|| format!("loading config from {}", cli.config))?;
     let cfg = Arc::new(cfg);
@@ -119,6 +178,13 @@ async fn main() -> Result<()> {
     let db_path = data_dir.join("mugglebot.sqlite");
     let store = Arc::new(Store::open(&db_path).context("opening store")?);
     info!("store: {}", db_path.display());
+
+    // One-shot commands run against the store and exit, before any watcher, workflow or
+    // endpoint is armed — none of that is what they need, and arming it would mean a
+    // maintenance command competing with a running daemon for the Restate endpoint port.
+    if let Some(command) = cli.command {
+        return run_command(command, &cfg, store).await;
+    }
 
     // The credential store. Read at point of use, never cached at boot, so a token
     // rotated through the config page takes effect on the next poll.
@@ -304,6 +370,20 @@ async fn main() -> Result<()> {
         reasoners.cloud.clone(),
         cfg.investigation.clone(),
     ));
+    // Source snoozes — "not Slack, not now". Built once and shared: the tools set them, the
+    // attributor reads them when a subject is created, and the notifier reads them before it
+    // rings. Announced at boot because a snooze that survives a restart and says nothing is
+    // indistinguishable from a source that has quietly broken.
+    let quiet = Arc::new(quiet::Quiet::new(store.clone()));
+    for s in quiet.all_active() {
+        info!(
+            "quiet: {} is snoozed for another {} ({:?} and above still land)",
+            s.source.as_str(),
+            s.remaining(chrono::Utc::now()),
+            s.floor
+        );
+    }
+
     let browser_driver = Arc::new(browser::BrowserDriver::new(cfg.browser.clone()));
 
     // Grafana: the numbers behind an alert, before the browser reads the page.
@@ -361,6 +441,20 @@ async fn main() -> Result<()> {
         );
     }
 
+    // Restate Cloud ids: `env_…` in a ticket becomes an account, an organization, a region
+    // and a Nuon install, resolved once and cached.
+    //
+    // Read-only by construction — it shells out to `rcc` and `nuon`, holds no credential of
+    // its own, and keeps an explicit field allowlist so that what lands in SQLite and in
+    // model prompts cannot include the credential-bearing fields raw state carries.
+    let cloud_resolver = Arc::new(cloud::Resolver::new(cfg.cloud.clone(), store.clone()));
+    if cfg.cloud.enabled {
+        info!(
+            "[cloud] on — resolving platform ids with `{}` (nuon: `{}`)",
+            cfg.cloud.rcc_path, cfg.cloud.nuon_path
+        );
+    }
+
     // Assigned-issue triage: check the repo out, read the code, propose patches, look for a
     // PR that already fixes it, then render the lot in plain English.
     //
@@ -380,10 +474,10 @@ async fn main() -> Result<()> {
 
     // Notifier + live event bus.
     notify::init();
-    let notifier = Arc::new(Notifier::new(
-        &cfg.notifications,
-        cfg.general.quiet_hours.as_deref(),
-    ));
+    let notifier = Arc::new(
+        Notifier::new(&cfg.notifications, cfg.general.quiet_hours.as_deref())
+            .with_quiet(store.clone()),
+    );
     let (events, _rx) = broadcast::channel::<Event>(1024);
     // The dispatch registry pushes on the same bus. Installed here rather than passed
     // around because the two halves of a dispatch — the tool that submits it and the
@@ -518,6 +612,18 @@ async fn main() -> Result<()> {
         },
     });
 
+    // GitHub branch review: the model's own read plus a pass per persona, inline on the diff.
+    let branch_reviews = Arc::new(ghreview::Runner::new(
+        store.clone(),
+        diff_reader.clone(),
+        personas.clone(),
+        github_token.clone(),
+        reasoner_factory.clone(),
+    ));
+    if !branch_reviews.ready() {
+        warn!("branch review is inert — it needs the `github` credential to read a branch's diff");
+    }
+
     let tools = Arc::new(Tools {
         agents: agent_sessions.clone(),
         store: store.clone(),
@@ -533,9 +639,12 @@ async fn main() -> Result<()> {
         investigator: investigator.clone(),
         repos: repo_index.clone(),
         browser: browser_driver.clone(),
+        quiet: quiet.clone(),
+        reviews: branch_reviews.clone(),
         threads: thread_analyser.clone(),
         diffs: diff_reader.clone(),
         personas: personas.clone(),
+        cloud: cloud_resolver.clone(),
     });
     let chat = Arc::new(ChatAgent::new(
         tools.clone(),
@@ -544,7 +653,9 @@ async fn main() -> Result<()> {
     ));
 
     // Web server (UI/API + WS).
+    let cloud_cfg = Arc::new(cfg.cloud.clone());
     let app_state = AppState {
+        cloud: cloud_cfg,
         tools: tools.clone(),
         chat,
         live: live.clone(),
@@ -612,7 +723,33 @@ async fn main() -> Result<()> {
     // endpoint: the poll loops are `Watcher` objects with durable timers, activity
     // lands on a subject object whose exclusive handler serializes it, and the
     // expensive pipelines are workflows keyed so a redundant run is free.
-    let watchers = build_watchers(&cfg, &secrets);
+    // Clears the GitHub notifications that do not need you. The one write in this codebase,
+    // and narrowly so — see `src/tidy.rs`.
+    let tidier = Arc::new(tidy::Tidier::new(
+        store.clone(),
+        github_token.clone(),
+        cfg.tidy.clone(),
+    ));
+    if cfg.tidy.enabled {
+        if !tidier.ready() {
+            warn!(
+                "[tidy].enabled is set but the tidier is inert — it needs the `github` \
+                 credential"
+            );
+        } else if tidier.dry_run() {
+            info!(
+                "[tidy] is in DRY RUN: it will report what it would clear and clear nothing. \
+                 Set [tidy].dry_run = false once the list looks right."
+            );
+        } else {
+            warn!(
+                "[tidy] is LIVE: matching GitHub notifications will be marked {} on every \
+                 poll. Every one is recorded in `tidied_notifications`.",
+                cfg.tidy.mode
+            );
+        }
+    }
+    let watchers = build_watchers(&cfg, &secrets, cfg.tidy.enabled.then(|| tidier.clone()));
     if watchers.is_empty() {
         warn!("no active watchers — running with the web UI + MCP only");
     }
@@ -636,6 +773,8 @@ async fn main() -> Result<()> {
         org: cfg.investigation.org.clone(),
         personas_on_engagement: cfg.personas.enabled && cfg.personas.refresh_on_engagement,
         contexts_dir: data_dir.join("contexts"),
+        extra_context_dirs: cfg.context.dirs.iter().map(|d| expand_path(d)).collect(),
+        cloud: cloud_resolver.clone(),
     });
     let ops = Arc::new(restate::SubjectOps {
         store: store.clone(),
@@ -667,6 +806,7 @@ async fn main() -> Result<()> {
         grafana: grafana_reader.clone(),
         grafana_fallback_enabled: cfg.grafana.fallback_to_browser,
         threads: thread_analyser.clone(),
+        reviews: branch_reviews.clone(),
         context: context.clone(),
         diffs: diff_reader.clone(),
         personas: personas.clone(),
@@ -746,7 +886,14 @@ async fn main() -> Result<()> {
         let mut tasks: Vec<String> = vec![
             restate::objects::scheduler::CONTEXT_REFRESH.into(),
             restate::objects::scheduler::CONTEXTS_DIR.into(),
+            // Unconditional, and it has to be: a snooze with an expiry is a promise the
+            // subject comes back, and there is no configuration under which that promise
+            // should go unkept.
+            restate::objects::scheduler::SNOOZE_LAPSE.into(),
         ];
+        if cfg.cloud.enabled {
+            tasks.push(restate::objects::scheduler::CLOUD_RESOLVE.into());
+        }
         if cfg.investigation.enabled {
             tasks.push(restate::objects::scheduler::REPO_INDEX.into());
             if code_indexer.enabled() {
@@ -821,19 +968,136 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-fn cfg_context_refresh(_cfg: &Config) -> String {
-    // Context refresh cadence isn't a first-class config field yet; the library
-    // default matches the design's `[context].refresh_default`.
-    "6h".into()
+/// Apply a resource override to the document `rcc edit` is holding open.
+///
+/// Runs as `$EDITOR`, so its contract is the editor contract: rewrite the file in place, exit
+/// zero to have the change submitted, exit non-zero to abort — which `rcc` handles by writing
+/// nothing at all. Every guarantee of the write is still `rcc`'s: the optimistic lock on the
+/// state hash, the server-side schema validation, the redacted-secret round trip, and the
+/// confirmation before anything reaches the control plane.
+fn set_resources(memory: Option<u32>, storage: Option<u32>, file: &std::path::Path) -> Result<()> {
+    let raw =
+        std::fs::read_to_string(file).with_context(|| format!("reading {}", file.display()))?;
+    let mut doc: serde_json::Value = serde_json::from_str(&raw)
+        .with_context(|| format!("parsing {} as JSON", file.display()))?;
+    let changed = cloud::apply_resource_overrides(&mut doc, memory, storage)?;
+    // Pretty-printed with a trailing newline, matching what `rcc` wrote out — so an edit that
+    // changes nothing compares equal to the original and is reported as "No changes." rather
+    // than submitted as a whitespace-only rewrite of the whole document.
+    std::fs::write(file, serde_json::to_string_pretty(&doc)? + "\n")
+        .with_context(|| format!("writing {}", file.display()))?;
+    // Straight to stdout, which `rcc` has inherited into the web terminal: this is the only
+    // account of what was applied that the operator sees before the confirmation prompt.
+    for line in &changed {
+        println!("set {line}");
+    }
+    Ok(())
 }
 
-fn build_watchers(cfg: &Config, secrets: &secrets::Secrets) -> Vec<Arc<dyn Watcher>> {
+async fn run_command(command: Command, cfg: &Config, store: Arc<Store>) -> Result<()> {
+    match command {
+        // Handled in `main` before any setup — see the note there.
+        Command::CloudSetResources { .. } => unreachable!("intercepted before startup"),
+        Command::CloudWarm { concurrency } => {
+            // Deliberately not gated on `[cloud].enabled`: that switch governs whether the
+            // *daemon* spends subprocesses on every signal, and an operator typing this has
+            // already decided to spend them.
+            let store_for_rescan = store.clone();
+            let resolver = Arc::new(cloud::Resolver::new(cfg.cloud.clone(), store));
+            match resolver.check_auth().await {
+                Ok(identity) => info!("cloud: {identity}"),
+                // Fatal here, unlike on the daemon's sweep. A warm pass against an expired
+                // token would fall back to `kubectl` for two thousand reads — slow enough to
+                // look like a hang, and it would fill the cache over hours instead of minutes.
+                Err(e) => bail!("cloud: not authenticated ({e:#})"),
+            }
+            // Re-scan what is already stored before warming. Ingest only scans on the way in,
+            // so a fix to the scanner reaches new signals and leaves the old ones alone —
+            // and the alerts worth a context box are mostly already in the table. Pure text
+            // work over SQLite, so it costs nothing next to the estate walk that follows.
+            let signals = store_for_rescan.signals_for_rescan()?;
+            let mut rescanned = 0usize;
+            for (signal_id, text) in &signals {
+                let ids = cloud::scan(text);
+                if ids.is_empty() {
+                    continue;
+                }
+                store_for_rescan.link_signal_cloud_ids(signal_id, &ids)?;
+                rescanned += 1;
+            }
+            info!(
+                "cloud: re-scanned {} signals, {rescanned} mention platform ids",
+                signals.len()
+            );
+
+            let seeds = resolver.enumerate_all().await?;
+            info!(
+                "cloud: warming {} entities at concurrency {concurrency}",
+                seeds.len()
+            );
+            let started = std::time::Instant::now();
+            let report = resolver
+                .warm(seeds, concurrency, |done, total| {
+                    if done % 200 == 0 || done == total {
+                        info!("cloud: {done}/{total}");
+                    }
+                })
+                .await;
+            for (kind, n) in &report.by_kind {
+                info!("cloud:   {n:>5} {kind}");
+            }
+            if !report.failed.is_empty() {
+                warn!("cloud: {} failed", report.failed.len());
+                for (id, why) in report.failed.iter().take(10) {
+                    warn!("cloud:   {id}: {why}");
+                }
+            }
+            info!(
+                "cloud: warmed {} entities in {:.1}s",
+                report.resolved(),
+                started.elapsed().as_secs_f64()
+            );
+            resolver.record_health().await;
+            Ok(())
+        }
+    }
+}
+
+fn cfg_context_refresh(cfg: &Config) -> String {
+    cfg.context.refresh_default.clone()
+}
+
+/// A configured path with a leading `~` expanded. Falls back to the literal string when the
+/// home directory cannot be resolved, so the failure surfaces as "no such directory" naming
+/// the path the operator wrote rather than as a silently skipped sync.
+fn expand_path(raw: &str) -> std::path::PathBuf {
+    match raw.strip_prefix("~/") {
+        Some(rest) => dirs::home_dir()
+            .map(|h| h.join(rest))
+            .unwrap_or_else(|| std::path::PathBuf::from(raw)),
+        None => std::path::PathBuf::from(raw),
+    }
+}
+
+fn build_watchers(
+    cfg: &Config,
+    secrets: &secrets::Secrets,
+    tidier: Option<Arc<tidy::Tidier>>,
+) -> Vec<Arc<dyn Watcher>> {
     let mut watchers: Vec<Arc<dyn Watcher>> = Vec::new();
 
     if cfg.sources.github.enabled {
         match secrets.get("github") {
             Ok(Some(token)) => match GithubWatcher::new(&cfg.sources.github, token) {
-                Ok(w) => watchers.push(Arc::new(w)),
+                // The tidier rides this watcher's poll rather than running its own: a second
+                // poller on `/notifications` would double the request cost, could not share
+                // the `Last-Modified` cursor that makes most polls a 304, and would have to
+                // re-fetch each subject to learn what is merged — which this poll's
+                // enrichment already knows.
+                Ok(w) => watchers.push(Arc::new(match tidier {
+                    Some(t) => w.with_tidier(t),
+                    None => w,
+                })),
                 Err(e) => error!("github watcher init failed: {e:#}"),
             },
             Ok(None) => warn!(

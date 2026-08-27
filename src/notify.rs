@@ -12,6 +12,9 @@ use crate::signal::{Severity, Signal};
 
 pub struct Notifier {
     min_severity: Severity,
+    /// Source snoozes. `None` in test harnesses and anywhere without a store — a notifier
+    /// that cannot read snoozes notifies, which is the safe direction to fail.
+    quiet: Option<crate::quiet::Quiet>,
     quiet_hours: Option<(NaiveTime, NaiveTime)>,
     critical_sound: bool,
     /// Highest severity already notified per subject — so we notify once per
@@ -26,7 +29,18 @@ impl Notifier {
             quiet_hours: quiet_hours.and_then(parse_quiet_hours),
             critical_sound: cfg.critical_sound,
             notified: Mutex::new(HashMap::new()),
+            quiet: None,
         }
+    }
+
+    /// Let this notifier see source snoozes.
+    ///
+    /// Separate from [`Self::new`] because the notifier is otherwise storeless, and a
+    /// notifier that silently needed a database would be a worse thing than one that has to
+    /// be handed it.
+    pub fn with_quiet(mut self, store: std::sync::Arc<crate::store::Store>) -> Self {
+        self.quiet = Some(crate::quiet::Quiet::new(store));
+        self
     }
 
     /// Notify for a subject-level change: fires only when a subject is first seen or
@@ -42,6 +56,19 @@ impl Notifier {
                 s.severity
             );
             return;
+        }
+        // A snoozed source does not ring. Same shape as quiet hours immediately above,
+        // including the part that matters: the snooze carries its own floor, and a severity
+        // at or above it notifies regardless — so silencing Slack cannot silence an outage.
+        if let Some(quiet) = &self.quiet {
+            if quiet.suppresses(s.source, s.severity) {
+                debug!(
+                    "suppressing {:?} notification: {} is snoozed",
+                    s.severity,
+                    s.source.as_str()
+                );
+                return;
+            }
         }
         {
             let mut map = self.notified.lock().expect("notifier mutex poisoned");

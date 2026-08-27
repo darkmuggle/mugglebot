@@ -1125,7 +1125,15 @@ on-call/observability guide, service catalogs, status pages. Three source kinds:
   automatically: each immediate sub-directory names an automatic (pinned) tag, so
   dropping a runbook into `contexts/database/` files it under `database` with no
   LLM pass. Files reload on mtime change, and entries whose backing file
-  disappears are dropped.
+  disappears are dropped. Files sitting at the *root* are ingested untagged rather
+  than skipped.
+- **Documentation checkouts** — `[context].dirs` points at directories outside the
+  managed tree, synced by the same walk and never written to. This is how a repo's
+  `docs/` gets into the library: it stays current with `git pull` instead of needing
+  a re-copy, its `runbooks/`, `sop/` and `design/` sub-directories become tags, and
+  its top-level guides — the orientation material — come in untagged. Dropping the
+  root level is what made this worth spelling out: a docs tree laid out by whoever
+  wrote the docs keeps its overviews at the top.
 
 **Shared ingest pipeline** (`ContextIngest`, keyed on `{id}@{etag|mtime}` so an
 unchanged source is a free no-op): fetch/read → normalize to text → summarize via
@@ -1370,6 +1378,504 @@ The two tiers share one queue and one row. One row per signal is the invariant w
 — it is what stops a re-emitted alert being re-queued on every poll — so escalation is a
 *transition* on that row rather than a second row, and the reason Grafana came up short
 survives on the record even after the browser succeeds.
+
+## Cloud context — an id in a ticket becomes a box of facts
+
+A support thread says `env_201kpvffchrm1sq5p0qph42dqev is throwing 500s`. On its own that is
+an opaque token: it does not say whose environment it is, which region it runs in, what
+profile it is on, or which Nuon install to look at. Each answer is an `rcc get` away, and it
+is the same four commands every time. MuggleBot runs them once and hangs the answer off the
+subject — a **Cloud context** panel on the detail view, and the same facts in the summary and
+live-assist prompts so they reason about the real account and region rather than inferring
+one from the environment's name.
+
+Prefixes are the set `rcc` itself routes on: `usr_ acc_ env_ rgn_ key_ org_ grp_`.
+
+### Resolution is transitive, and only upward
+
+An environment names its account and its region; an account names its organization; a region
+names its Nuon install. Following those turns one mention into the whole hierarchy. The edges
+only ever point at *parents*, which is what keeps the closure small and guarantees it
+terminates — an organization with 23 accounts does not fan back out into 23 more lookups. A
+mentioned environment resolves to five entities in about five seconds.
+
+### People are the exception, because nothing lists them
+
+A `usr_` is the one kind that cannot be enumerated. There is no `rcc list-users`, and a user's
+own document names the accounts they can reach rather than the other way about — so the only
+place a user id exists at all is inside the account or organization that granted them access.
+
+That gives `Entity` a second, *downward* edge list, `members`: the people on an account
+(`primaryOwnerUserId`, `secondaryOwnersUserIds`, `members`, `userRoleBindings` — four spellings
+of the same relationship, and which is in use depends on whether the account is org-owned), and
+the members and groups on an organization. **Only `cloud-warm` follows it.** The ingest closure
+reads `related` and nothing else, and that is the whole reason it stays bounded: an
+organization has 198 members, and a Slack message mentioning one environment must not turn into
+198 lookups and a context box full of strangers.
+
+`members` is read back for display too, and the estate is what proved it had to be. "Contains"
+is the reverse of `related`, which finds an account's owners fine — they name the account. It
+finds an organization's members **not at all**: their document lists `accountMemberships`, and
+an org member has none, so they name nothing and nothing points at them. That was 884 of 1326
+people on the real estate — cached, searchable by email, and completely unreachable by walking,
+which is most of what the Cloud page is for. `explore_cloud_entity` merges the reverse lookup
+with this entity's own `members`, excluding anything the reverse lookup already returned so an
+account's owners appear once. The exclusion is done in SQL rather than against the capped child
+list, so it stays exact however many children there are.
+
+### A user's identity is not in the state store
+
+Every other kind resolves with one `rcc get` and a document that has a `name` in it. A `usr_`
+virtual object is `{userId, version, accountMemberships, limits, accounts}` — no name, no email.
+The identity lives in a **separate DynamoDB table** (`us-RestateCloud-Users`), written by the
+WorkOS/Cognito integration and never mirrored into the state store.
+
+`rcc describe usr_… -o json` is the one command that reads both and prints them together: the
+virtual object as JSON, a `---` rule, then `Name:`/`Email:` lines. `cloud::Resolver::user`
+parses both halves of that single invocation. Two costs worth knowing, and the reason this is
+not how every kind is read: `describe` goes through a `kubectl exec` into the control-plane pod
+rather than the admin gateway, and the profile half needs AWS credentials (`[cloud] aws_profile`
+overrides the realm default). The profile is parsed **best-effort** — a failed DynamoDB lookup
+prints a note to stderr and still exits zero, so a user with no AWS session resolves anyway,
+just without a name. "We could not read the directory" and "this id is not real" have to stay
+different answers.
+
+The email is put in the fields rather than anywhere special because `search_cloud_entities`
+matches field values — which is what makes the question people actually arrive with ("what does
+`connor@repl.it` have") work at all, in the same box as "who is `usr_10uXl8…`".
+
+### The allowlist is the redaction
+
+`rcc get` dumps raw virtual-object state, and that state carries credentials:
+`secretKeyHash` on an api key, `controlPlaneApiKeyFull` and `signingKeyArn` on an
+environment. The admin API redacts the worst of them server-side, but "the server redacted
+it" is not a property to depend on when the output is about to be cached in SQLite and pasted
+into a model prompt. Each kind has an explicit field list in `cloud::summarize`, and
+everything else is dropped — so the credential-bearing fields are absent because they were
+never named, not because something stripped them afterwards. The tests assert the absence
+directly, against real documents.
+
+### Both separators, because the alerts use the other one
+
+The control plane writes `env_201k…`. Kubernetes cannot — a cluster, a namespace and a pod are
+all named `env-201k…` — and that hyphenated form is what every Grafana alert label carries. In
+this store `env-` outnumbered `env_` **713 to nothing**, so matching only the underscore left
+the context box blank on precisely the signals it was built for. The miss was invisible,
+because a box that never renders looks exactly like an id nobody mentioned.
+
+Both forms are now matched and normalized to the underscore, so one environment is one cache
+entry however it was spelled. Normalization is lossless for environments, whose ids are
+lowercase base32; account and organization ids are mixed-case base62 and the hyphenated form
+has already lost the casing, so `Store::find_cloud_entity_ci` recovers it from the warmed
+estate — which is a thing only a warmed estate can do.
+
+Because ingest scans on the way in, fixing the scanner reaches new signals and leaves old ones
+alone. So `cloud-warm` re-scans the stored signals first: on this store that turned 997 signals
+into 831 mentions across 55 subjects, none of which existed before.
+
+### Half an id is not an id
+
+Alert titles are elided to fit — `…TenantPodRescheduled (environment env-201j20x11txnd0x0m…`
+— and a scanner that stops at the first non-alphanumeric byte reads the fragment as a whole
+id. That produced 27 permanently unresolvable entities, each retrying every ten minutes
+forever and putting a failed box on every subject that carried one.
+
+A match ending at an elision is rejected. Rejecting on the *marker* rather than on a length
+rule is deliberate, even though the length rule would also work: real ids have exactly one
+body length per kind — 27 for an environment, 23 for an account, 10 for a region, across 1930
+of them — but an id format the platform changed later would then stop matching **silently**,
+which the hyphen bug already proved is impossible to notice. A truncation marker cannot
+produce a false negative on a well-formed id.
+
+### Scanning is strict, and that is not fussiness
+
+`env_`, `key_`, `org_` and `acc_` are ordinary identifier prefixes in ordinary logs:
+`env_vars`, `key_management`, `org_name`, `acc_id`. A prefix match would queue a failed
+subprocess for each of them, on every message in the channel. Real ids are base62 and long —
+`rgn_…` is the shortest in service at 11 characters, the rest run to 23–26 — so an id needs
+ten characters *and* a digit. That rejects every one of those words and keeps every real id.
+
+### Nothing shells out on the poll path
+
+Ingest **scans only**, recording which ids a signal mentioned; the lookups run on a 30s
+scheduler sweep. This is the same split the browser queue makes and for the same reason: the
+poll path is the one place where a few seconds of subprocess would be paid per message. The
+sweep is bounded twice — on the seeds it takes and again on the closure each one opens — so a
+thread pasting thirty environments is spread across ticks rather than forking thirty CLIs.
+
+Successes cache for six hours; **failures cache for ten minutes**, so an expired token that
+the operator fixes with `rcc login` comes back on the next tick rather than tomorrow. Only
+the *mention* is stored against the signal — the ancestors are walked from the cache on read,
+so an account that moves to a new organization is correct everywhere at once instead of
+leaving every subject holding its own stale copy of the hierarchy.
+
+Read-only by construction: it shells out to CLIs the operator already configured, holds no
+credential of its own and cannot obtain one, and passes `nuon --read-only` so that "cannot
+mutate" is a property of the subprocess rather than of this code being careful.
+
+### Pre-population — `mugglebot cloud-warm`
+
+Waiting for a first mention means the first person to paste an id gets an empty panel and a
+30-second wait. `cloud-warm` fills the cache from the control plane instead of from the
+signal feed: `rcc regions`, then `rcc list-envs --region` per region — about forty calls to
+*name* the whole estate — and then one read per entity, eight at a time.
+
+Enumerating through the listing commands rather than reading each environment to discover its
+account is the whole trick: the alternative is the thing the cache exists to avoid. Already
+fresh entities are served from the cache and cost nothing, which is what makes the command
+safe to interrupt and cheap to re-run.
+
+Users, groups and organizations are not in the seed list and cannot be — see *People are the
+exception* above. They are **discovered** during the walk, by following the `members` edge off
+the accounts and organizations that are seeded. Since the seeds are the whole estate of
+accounts, the people are the whole estate of people. This is also what makes the pass longer
+than the entity count suggests: each user is a `kubectl exec` plus a DynamoDB query rather than
+an admin-gateway read.
+
+It is a maintenance subcommand, so it runs against the store and exits before any watcher,
+workflow or endpoint is armed — a warm pass must not contend with a running daemon for the
+Restate endpoint port. It *does* share the SQLite file with a running daemon, which is what
+put a `busy_timeout` on the connection: WAL lets a reader and a writer coexist but not two
+writers, and two thousand short writes alongside a live daemon is exactly the collision that
+used to be unreachable when one process owned the file.
+
+A full pass over the real estate is 33 regions, 974 environments, 903 accounts, 32 Nuon
+installs and 4 organizations — **1946 entities in 280 seconds** at concurrency 8.
+
+### Three things the estate taught us that a unit test would not have
+
+Running it against the whole fleet found edge cases no amount of reasoning about the happy
+path would have produced, all three in the region column:
+
+- **Public regions are not objects.** An environment in `eu-west-1` names that as its
+  `region`, but there is no `rgn_` virtual object behind it — following the edge cached a
+  permanent `unknown id prefix in eu-west-1` box. Public regions are now named as an inline
+  field, and an `is_resolvable` guard sits on every traversal edge so nothing unreadable can
+  be queued again.
+- **`.nuon` twins are regions.** A nuon-native region has no `rgn_` id at all: it is keyed
+  `<install>.nuon` (`inl3jdnqyt2p0vqiiglfhe1da9.nuon`, "Balerion AI us-east-1") and is a
+  region object of the ordinary shape. It has to resolve, because environments in one name it
+  as their region — and it must *not* be confused with the bare install id it contains, which
+  is a different object read with a different CLI. Reading one also revealed that `rcc`
+  prefixes a selector-resolved read with a `#` note, which is friendly on a terminal and fatal
+  to a parser.
+- **A region can point at an install that no longer exists.** `rgn_f9cakwtfb0` names an
+  install Nuon returns `record not found` for. That is real information about the estate, not
+  a bug to paper over — but it only became visible after fixing where the message comes from:
+  `nuon` reports the failure as a JSON envelope on **stdout** and exits 1, so every such
+  failure had been rendering as "`nuon` exited with status 1:" and nothing else.
+
+The `.nuon` region document is also the strongest argument for the field allowlist: it carries
+`kubeCa` in full, and unlike `kubeToken` the gateway does not redact it.
+
+### The Cloud page — searching the estate, and walking it
+
+The context box answers "what is this id somebody pasted". The **Cloud** view answers the
+question you arrive with when nobody has pasted anything: *which* environments are on that
+profile, what else is in this account, which region is this customer in. Same cache, no CLI
+calls.
+
+Search matches ids, names, statuses **and the curated field values**, and the last one is
+what makes it useful — the real questions live in the fields, not in the ids. It also covers
+a gap the graph cannot: 932 of the 974 environments are in *public* regions, which are an
+inline field rather than an edge, so "everything in `eu-west-1`" is a search rather than a
+walk. Only the 42 BYOC environments have a region edge to follow. An exact id sorts first, so
+pasting one lands on it instead of on the things that mention it.
+
+Relationships go both ways. `related` walks **up** — an environment's account and region, an
+account's organization, a region's Nuon install. `cloud_entity_children` is the reverse edge
+and walks **down** — an account's environments, an organization's accounts. It is a scan, not
+an index, because the whole table is a couple of thousand rows, and the ids are quoted inside
+the JSON so a match is an exact token rather than a prefix collision.
+
+Results and relationships sit side by side rather than as a drill-down page: exploring a
+graph is a run of small hops, and a page transition per hop throws away the search that got
+you there. The `Contains` count is the *true* count with the shown number named separately —
+an organization with 900 accounts must not read as the 200 that fit.
+
+Both queries are also tools (`search_cloud_entities`, `explore_cloud_entity`), so the same
+two questions are answerable from a Claude session over MCP.
+
+**Hovering an entity chip answers the question without leaving the page.** `environment:env-201kya…`
+on a firing's summary is an opaque token in the one place it matters most, so the chip carries
+a `data-tip` with the environment's own fields and then the chain above it — account,
+organization, region, Nuon install. It is a lookup, not a fetch: `SubjectView.cloud` already
+holds the resolved closure, so the hover costs no round trip and works offline of `rcc`
+entirely. No tooltip appears when the estate has not been warmed for that id, rather than an
+empty one.
+
+A selected entity is a *location* — `#/cloud/env_201k…` — which is what makes the page
+reachable from elsewhere. An alert's `environment:` / `account:` / `organization:` entity chip
+links straight to it, canonicalizing the hyphenated form on the way. Those chips used to be
+the only dead ones on the subject panel, and they are the ones an operator most wants to
+follow: "whose environment is this" is the first question a cloud alert raises.
+
+### Grafana deep links — the other half of "what is this id"
+
+The context box says whose environment it is and where it runs. The next question is always
+*how is it doing right now*, and that was four clicks and a dashboard variable away. An
+environment and a region now carry a link straight to their own dashboard with themselves
+already selected.
+
+**Constructed, never looked up, and it costs nothing.** The dashboards in
+`restate-cloud/grafana` have stable string UIDs — `cloud-environment`, `cloud-region` —
+identical in dev and prod, and the values they key on are already fields `cloud::summarize`
+caches. No API call, no token, no new state, and it works with Grafana unreachable.
+
+The values are **not** the ids, which is the whole reason it is a function rather than a format
+string at the call site:
+
+| | UID | Variable | Value |
+|---|---|---|---|
+| Environment | `cloud-environment` | `restate_instance` | Kubernetes namespace — `env-201k…`, hyphenated |
+| Region / Nuon install | `cloud-region` | `region` | the Nuon install id — `inl…` |
+
+`cloud-environment.ts` builds every query as `namespace="$restate_instance"`, and
+`cloud-region.ts` populates its picker from the deploy config's region names, which for BYOC
+*are* install ids. Passing the `env_`/`rgn_` id to either renders the dashboard perfectly with
+no data on it — the most expensive kind of wrong link, because it looks like an outage.
+
+An account, an organization, a user and a key get **no link**: they are billing and identity
+structures, not things with a p99. So does a region with no install — a public one, or one
+naming an install that has been deleted. `None` rather than a link to the picker's default,
+which would show a stranger's region.
+
+Which stack is decided by the `rcc` realm — `dev` is the dev stack, everything else is prod,
+which is also how `eu` shares the prod credential. `[cloud] grafana_url` overrides it. Its own
+setting rather than borrowing `[grafana] base_url`: that one says where your *alerts* come
+from, and the two are only incidentally the same host.
+
+Derived on read rather than stored on the entity, so correcting the host is a config edit
+rather than a full re-warm. It rides on `explore_cloud_entity`, so the model gets it too.
+
+### The operations that are not reads
+
+Four things on that page run something real, and three of them change the world: `rcc edit`
+rewrites a control-plane document in an editor, `resources…` resizes an environment's memory
+and storage (also `rcc edit`, see below), `rcc reconcile` applies stored state to a live cluster
+after showing a diff, and `refresh-kube-token.sh` mints an ephemeral kubectl token against a
+Nuon install. There is also `view json` — `rcc get`, for when the twelve curated fields are not
+enough.
+
+The three that change the world are genuinely interactive: an editor, a confirmation prompt, a
+progress stream. None survives being a button that returns JSON, so the UI gets a real terminal
+— xterm.js over a PTY, with `SIGWINCH` on resize.
+
+**`view json` is in the terminal for fidelity, not interactivity.** It used to call the
+`cloud_entity_raw` tool, which runs the same `rcc get` but parses the output into a value that
+the page then re-serialised — so the document on screen had its keys reordered and anything
+`rcc` printed that was not JSON dropped. You open the raw document precisely when you have
+stopped trusting the summary, and a reconstruction is the wrong thing to be handed at that
+moment. The tool stays on the MCP surface, where a parsed value is exactly what the caller
+wants.
+
+**`resources…` is a form, not an editor.** Memory and storage are the two overrides an operator
+actually reaches for, and they are the two least pleasant to set through `edit`: storage is
+persisted as a raw byte count (`minimumStorageRequestBytes`), memory as a Kubernetes quantity
+on *both* the request and the limit. So the modal takes GiB for each and does the conversion —
+and merges, so nothing else under `resourceOverrides` (replicas, env vars, tolerations) is lost
+on the way past, which is the trap the hand-written `restate state patch` route has.
+
+**It is `rcc edit` with a non-interactive `$EDITOR`, and it had to become that.** This used to
+spawn `rcc override <id> --memory N --storage N` — **a command `rcc` has never had**. Pressing
+the button printed `Unknown command: override` and rcc's usage, and exited 1. It shipped
+because the tests asserted the argv this code *built* rather than anything about the tool it
+was building it for, so they passed on a command that could not run; and the UI's
+"state written, not applied" follow-up keyed on `/Environment state updated/`, a string invented
+in the same breath and never printed by anything.
+
+The fix is not a new write path. `rcc edit` is GetState → `$EDITOR <file>` → PutState:
+optimistically locked on the state hash, validated server-side, with redacted secrets that
+round-trip. Standing in as the editor — `mugglebot cloud-set-resources --memory N <file>`, a
+hidden subcommand that merges the two fields and exits — keeps every one of those properties.
+`rcc`'s `openEditor` splits `$VISUAL`/`$EDITOR` on whitespace and appends the file, so both are
+set (it prefers `VISUAL`, and leaving either interactive would park the pane in an editor nobody
+is driving) and a binary path containing whitespace is refused with the reason. The subcommand
+is intercepted in `main` before config, logging or the store: it is not MuggleBot starting, it
+is a text editor with a few milliseconds to live, and opening the SQLite file would put a second
+writer on it while the daemon that launched it is still running.
+
+**Nothing about a resource figure is capped.** An override is how an environment is given more
+than its tier provides, so a ceiling in `pty.rs` would refuse the exact case the feature exists
+for. Zero is still refused — that is a broken value, not a small one. What guards against a
+slipped decimal is not a number in the source: the editor prints what it set, the control plane
+validates the document, and nothing reaches the cluster until a reconcile whose diff a human
+reads. Storage is also a *floor* — the manifest renders `max(override, live volume)` and volumes
+never shrink — which the modal says before the button is pressed rather than after.
+
+**Reconcile takes a selection, and there is no browser dialog in front of it.** Ticking rows in
+the results list and pressing `reconcile N` opens **one** `rcc reconcile id1 id2 …` session:
+`rcc` diffs and confirms each id in turn, so a bulk run *queues* the per-environment prompts
+rather than skipping them. That is the property that makes bulk safe to offer at all, and
+`--yes` remains unreachable. Rolling a profile change across twenty environments is one session
+with twenty diffs instead of twenty trips through the page.
+
+The `confirm()` that used to sit in front of a single reconcile is **gone**. Its stated reason
+was that `rcc`'s prompt appears only after the run has started — but the next thing that happens
+is "here is exactly what will change, are you sure?", so the dialog asked the same question
+with strictly less information. A confirmation you answer twice is one you stop reading, which
+makes the second one worse rather than the first one better; and at twenty environments it would
+have been twenty dialogs in front of twenty real diffs.
+
+Three things the selection has to get right, all of them about not acting on what the operator
+cannot see:
+
+- **Every id is validated before anything spawns.** One unreconcilable or unknown entry refuses
+  the whole selection. Validating as it went would surface the mistake part-way through a run of
+  confirmations, with some environments already applied — half a bulk reconcile is a state
+  nothing else in the system can describe.
+- **The run is scoped to what is on screen.** Ticks are kept by id so a selection survives the
+  search re-running under it, but the action only takes ticked rows *still in the current
+  filter*. Narrowing the filter narrows the run.
+- **`MAX_RECONCILE` (50) is named, not silent.** Past it the request is refused with the count
+  and the suggestion to batch. A bulk action that quietly does some of what was asked is worse
+  than one that refuses.
+
+**The terminal moved below the split** to make this work. It used to render inside the detail
+panel's `Show when={detail()}`, so a session started from the results list with nothing selected
+would have run with its output rendered nowhere at all. Relatedly, navigating to an entity ends
+a session that *belongs* to an entity but no longer ends a bulk reconcile: clicking a row to see
+what one of the twenty is, while the diffs go past, is the obvious thing to do and must not kill
+a run that is part-way through applying to live clusters.
+
+**The terminal pane is `keyed`, and that is load-bearing.** `PtyPane` opens its socket in
+`onMount` and reads the request once, inside `ws.onopen`. A plain `<Show when={pty()}>` only
+re-runs when its condition changes *truthiness* — Solid's `Show` memo uses
+`equals: (a, b) => !a === !b` — so swapping one request for another while a pane is open kept
+the same instance mounted: prop changed, `onMount` did not re-run, no socket opened, and the
+pane went on showing the previous command's exited output. Reconcile from the follow-up strip
+is the path that always has a pane open, so it did nothing at all, silently. Keying on the
+request object tears the old pane down (closing its socket, killing its child) and mounts a new
+one. Anything else that starts a process from a prop read at mount needs the same treatment.
+
+Because starting a command now replaces the pane, and replacing it kills the child, the page
+tracks whether a session is still running and asks before clobbering one — an `rcc edit` holds
+an editor open on a control-plane document, and losing it to a mis-aimed click would discard
+the edit.
+
+**An edit writes state; it does not apply it.** `rcc edit` prints a tip saying so, and a tip
+in a pane the operator is about to close is a tip that gets missed — leaving a control plane
+and a cluster that disagree, with nothing on the board to show it. So reconcile is a
+first-class command and the page offers it the instant an edit exits cleanly. The two kind
+lists are deliberately different: an account edits but has nothing to apply; a region
+reconciles but is not hand-edited, because that is the break-glass path `rcc` warns applies no
+server-side validation.
+
+A kubectl token is a small form, so it is a modal rather than two dropdowns wedged into the
+actions row: it names the install it is about, offers **support** or **admin** and a lifetime
+of 24 hours / 7 days / 30 days, and says what each access level means — they are different
+amounts of power over a customer's cluster, and a pair of words on a chip does not convey
+that. Support is the default. Cancel and Esc run nothing.
+
+Everything the pane holds is *about one entity* — the complete document, the reconcile notice,
+the token modal, the terminal — and all of it is scoped to the selection. A value that
+outlives the entity it came from is not harmlessly stale: a pane headed `insurity/us-east1`
+showing a document that describes `comcast/us-east5` is an invitation to act on the wrong
+cluster. The document and the notice are keyed by id so navigating away and back restores
+them; the terminal is cleared outright, because it owns a process and re-mounting it would
+start a second `rcc edit` on the *previous* entity.
+
+The reconcile notice can be dismissed. It is labelled `dismiss` rather than `discard`, because
+the state change is already in the control plane and nothing in the UI takes it back — the way
+to actually discard an edit is to quit the editor without writing. Which is now distinguished
+properly: `rcc edit` exits 0 both when it writes and when it prints `No changes.`, so keying
+off the exit code alone claimed a write on every `:q!` and then offered a reconcile with
+nothing to apply. The terminal hands its output tail to the exit handler for exactly this.
+
+Reconcile asks before it runs. `rcc` prints a diff and prompts before applying, and that
+prompt is still the one that matters — but it appears *after* the run has started, by which
+point the operator has already pointed something at a live cluster. A button reading
+`reconcile` one click from a search box is too easy to hit on the wrong row, so the UI names
+the target first.
+
+#### Why the terminal is not a terminal
+
+A PTY endpoint is the shape of a remote shell, and everything else the web UI can reach is a
+tool — a fixed function with a typed argument list. So the socket **never carries a command
+string**. It carries a *kind* plus its inputs; `pty::Request::resolve` validates those and
+builds the argv itself. A caller cannot name a program, add a flag, or smuggle a
+metacharacter, because nothing they send is ever concatenated into a command line — there is
+no shell in the path at all. Ids are checked twice, for shape *and* against the entity cache,
+so the only editable things are ones MuggleBot has already seen in the estate. `--yes` and the
+token script's permanent-credential mode are not expressible.
+
+That makes this narrower than what the operator can do in their own terminal, which is the
+point: their terminal is theirs, and this endpoint is reachable by anything that can open a
+socket to the UI port. The WebSocket upgrade carries the same Origin check as the event
+socket, for a sharper reason — upgrades bypass CORS, and this one spawns processes.
+
+One socket is one process for its whole life; closing it kills the child, so navigating away
+cannot strand an editor holding a lock on a document.
+
+**The UI bundle is minified with terser, and the terminal is why.** `@xterm/xterm` ships an
+already-minified ESM bundle, and esbuild re-minifying it breaks its DECRQM handler with
+`ReferenceError: i is not defined`. Nothing fails at build time — it fails the first time an
+application asks the terminal about a mode, which vim does on startup, inside xterm's write
+pipeline. The editor renders and then silently ignores every keystroke. See the note in
+`ui/vite.config.ts`; a build that succeeds proves nothing there, so the check is to open an
+edit session and press a key.
+
+The `view json` document is the one uncurated thing here. It carries what the field allowlist
+exists to keep out, so it is fetched on demand, held in the page, and never written to SQLite
+or a prompt.
+
+### Credentials expire, and the failure is silent
+
+This is the part worth knowing about `rcc`: when its admin token expires it does **not**
+fail. It falls back to reading the virtual object through `kubectl exec`, which is far slower
+and returns state the admin gateway would have redacted. Nothing downstream would notice —
+the reads still succeed, they just take an order of magnitude longer and arrive unredacted.
+(The field allowlist is what stops the second half mattering. It is not what gets the token
+fixed.)
+
+So the fallback is detected directly, from the `falling back to kubectl` line `rcc` writes to
+stderr on an otherwise-successful call, and `rcc whoami` — which checks gateway, token and
+role binding in one call — is the probe. Both land in `source_health` under `cloud`, with the
+remediation spelled out including the realm flag people get wrong:
+`restate cloud login && rcc login -c us`.
+
+The probe is only spent when it is likely to say something: a sweep where *nothing* resolved,
+or one where a fallback was seen. Probing every idle tick would cost more than the sweep it
+is checking on. `cloud-warm` checks up front and refuses to start unauthenticated, because a
+warm pass through the kubectl fallback would take hours and look like a hang.
+
+### A failed read must not erase a good one
+
+The failure above got worse than slow. When the token expired for real, `rcc` fell back to
+`kubectl` and **that failed too** — so reads did not degrade, they errored. A failed read built
+an empty `Entity`, and `put_cloud_entity` is an upsert: every column was replaced with nothing.
+On the ten-minute error TTL, every mentioned id was retried and blanked, on a loop.
+
+**132 environments** lost their name, tier, cluster and region, and their `accountId` edge with
+them — so they also dropped out of their account's "Contains" list and out of the closure behind
+every subject that mentioned them. `source_health` said `cloud: not ok` throughout, correctly;
+the estate was dismantling itself anyway, and the only symptom on screen was boxes going blank.
+
+A failed read now writes the error **over the top of** the last known good copy rather than
+instead of it. Stale-but-known beats blank every time: the facts were true six hours ago, and
+the error says why they have not been re-checked, which is strictly more than an empty box says.
+`fetched_at` still moves, because it is the retry clock — what is preserved is the content, not
+the pretence that it is current. `prompt_block` therefore filters on *has something to say*
+rather than on `error.is_none()`, and the entity card renders an error-with-facts as **stale**
+(a dim rule) rather than as a failure (a red box).
+
+This does not un-blank what was already lost. Those rows have nothing left to preserve and come
+back only on a successful read — `mugglebot cloud-warm` after fixing the credential, or the
+sweep, which picks up mentioned ids at `max_entities` a tick.
+
+### Refresh — the escape hatch from a six-hour TTL
+
+The cache is right for things that change on the order of never, and wrong at exactly the two
+moments an operator is on this page on purpose: just after reconciling a change they made, and
+just after fixing a credential that had been failing. Both leave a box showing something they
+know is out of date. Until this there was nothing to do about it — the automatic sweep only
+re-reads ids a *signal mentioned*, so an environment you edited yourself might never refresh at
+all.
+
+`refresh` on the entity card, and `refresh_cloud_entity` on the tool surface, re-read one entity
+now and store what comes back. Every kind, unlike the rest of that row. It goes through the same
+failure path, so refreshing against a broken credential reports the reason and keeps what was
+already known.
 
 ## Assigned issues — the work you own, triaged against the code
 
@@ -1806,7 +2312,7 @@ vqueues *requires* a fresh cluster. That is a deliberate acceptance, not an over
 
 **The local model does the work.** Every pass MuggleBot runs on its own — correlation,
 root cause, explanation, code indexing, tagging, live assist, chat — runs on
-`deepseek-coder:33b` via Ollama and nowhere else.
+`gemma4:31b` via Ollama and nowhere else.
 
 **Assigned-issue triage is the one exception**, on `claude-sonnet-5` via the CLI bridge
 (`[reasoner] triage`). It is a queueing decision: one Ollama is one GPU, triage makes
@@ -1877,7 +2383,7 @@ which is the only reason a second opinion tells you anything about the first.
 
 | Handle | Model | Who holds it |
 |---|---|---|
-| `local` | `deepseek-coder:33b` | everything automatic |
+| `local` | `gemma4:31b` | everything automatic |
 | `routed` | `local`, unless routing is turned on | call sites that *would* escalate, so the set is visible |
 | `vision` | a local vision model (`qwen2.5vl:7b`) | chat, and only for a turn carrying images |
 | `cloud` | `claude-opus-4-8` via the CLI bridge | the chat picker, and `SecondOpinion` |
@@ -1972,6 +2478,29 @@ No gated action ships in v1. The mechanism is specified now because retrofitting
 authorization onto a pipeline that already acts is the wrong order.
 
 ---
+
+## Every advertised tool must dispatch
+
+`definitions()` is the catalog: the chat system prompt reads it, every MCP client reads it, and
+the web UI calls tools by name. Nothing connects a `ToolDef` to the arm in `Tools::call`'s match
+— so a tool can be advertised, fully implemented, and reachable from nowhere. The handler
+compiles. The catalog is complete. The type system has no opinion about a match arm that does
+not exist.
+
+That shipped twice in a row: `review_branch` answered `unknown tool 'review_branch'` in the UI,
+and the same defect had silently gone out with the source-snooze buttons — **eight** advertised
+tools with no dispatch arm between two features.
+
+`every_advertised_tool_actually_dispatches` closes it. It calls every tool in the catalog with
+empty arguments and rejects exactly one failure: `unknown tool`. A missing argument, a bad id, a
+disabled feature — all fine, none of those mean the name is a lie. Its negative control was run:
+deleting one arm makes it fail with that arm named.
+
+Two companions: names must be unique (a duplicate `ToolDef` makes the second unreachable, the
+same bug from the other side), and every tool needs a description and an object schema, since
+those are what the prompt and MCP clients actually consume. Deliberately **no** minimum
+description length — `"Browse memory entries."` says everything there is to say about
+`list_memories`, and a threshold would be a test inventing a house rule rather than checking one.
 
 ## MCP surface
 
@@ -2630,6 +3159,109 @@ And a prediction is a **private rehearsal** — never posted to GitHub or Slack,
 same footing as every other critique here. See the next section, which is the invariant this
 rests on.
 
+## Branch review — a panel of reviewers, inline on the diff
+
+Point at any GitHub **branch** and ask several reviewers at once: the model's own read of the
+code, plus a predicted review per persona. Every comment lands on the line its author quoted.
+
+The existing review path runs the other way round — a PR arrives as a notification, becomes a
+subject, and gets one review. This starts from a branch, which is often *before* there is a
+pull request, and that is when a review is worth most. If there is one, it is reported
+(`open_pull_request`), because adding a second opinion to something already under review is
+worth knowing about before you do it.
+
+### Three dots
+
+`base...head`, against the **merge base**. Two dots would fold in everything that landed on the
+base branch since this one left it, presenting other people's commits as part of the change
+under review. On a busy repo that is most of the diff.
+
+### One comment type, two very different claims
+
+A model review says *"this swallows the error"*. A persona review says *"Luke would say this
+swallows the error"* — a prediction about a colleague, and the sentence reads **identically**
+either way. Only the label distinguishes them, so the label is never subtle:
+
+- `Placed::by` rides every comment, not just its pass, because the diff interleaves producers.
+- A persona takes the identity hue on the note's edge as well as its text — on a patch with
+  three reviewers the eye finds the boundary before it reads the attribution.
+- The pass summary is prefixed `rehearsal · never posted`, next to the words themselves.
+
+They nevertheless share one [`Placed`] type and one renderer, because two inline-comment
+renderers drift apart and the *placement* problem is identical.
+
+### Placement reuses the matcher that already works
+
+Both producers are asked to quote the line they mean, and both resolve through
+`prdiff::anchor_index` — including the moved-line case where a line exists twice in one patch
+and only its `+`/`-` marker says which copy was meant.
+
+A persona's `PredictedPoint::line` is *already a copied line* rather than a number, so it needed
+no new anchoring rule at all. A point that resolves to nothing becomes a **file-level** comment
+shown above the hunks rather than being attached to whatever line happened to match — which is
+what makes an unresolvable anchor visible instead of wrong. A point naming no file is dropped:
+the persona's summary is where an unanchored opinion belongs.
+
+Persona points still go through `Engine::predict` rather than reaching into the predictor
+directly, because that path applies `verify_prediction`, which drops any point citing no trait.
+A predicted review with uncited points is an accusation dressed as a rehearsal.
+
+### A pass is about a commit, not a branch
+
+Passes are keyed `(branch, sha, reviewer, provider, model)`. Re-asking the same reviewer on the
+same model about the same commit hands back the existing row — no second model call. When the
+branch moves, the pass does not follow it: it reads `stale`, which is the difference between
+stale and wrong. A pass that was queued before a push and would now review code it never read
+fails with the sha it expected rather than filing a review against the wrong commit.
+
+The diff is read **once per panel** and cached by sha. Five reviewers is one compare call, and
+the view still needs the diff to render comments against after the pass that fetched it has been
+dismissed — which is why the cache is its own table rather than a column on a pass.
+
+### Add and dismiss
+
+Adding a reviewer is another pass; nothing is replaced, and naming personas does not displace
+the model's own read, because the two answer different questions and seeing them against each
+other is the point of the view.
+
+**Dismissal is a flag, never a delete.** A dismissed pass leaves the diff and stays on the
+record, for two reasons: "the local model said this and I disagreed" is evidence about that
+reviewer, and re-running a pass you dismissed should be a decision rather than something that
+happens quietly because the record of your dismissal was thrown away. `visible()` is the single
+place that decides what the diff shows, so "dismissed" cannot mean one thing in the gutter and
+another in the header tally.
+
+Re-asking clears the old answer as well as re-queueing, so a half-finished rerun cannot read as
+the new verdict.
+
+### What the operator actually pastes
+
+Five shapes, and a **pull request URL** is one of them — `…/pull/1334`. The feature is about
+branches, but a PR link is by far the likeliest thing in a clipboard when a box says "point at
+any branch", and refusing it with a lecture about branches is a parser being right at the
+operator's expense. The number is resolved to its head branch at request time, so pasting the PR
+link and pasting the branch link land on the **same** review rather than two rows about the same
+code — `…/pull/1334` and `…@bh/health` both key to `restatedev/restate-cloud@bh/health`.
+
+Until it resolves, `head` holds `#1334` — marked, so a branch that never resolved cannot be
+mistaken for one with an empty name.
+
+### Verified on a real branch
+
+`restatedev/restate-cloud@bh/health`, Claude Opus 5, model + `lukebond`:
+
+- The model returned `comment` with **5 inline comments**, all resolved onto real patch lines —
+  including a genuine concurrency finding (a handler holding an environment key exclusively
+  across a metrics-backend call) and two type mismatches.
+- The persona returned `approve` with 1 inline comment, in his own register: *"lgtm — byoc still
+  needs the matching cluster-admin rules, i'll pick that up. i think pavel should sanity check
+  the secrets fetch at module init before this rolls out"*.
+- Every placed comment was asserted to be inside a patch that exists, at an index within it — a
+  comment anchored past the end of a patch renders nowhere, which looks identical to no comment.
+
+A branch that has been merged and deleted fails at resolve time with the 404 and the branch
+name, on the button, rather than as a queued pass that dies later.
+
 ## Slack thread analysis — two models, no synthesis, and the quotes have to be real
 
 Paste a Slack permalink; get an assessment of what happened in that thread, including your own
@@ -2731,7 +3363,23 @@ that every finding carried the same `source`. The fixtures were all green.
   the same subscription — and the cloud budget stays free for work the operator is waiting on.
 - Two retries, not four. Each retry is two more model calls on a question asked once.
 
-## Nothing is ever written back to GitHub
+## Nothing is ever written back to anything anyone else can see
+
+> **Restated on purpose.** This section used to be titled *"Nothing is ever written back to
+> GitHub"*, and asserted that the codebase contains no `PATCH`, `PUT` or `DELETE` against any
+> source. That is no longer literally true: [`crate::tidy`] clears your own GitHub
+> notifications. The invariant is **narrowed, not dropped** — and the narrowing is what the
+> original sentence was reaching for.
+>
+> Read the reason the old wording gave for itself: *"an ops agent that comments on your
+> colleagues' pull requests is a different, much worse product."* Every example it listed —
+> a review, an approval, a label, a predicted comment — is **something a colleague can see**.
+> Your notification inbox is not. Marking a thread read mutates no shared artifact, says
+> nothing in your name, and is invisible to everyone but you.
+>
+> So the line moved from "GitHub" to "visible to anyone else", which is where it always
+> belonged. What did *not* move: there is still no mechanism to post, comment, review,
+> approve, label, commit, push, or open a PR, and adding one would be a different product.
 
 A PR critique is a note in MuggleBot's own store. It is rendered in the LCARS console and
 nowhere else: it never becomes a PR comment, a review, an approval, or a label. The same is
@@ -2746,15 +3394,233 @@ exactly what someone would want to post — and the value of the whole feature d
 it not being posted. An ops agent that comments on your colleagues' pull requests is a
 different, much worse product.
 
-Mechanically: the GitHub client has no write methods. The only `POST` anywhere in the
-codebase is Granola's read API, which requires one to fetch documents. Nothing calls
-`PATCH`, `PUT`, or `DELETE` against any source. The triage path is the same — no commit,
-no push, no PR — as is the browser path, where the tool allowlist grants navigate and
-snapshot but never `click`, `fill`, or `evaluate_script`, so there is no *mechanism* to
-acknowledge an alert even if something wanted to.
+Mechanically: **the GitHub client still has no write methods.** The one write in the codebase
+lives in `src/tidy.rs`, which holds its own HTTP client precisely so that stays true, and it
+can only reach one endpoint — see below. The only `POST` anywhere is Granola's read API, which
+requires one to fetch documents. The triage path is unchanged — no commit, no push, no PR — as
+is the browser path, where the tool allowlist grants navigate and snapshot but never `click`,
+`fill`, or `evaluate_script`, so there is no *mechanism* to acknowledge an alert even if
+something wanted to.
 
 The UI says so where it matters: each critique block is footed with "never posted to
 GitHub", because the person reading it is the person who might otherwise assume it was.
+
+## Snoozing a source — "not Slack, not now"
+
+Snooze already existed per subject: one thread goes quiet until you re-enter it. This is the
+other axis, and the reason it is needed is a number — **204 of 291 ingested Slack signals are
+Grafana alerts**. What you want to silence is not a thread, it is Slack.
+
+### It has to cover what arrives next
+
+Snoozing the Slack subjects currently on the board would be useless alone: the watcher polls
+every 30 seconds and alert channels refill it immediately. So a source snooze does two things
+— snoozes what is there, and holds arriving work back until it expires. Only the first half is
+visible when you press the button; only the second half is what makes it worth pressing.
+
+Existing subjects are snoozed **to the snooze's own expiry**, so they resurface when the
+source does. Waking early deliberately does *not* reopen them — their expiry is unchanged, and
+dumping the backlog back on is the opposite of what someone pressing "wake" wants, which is
+for *new* Slack to reach them again.
+
+### The floor, and why total silence is still offered
+
+A snooze carries a floor: severities below it are held back, at or above it land anyway.
+`Critical` by default — not a new rule, but the one `general.quiet_hours` already follows,
+where a Critical notification fires regardless of the hour. Slack is where a firing incident
+arrives, so this is the guard the whole feature turns on.
+
+But "snooze **all** Slack notifications" literally means all of it, and that has to be
+sayable: **a safe default you cannot override is a tool arguing with its operator.** So the
+floor is `Option<Severity>` rather than a level — nothing sorts above `Critical`, so total
+silence could not otherwise be expressed. `floor = "everything"` holds back criticals too. It
+is never the default, the log line is a `warn!` rather than an `info!`, and the rail marks it
+in red rather than the lilac a normal snooze uses: the difference between "quiet for a bit"
+and "you will not be told if this catches fire" is the most important distinction there.
+
+What makes offering it safe at all is that it still expires. The difference between a snooze
+and a mute is that one of them ends.
+
+### Expiry is read, never scheduled
+
+A *source* snooze is a row with an `until`, and every surface asks "is that still in the
+future?". Nothing to arm, nothing to re-arm after a restart, and no scheduled cancellation that
+can fail to run and leave a source silenced past its window. 24h is the cap — longer is a
+disabled source, and the error says to disable it in config instead.
+
+**A subject's snooze was not like that, and the docs above this line used to claim it was.**
+`subjects.snoozed_until` was written by both snooze paths from the beginning — by the per-subject
+snooze, and by a source snooze taking its own subjects off the board "with the same expiry, so
+they come back on their own" — and read by *neither*. `Projection::views` drops anything whose
+`handled` is `Snoozed` and looks no further. So every snooze with an expiry was in practice
+indefinite: the only ways back were un-snoozing by hand, or a new signal the operator was
+personally in.
+
+The `snooze-lapse` scheduler task closes it — one indexed read a minute, and an `UPDATE` back to
+`open` only when something is actually due. A **sweep** rather than a check on read, because
+`handled` is what the notifier, the correlation engine and the root-cause guard all consult:
+waking only when somebody looks at the board would leave those three suppressing work whose
+snooze expired hours ago. Idempotent and restart-safe, so a tick that is late or lost costs
+latency and nothing else — the row still records when it was due. A snooze with **no** expiry is
+untouched, because "off the board until it moves" is a different thing to have asked for.
+
+### Bulk snooze — clearing what the filter is showing
+
+The board's own axis, next to the two above. The source snooze is "not Slack, not now"; the
+per-subject `s` is a judgement about one thread you have read. Neither covers *"these forty
+alert threads, gone"* — which is what an operator actually does after an alert storm, and what
+they were doing forty keystrokes at a time.
+
+`snooze showing…` sits on the filter strip because **the filter is what scopes it**: put
+anywhere else it would be a button whose blast radius you have to go and look up. It takes what
+is on screen, asks for a duration, and writes them in **one transaction over one route**
+(`POST /api/subjects/handled`). Looping the single-subject route would have been forty-one full
+board projections and forty-one WebSocket frames, each rendering a part-triaged board.
+
+Durations, not the indefinite snooze `s` applies, and that is the whole reason the lapse sweep
+above had to exist first: an indefinite bulk snooze is how a board silently becomes a list of
+things nobody will look at again.
+
+Criticals are held back by default and **named** — `keep 3 on the board` / `snooze them too` —
+the same guard `quiet.rs` puts on a source snooze, for a stronger reason: a bulk snooze is the
+one triage action taken *without reading the rows*. Overridable, because a safe default that
+cannot be argued with is a tool arguing with its operator; the override is a second click, in
+critical red, and says what it is silencing.
+
+Snoozes are announced at boot for the same reason the rail shows a live countdown: a snooze
+that survives a restart and says nothing is indistinguishable from a source that has quietly
+broken. That is the failure this feature could most easily be mistaken for, so remaining time
+is visible everywhere the snooze is.
+
+### Only purely-that-source subjects
+
+A pull request with Slack chatter on it is not a Slack notification. The bulk query's
+`NOT EXISTS` clause excludes any subject carrying a signal from elsewhere, and already-handled
+subjects are left alone — rewriting an acknowledged thread's state would move it from "I've
+seen this" to "hidden".
+
+Verified against a copy of a real 38-subject board: with the default floor, **0** taken; with
+`everything`, exactly the **2** purely-Slack subjects and no GitHub subject touched.
+
+### Reused state, not a fifth one
+
+A snoozed-by-source subject is `Handled::Snoozed`, the state that already exists. The board,
+the notifier, the correlation engine and the root-cause guard all already refuse to act on it;
+a new handled state would have meant teaching every one of them, and the ones that were missed
+would be places the snooze silently did not apply.
+
+### The bug this surfaced: 77% of Slack claimed to be an outage
+
+The first run of the snooze against real data took **0 subjects** — because 518 of 669 stored
+Slack alerts were classified `critical`, and a critical-floor snooze lets criticals through.
+The feature was correct and useless at the same time.
+
+The cause was keyword classification by substring:
+
+- `"down"` matched inside `RegionEnvMeltdown`
+- `"page"` matched the phrase *"a real OOM, not reclaimable page cache"*
+
+Both are alert *descriptions*, not alert severities — and both notifications were `[RESOLVED]`,
+so the classifier was calling a recovery an outage. Meanwhile `severity = warning` sat in the
+message a few lines down, ignored.
+
+The classifier now, in order: **a resolved alert is `Info`** (resolution beats even a
+`severity = critical` label — the label describes the condition and the condition is over);
+then **the alert's own `severity =` label**, because it is the author's answer to the question
+being guessed at; then the keyword list, matched on **whole words**, for alerts that carry no
+label (some rules deliberately don't).
+
+Measured over the same 669 real alerts:
+
+| | before | after |
+|---|---|---|
+| critical | **518** (77%) | **162** (24%) |
+| warning | 151 | 364 |
+| info | 0 | 143 |
+
+The forward-looking part matters: this changes what *new* signals are classified as. The 669
+already stored keep their old severity, which is why the snooze still takes 0 from today's
+board — a backfill is a separate, deliberate migration, not something to do silently to a live
+store.
+
+## Tidying the notification inbox — the one write, and why it cannot slip
+
+GitHub's notification feed fills with work that has already happened. On a real inbox of 50,
+**35 were green or skipped CI runs** — and every one of the other 15 was a `review_requested`,
+`author`, or `comment` notification, i.e. something that genuinely wanted a person. That ratio
+is the feature: the signal was there all along, under seven-to-one noise.
+
+### The write is un-aimable by construction
+
+`Tidier::clear` takes a thread id, checks it is **nothing but digits**, and builds
+`…/notifications/threads/{id}` itself. No input reaches the path. There is no argument a
+caller could pass — and no malformed `subject.url` an API response could carry — that turns
+this into a write against a pull request, a review, or a label.
+
+That is a property of the code rather than a promise, which is the only kind worth making
+here, and `the_write_cannot_be_aimed_at_anything_but_a_notification_thread` asserts it against
+path traversal, absolute URLs, query strings, and non-numeric ids.
+
+### The two rules, and the two things the literal rules would have thrown away
+
+Asked for: `ci_activity`, and anything merged. Read literally that is a one-line rule. But the
+*purpose* — "clean up my notifications for things that really need my attention" — qualifies
+it in two places, and both are failures you would only discover after something was gone:
+
+- **A failed CI run is not noise.** Red on a branch you own is the single most attention-worthy
+  thing in the feed, and it arrives under `ci_activity` exactly like every green one.
+  `keep_failed_ci` defaults to keeping them; the classifier errs towards keeping, treating
+  `cancelled` and `timed out` as failures too, because a title it cannot read as green should
+  survive.
+- **A merged pull request can still contain a question aimed at you.** `mention`,
+  `team_mention`, `review_requested` and `assign` mean a human addressed you specifically, and
+  merging the PR did not answer them. Those reasons do *not* protect a CI notification — a
+  workflow run has no author and cannot have asked you anything.
+
+And `security_alert` is never cleared, deliberately not as a setting: it is the one
+notification whose cost of being wrongly dismissed is unbounded, and it arrives as `closed` on
+a repository whose advisory has been published — precisely the shape the merged rule sweeps.
+
+The merged rule reads a **resolved** state and never infers one. With
+`[sources.github].enrich = false` there is no state, so it does not fire. A closed *issue* is
+not a merged pull request either — it may have been closed as "not planned", with the question
+you were asked still in it.
+
+### Dry run by default, and an audit trail that outlives the notification
+
+`dry_run` defaults to **true**, so switching this on produces a list rather than an emptied
+inbox. Every decision is recorded in `tidied_notifications` either way, and the row is written
+*before* the API call — so a crash leaves a record of what was about to happen rather than a
+gap, and a failed clear is walked back to `cleared = 0` rather than claiming something left
+that is still sitting there.
+
+The table exists because of an asymmetry: this is the only outward-facing, awkward-to-undo
+thing MuggleBot does, and "what did it take out of my inbox?" is a question you have *exactly*
+when the notification is no longer there to look at.
+
+### It rides the existing poll
+
+A separate module, not a separate poller. A second watcher on `/notifications` would double the
+request cost, could not share the `Last-Modified` cursor that makes most polls a 304, and would
+have to re-fetch every subject to learn what is merged — which this poll's enrichment already
+knows.
+
+Candidates are collected at **two** points in that walk, which is not an accident: a
+notification the `watch` filter or `ignore_prefixes` drops never reaches enrichment, and those
+are exactly the CI runs the tidier is for. So the CI decision (reason and title alone) is taken
+before those `continue`s and the merged decision after enrichment. On the real config this
+matters immediately: `ignore_prefixes` already contained `"Claude Code workflow run skipped for
+main branch"`, so MuggleBot had been told to ignore that noise while it went on piling up in
+GitHub.
+
+The sweep runs **after** the signals are built, so a tidier that errors or hangs cannot cost
+the poll its batch. And clearing a notification does not suppress its signal: the board is
+MuggleBot's own attention model, and the CI signals it keeps are what correlate a failing run
+to its pull request. The inbox is the thing being cleaned.
+
+Token scope: a classic PAT needs `notifications`; a fine-grained one needs read+write on
+"Notifications". A read-only token 403s on the clear, and the error says which scope is missing
+rather than passing GitHub's string through.
 
 ## Comments — read on merit, not on position
 
@@ -2799,6 +3665,156 @@ so.
 A single-pane dashboard in the **LCARS** idiom (the swooping Okudagram panels from
 Star Trek: TNG). The aesthetic isn't just fun — LCARS is genuinely good at dense,
 color-coded, panelized status display, which is exactly the job.
+
+### The primitive layer — `ui/src/components/ui.tsx`
+
+**Every screen is built from one small set of boxes, and they are components rather than CSS
+classes.** That distinction is the whole point: a class is an invitation to be creative with,
+and the app had already proved it. `.panel` was the page-section container on six screens;
+`.card` was a *board item* — inset, coloured left rank spine, `cursor: pointer` — and two
+screens used it as their section container anyway, so their headings rendered as clickable
+board rows. Alongside those sat **thirteen** bespoke "title left, meta right" rules and **four**
+different page shells. `Panel` is now the only way to draw a section, so a section cannot
+accidentally be drawn as a board item.
+
+| Primitive | What it is | Replaced |
+|---|---|---|
+| `Page` | The one page shell: title, subtitle, screen actions. Owns the scroll container. | 4 page-header idioms |
+| `Panel` | The one section container. `tone` is `quiet` (subordinate) or `alert` (a failure), never decorative. | `section.panel`, `.card`-as-section, bare `.panel` |
+| `SectionHead` | Title left, meta and actions right. Exported separately for heads *inside* a panel. | 13 `*-head` rules |
+| `Toolbar` | The input-and-button strip a screen opens with. | `.thread-input`, `.review-input`, ad-hoc `.row` |
+| `Empty` | Nothing to show, **and which nothing**: `clear` / `waiting` / `unset` / `error`. | one grey sentence everywhere |
+| `Form` / `Field` | A *labelled* control — a placeholder is not a label, it vanishes when there's a value. | `.form`'s bare stack of placeholder-only inputs |
+| `Item` | One entry in a list: title, actions, body, foot. | `.mem-item` (×3 screens), `.cred-row` |
+| `Stat` / `Stats` | A number with the word for what it counts, in tabular figures. | per-screen hand-laid counts |
+| `Tabs` | Switching within a destination. Caller owns the active value, so a tab can be driven from the URL. | new |
+
+Deliberately **not** in this layer: the design tokens, `button`, `input`, `.chip`, `.badge`,
+`.muted`. Those were already consistent app-wide and are used directly — the breakage was all
+in the composition above them.
+
+Two rules that were each defined three times, scoped to three different parents, and therefore
+worked nowhere else — now global, and split because they are different claims:
+
+- **`button.destructive`** — this removes something that was here. Critical red.
+- **`button.mutating`** — this reaches outside MuggleBot and changes something real: rewrites a
+  control-plane document, applies to a live cluster, mints a token. Amber. It should never look
+  like `view json`.
+
+`.card` now means exactly one thing again: **a subject on a board.** The Incidents list renders
+as cards for that reason — it used to draw `.lane-row`, the board's *previous* row shape, under
+a comment claiming the two lined up. They stopped lining up the day the board moved to cards,
+and Incidents was the only screen left holding that language alive. A past analysis run (Read)
+is a `.run`: a raised record, not an item competing for attention.
+
+### The subject view — `components/detail/`
+
+`SubjectDetail.tsx` renders eleven panels and was a single 2,100-line component. The panels
+that are **presentational over one resource** now live in `components/detail/`: `RootCause`,
+`IssueTriage`, `DashboardReadings`.
+
+They take data and callbacks as props; the resources and the single 5s interval that refreshes
+every in-flight panel at once stay in `SubjectDetail`. Splitting the resources out too would
+give each panel its own timer for no gain.
+
+The Summary and Timeline panels deliberately stayed put. They are entangled with the page's
+action state — `busy`, `run()`, `actionError`, `reconsidering`, the signal modal, the selection
+set — and pulling them out behind eight-prop interfaces trades one kind of complexity for
+another. Extract a panel when its interface is three or four props, not before.
+
+### One palette, one scale
+
+Every colour, radius and tracking value comes from a token in `:root`. That is now true; it
+was not before, and the ways it failed are worth naming because they all failed *silently*:
+
+- **A shadow palette.** 73 hardcoded colours — `#8ab4f8`, `#9aa0a6`, `#f0c674`, `#7ddf8f`,
+  `#f28b82`, `#10100f` and friends — ran through the code-index, issue-scoring and attempts
+  regions. A second, foreign palette sitting next to the real one. Each mapped cleanly onto an
+  existing token by meaning (fixes→`--ok`, partial→`--amber`, related→`--blue`,
+  unrelated→`--slate`, request-changes→`--sev-critical`).
+- **Three variables that were never defined.** `--lcars-tan` (26 uses), `--sev-ok` and
+  `--muted` were only ever written as `var(--lcars-tan, #d69a78)`, so every use quietly
+  resolved to its hardcoded fallback. An entire region of the UI rendered in an off-palette
+  tan that nothing else in the app used, and no amount of editing `:root` would have changed
+  it. **If you write `var(--x, fallback)`, `--x` must exist** — otherwise the fallback *is* the
+  design, and it is invisible to anyone reading the palette.
+- **Eight tracking values** across 23 uppercase micro-labels doing the same job (0.04em →
+  0.14em). Now `--track`.
+- **Six corner radii** for three roles. Now `--radius` (panels), `--radius-sm` (insets — list
+  items, wells, code blocks), `--radius-xs` (chip-sized), plus `--pill` and `50%`.
+
+**Selected state has one language.** It was expressed six ways; now: `--blue` for a selected
+control, `--panel` only for the chrome (the elbow, the active nav pill), and `--lilac` where
+what you selected is a *person* — the identity hue, so "reviewing as Pavel" does not read as
+just another filter being on. `--amber` remains warning-only.
+
+Identical rule bodies went from 16 shared pairs to 3. The big one: seventeen rules expressing
+**three** row shapes, where the 6/8/10px gap between them tracked nothing but which screen was
+written first.
+
+### Destinations
+
+Eight, not twelve. The rail is the most expensive real estate in the app — every slot is a
+thing the operator has to rule out before finding the one they want — and eight of the twelve
+were sub-views that had a slot because there was nowhere else to put them.
+
+| Destination | The question it answers |
+|---|---|
+| **Board** | What does my work need from me? |
+| **Incidents** | What is broken in production? |
+| **Chat** | (ask MuggleBot) |
+| **Read** | Point at a thread or a branch and have it read properly. *(was Threads + Review)* |
+| **Personas** | Who is this work with? |
+| **Knowledge** | What has MuggleBot been told and read? *(was Memory + Context + Tags)* |
+| **Directory** | What does this name refer to? *(was Code index + Cloud)* |
+| **Config** | |
+
+What merged, and on whose authority: each merge is one the *old navigation's own comments*
+already argued for. Threads and Review — "both are 'point at a thing and have it read properly',
+and both use the personas". Code index and Cloud — "both answer 'what does this name refer to'
+about a body of things that exists whether or not anything is on fire". Memory, Context and Tags
+are one body of grounding seen three ways, and tags are a *property* of the other two rather
+than a peer of them.
+
+**Board and Incidents deliberately did not merge.** It is the tempting one and the wrong one:
+they are disjoint by construction server-side (`board_views()` excludes incidents,
+`incident_views()` is only incidents) and they answer different questions — one is driven by
+what you have read, the other by what incident.io says. They now *look* alike, which is the
+consistency that was missing; being one list is not.
+
+**Legacy URLs still resolve.** `#/memory`, `#/context`, `#/tags`, `#/threads`, `#/review`,
+`#/index` and `#/cloud/<id>` all land on the right tab. A URL that has been published — into a
+ticket, into a Slack message — is a promise, and renaming the screen behind it is not a reason
+to break it. The tab is in the hash (`#/knowledge/tags`) for the same reason the view is.
+
+**What is open is part of the location, not of the component.** `#/read/branch/<branch key>`,
+`#/read/thread/<id>`, `#/t/<subject>`, `#/cloud/<entity>`. A tab's component unmounts the moment
+you leave it, so anything held in a local signal is gone when you come back — which is how a
+finished branch review you had waited on came back as an empty pane. If a screen can have
+something open, the router owns which one.
+
+Two traps here, both of which were live bugs:
+
+- **`raw.split("/", 3)` does not do what it looks like.** JavaScript's limit argument
+  *truncates* the array rather than packing the remainder into the last element, so
+  `read/branch/owner%2Frepo@main` parsed as `["read","branch"]` and the selection silently
+  vanished. Split by index.
+- **Don't record "where I was" from an effect.** `go()` writes `view`, `sub` and `selected`, and
+  unless every write is batched there is an instant where the old view is paired with the new
+  cleared tab — so the effect records that the destination you are leaving had nothing open.
+  `go()` writes the departure point down before it moves anything.
+
+**A destination is somewhere you return to.** Clicking a rail item restores the tab and the
+selection you left it on. Before the merge `Review` was its own slot, so clicking it took you
+back to what you were reading; a tabbed destination that always resets to tab one takes that
+away, and it reads as the app having discarded your work.
+
+**Filtering the board moved off the rail.** Clicking a source used to filter the board *and*
+navigate you to it from wherever you were — a control in the global chrome that moves you is one
+you cannot use without leaving what you were doing. The chips now live in the board's own
+header, carrying a count each, because a filter that turns out to be empty is a click you should
+not have had to make to find out. What stayed in the rail is the genuinely global part: whether
+a source is healthy, and whether it is snoozed.
 
 - **The foot clock — UTC, then Denver, London, Berlin.** A 26px strip below the body, outside the
   scrolling region, so it is frame like the top band rather than something a view can slide under.
@@ -3066,7 +4082,7 @@ red_alert_min_confidence = 0.75
 [reasoner]
 # Does all the work. Every automatic pass runs here and nowhere else.
 local = "ollama_local"
-local_model = "deepseek-coder:33b"
+local_model = "gemma4:31b"
 vision_model = "qwen2.5vl:7b"  # images dropped into chat; a coder model has no encoder
 
 # Used ONLY when asked for by name: the chat pane's picker, or 2ND OPINION on a subject.
@@ -3078,7 +4094,7 @@ mid = "claude"
 mid_model = "claude-sonnet-5"
 
 ollama_url = "http://127.0.0.1:11434"
-ollama_model = "deepseek-coder:33b"
+ollama_model = "gemma4:31b"
 local_only_sources = []        # pins a source local even if routing is later turned on
 
 # Off: escalating on a grade is a cloud call nobody asked for, which is the one thing
@@ -3445,6 +4461,18 @@ cargo clippy --all-targets     # warning-free
 cargo test                     # backend unit/integration tests
 cd ui && npx tsc --noEmit && npm run build   # UI typecheck + build
 ```
+
+**`npm run build` is not optional, and skipping it fails silently.** The daemon serves
+`ui/dist` (`ServeDir`, or `MUGGLEBOT_UI_DIR`) — a *built* bundle, not the sources. `tsc
+--noEmit` proves the code compiles and says nothing about what the browser gets, so a UI change
+with `cargo test`, `clippy` and `tsc` all green can be entirely absent from the running app,
+with no error anywhere to suggest it. The tell is that the page behaves exactly as it did
+before the change: an old bundle is not a broken one.
+
+Observed: a run of UI changes was verified with `tsc --noEmit` alone and shipped against an
+eight-day-old bundle. The first sign was the operator being shown a dialog that had been
+deleted. If a UI change appears to have had no effect, check `ls -la ui/dist/assets` against
+the source mtime before debugging anything else.
 
 Handler logic is tested by calling the inner functions directly — the `ctx.run`
 bodies are ordinary async functions and should stay that way, so the tests need

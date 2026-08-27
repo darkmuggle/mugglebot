@@ -141,7 +141,37 @@ export interface SubjectView {
   /// Both, so they can be shown side by side and labelled — the point of a second opinion
   /// is comparing it to the first.
   explanations: Explanation[];
+  /// Restate Cloud entities named in this subject's signals, plus everything they reach:
+  /// the environment somebody pasted, then its account, organization, region and Nuon
+  /// install. Mentions come first, ancestors after. Empty when nothing was mentioned, or
+  /// when the resolver has not reached it yet.
+  cloud: CloudEntity[];
   attention: Attention;
+}
+
+/// One resolved platform entity — see `src/cloud.rs`. Curated fields only: raw
+/// virtual-object state carries credentials and never leaves the daemon.
+export interface CloudEntity {
+  id: string;
+  /// `environment`, `account`, `organization`, `region`, `user`, `group`, `apikey`, or
+  /// `nuon-install`.
+  kind: string;
+  name: string | null;
+  status: string | null;
+  fields: { label: string; value: string }[];
+  /// Ids this entity names — its parents. Each is another entry in the same list, so the
+  /// panel can link between boxes.
+  related: string[];
+  /// Ids this entity contains — an account's people, an organization's members and groups.
+  /// Exists because nothing lists users, so the estate walk needs somewhere to find them; and
+  /// because an organization's members name nothing at all, so the reverse of `related` cannot
+  /// find them either. `explore_cloud_entity` merges these into `children`, so the panel reads
+  /// one "Contains" list rather than two. See `src/cloud.rs`.
+  members: string[];
+  /// Why the lookup failed, when it did. An id that is real but unreadable (an expired
+  /// `rcc` token, most often) is worth saying out loud rather than hiding.
+  error: string | null;
+  fetched_at: string;
 }
 
 export interface Explanation {
@@ -1112,4 +1142,90 @@ export interface ThreadVerdict {
   /// Models that were asked and did not answer. Non-empty means nothing on the page could
   /// have been corroborated, so the absence of "both models" says nothing about the findings.
   failures: string[];
+}
+
+
+/// A source silenced for a while — see `src/quiet.rs`.
+export interface SourceSnooze {
+  /// Wire name: `github` | `slack` | `granola` | `incident_io`.
+  source: string;
+  until: string;
+  /// `1h47m` / `12m` / `40s`, computed server-side against one clock.
+  remaining: string;
+  /// The lowest severity still getting through — normally `critical`, which is what stops a
+  /// snooze being able to hide an outage. `everything` means nothing is: total silence.
+  floor: string;
+  /// True when nothing gets through, criticals included. Marked loudly, because that is a
+  /// different kind of decision from a normal snooze.
+  total: boolean;
+  set_at: string;
+}
+
+
+// ---- GitHub branch review (src/ghreview.rs) ----------------------------------
+
+/// Who produced a review comment.
+///
+/// `"model"` is the model's own read of the code. `{ persona: slug }` is a **rehearsal** — what
+/// that person would probably say — and must be rendered as one everywhere: the sentence reads
+/// identically either way, and only the label says which it is.
+export type Reviewer = "model" | { persona: string };
+
+export interface PlacedComment {
+  path: string;
+  severity: "blocker" | "concern" | "nit" | "praise";
+  note: string;
+  /// The line its author quoted, verbatim.
+  anchor: string | null;
+  /// Resolved index into that file's patch lines. Null when nothing matched — the comment then
+  /// renders against the file rather than a line, which stops an unresolvable anchor becoming a
+  /// note on the wrong code.
+  patch_index: number | null;
+  by: Reviewer;
+  /// Persona trait ids the point rested on. Empty for a model review.
+  because: string[];
+}
+
+export interface BranchPass {
+  id: string;
+  branch_key: string;
+  repo: string;
+  head: string;
+  base: string;
+  /// The commit reviewed. A pass is about a commit, not a branch name — when the branch moves
+  /// the review does not follow it, which makes it stale rather than wrong.
+  head_sha: string;
+  by: Reviewer;
+  provider: string;
+  model: string;
+  status: "pending" | "running" | "done" | "failed";
+  /// `approve` / `comment` / `request_changes`, or `would not engage` for a persona who
+  /// wouldn't look at this.
+  recommendation: string | null;
+  summary: string | null;
+  comments: PlacedComment[];
+  /// Hidden from the diff, kept on the record.
+  dismissed: boolean;
+  error: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface BranchReview {
+  branch_key: string;
+  repo: string;
+  head: string;
+  base: string;
+  head_sha: string;
+  tally: { reviewer: string; comments: number }[];
+  /// Comments from every pass still showing, in file-then-position order.
+  visible: PlacedComment[];
+  passes: BranchPass[];
+  /// The diff the comments are anchored to.
+  diff: {
+    files: { path: string; additions: number; deletions: number; patch: string | null }[];
+    file_count: number;
+    additions: number;
+    deletions: number;
+  } | null;
 }

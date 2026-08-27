@@ -271,11 +271,14 @@ mod tests {
             investigator,
             repos,
             browser,
+            quiet: Arc::new(crate::quiet::Quiet::new(store.clone())),
+            reviews: Arc::new(crate::ghreview::Runner::for_tests(store.clone())),
             threads: Arc::new(crate::thread::Analyser::for_tests(store.clone())),
             diffs: Arc::new(
                 crate::prdiff::DiffReader::new(None, reasoner.clone(), "local").unwrap(),
             ),
-            personas: Arc::new(crate::persona::Engine::for_tests(store)),
+            personas: Arc::new(crate::persona::Engine::for_tests(store.clone())),
+            cloud: Arc::new(crate::cloud::Resolver::new(Default::default(), store)),
         })))
     }
 

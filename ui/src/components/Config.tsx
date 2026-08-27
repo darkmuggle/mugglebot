@@ -1,5 +1,6 @@
 import { createResource, createSignal, For, Show } from "solid-js";
 import { api } from "../api";
+import { Empty, Field, Form, Page, Panel, Toolbar } from "./ui";
 
 export default function ConfigPage() {
   const [creds, { refetch: refetchCreds }] = createResource(() =>
@@ -38,31 +39,44 @@ export default function ConfigPage() {
     try {
       await api.setSecret(account(), secret());
       setSecret("");
-      setCredMsg(`stored '${account()}' in the local database — restart MuggleBot to apply source-token changes`);
+      setCredMsg(`Stored '${account()}' in the local database — restart MuggleBot to apply source-token changes.`);
       refetchCreds();
     } catch (e) {
-      setCredMsg(`error: ${e}`);
+      setCredMsg(`Error: ${e}`);
     }
   };
 
   const removeCred = async (acc: string) => {
     if (!confirm(`Delete credential '${acc}'?`)) return;
     await api.deleteSecret(acc);
-    setCredMsg(`deleted '${acc}' from the local database — restart MuggleBot to apply source-token changes`);
+    setCredMsg(`Deleted '${acc}' from the local database — restart MuggleBot to apply source-token changes.`);
     refetchCreds();
   };
 
+  const missing = () => (creds() ?? []).filter((s) => !s.set).length;
+
   return (
-    <div class="page">
-      <section class="panel">
-        <h3>CREDENTIALS (LOCAL DATABASE)</h3>
-        <p class="muted">
-          Secrets are stored in MuggleBot's local SQLite database, never the config file. Treat the
-          MuggleBot data directory as sensitive, and restart after changing a source token. Reasoning
-          uses the Claude/Codex CLI — no LLM API keys needed; <code>ollama</code> is the optional
-          Ollama&nbsp;Cloud key.
+    <Page
+      title="Config"
+      subtitle="Credentials live in MuggleBot's local SQLite database, never in the config file. Treat the data directory as sensitive, and restart after changing a source token."
+    >
+      <Panel
+        title="Credentials"
+        /* The count that matters is the missing one — a source with no token is a source that
+           has silently never worked, and that is not visible from a list of green dots. */
+        meta={
+          missing() ? (
+            <span class="meta-warn">{missing()} missing</span>
+          ) : (
+            `${(creds() ?? []).length} set`
+          )
+        }
+      >
+        <p class="muted panel-lede">
+          Reasoning uses the Claude/Codex CLI — no LLM API keys are needed here.{" "}
+          <code>ollama</code> is the optional Ollama&nbsp;Cloud key.
         </p>
-        <For each={creds() ?? []}>
+        <For each={creds() ?? []} fallback={<Empty kind="waiting">Reading credentials…</Empty>}>
           {(s) => (
             <div class="cred-row">
               <span class={`dot ${s.set ? "on" : "off"}`} />
@@ -75,41 +89,60 @@ export default function ConfigPage() {
                   : "missing"}
               </span>
               <Show when={s.set}>
-                <button onClick={() => removeCred(s.name)}>delete</button>
+                <button class="destructive" onClick={() => removeCred(s.name)}>
+                  Delete
+                </button>
               </Show>
             </div>
           )}
         </For>
-        <div class="form">
-          <div class="row">
-            <input placeholder="account (e.g. github)" value={account()} onInput={(e) => setAccount(e.currentTarget.value)} />
-            <input class="grow" type="password" placeholder="secret / token" value={secret()} onInput={(e) => setSecret(e.currentTarget.value)} />
-            <button onClick={saveCred}>Store</button>
-          </div>
+
+        <Form>
+          <Field label="Store a credential" hint="the account name a source or context entry refers to">
+            <Toolbar>
+              <input
+                placeholder="account (e.g. github)"
+                value={account()}
+                onInput={(e) => setAccount(e.currentTarget.value)}
+              />
+              <input
+                type="password"
+                placeholder="secret / token"
+                value={secret()}
+                onInput={(e) => setSecret(e.currentTarget.value)}
+              />
+              <button onClick={saveCred}>Store</button>
+            </Toolbar>
+          </Field>
           <Show when={credMsg()}>
             <div class="muted">{credMsg()}</div>
           </Show>
-        </div>
-      </section>
+        </Form>
+      </Panel>
 
-      <section class="panel">
-        <div class="mem-head">
-          <h3>CONFIGURATION (config.toml)</h3>
-          <span class="tl-actions">
-            <button disabled={saving() || !dirty()} onClick={save}>
-              {saving() ? "Saving…" : dirty() ? "SAVE" : "Saved"}
-            </button>
+      <Panel
+        title="config.toml"
+        /* Dirty state on the panel head, not only on the button label. "SAVE" vs "Saved" on
+           the same control was the only thing distinguishing an edited file from a saved one,
+           and it is the least visible pixel on the screen. */
+        meta={dirty() ? <span class="meta-warn">unsaved changes</span> : "saved"}
+        actions={
+          <>
             <Show when={dirty()}>
               <button onClick={() => setDraft(null)}>Revert</button>
             </Show>
-          </span>
-        </div>
-        <p class="muted">
-          Edit and save the daemon's TOML. Invalid TOML is rejected. Most changes (sources, reasoner
-          routing, intervals) apply on the next restart.
+            <button class="primary" disabled={saving() || !dirty()} onClick={save}>
+              {saving() ? "Saving…" : "Save"}
+            </button>
+          </>
+        }
+      >
+        <p class="muted panel-lede">
+          Invalid TOML is rejected. Most changes — sources, reasoner routing, intervals — apply
+          on the next restart.
         </p>
         <Show when={loaded.error}>
-          <div class="flag-strip">Could not load config: {String(loaded.error)}</div>
+          <Empty kind="error">Could not load config: {String(loaded.error)}</Empty>
         </Show>
         <textarea
           class="config-edit"
@@ -120,7 +153,7 @@ export default function ConfigPage() {
         <Show when={saveMsg()}>
           <div class="muted save-msg">{saveMsg()}</div>
         </Show>
-      </section>
-    </div>
+      </Panel>
+    </Page>
   );
 }

@@ -59,6 +59,11 @@ pub struct IngestOps {
     /// be ignored.
     pub personas_on_engagement: bool,
     pub contexts_dir: std::path::PathBuf,
+    /// Extra read-only documentation trees synced alongside the managed one — a repo's
+    /// `docs/` checkout, typically. See [`crate::config::ContextLibrary::dirs`].
+    pub extra_context_dirs: Vec<std::path::PathBuf>,
+    /// Resolves `env_…`/`acc_…` mentions into the context box. See [`crate::cloud`].
+    pub cloud: Arc<crate::cloud::Resolver>,
 }
 
 /// What one poll produced, in a form the object can journal.
@@ -236,14 +241,72 @@ impl IngestOps {
             .collect()
     }
 
-    /// Walk the managed contexts tree and register/reload what changed.
+    /// Walk the managed contexts tree — and any configured documentation checkouts — and
+    /// register/reload what changed.
+    ///
+    /// A failing extra directory is logged and stepped over rather than aborting the sweep:
+    /// these point outside MuggleBot's own data directory, so "the operator moved the
+    /// checkout" is a normal thing to survive, and it must not take the managed tree with it.
     pub async fn sync_contexts_dir(&self) -> Result<usize> {
-        let n = self.context.sync_dir(&self.contexts_dir).await?;
+        let mut n = self.context.sync_dir(&self.contexts_dir).await?;
+        for dir in &self.extra_context_dirs {
+            match self.context.sync_dir(dir).await {
+                Ok(extra) => n += extra,
+                Err(e) => warn!("context dir {} sync failed: {e:#}", dir.display()),
+            }
+        }
         let filled = self.context.backfill_tag_summaries().await;
         if filled > 0 {
             debug!("tags: backfilled {filled} summary(ies)");
         }
         Ok(n)
+    }
+
+    /// Resolve the platform ids ingest has seen but nothing has read yet.
+    ///
+    /// Runs on the scheduler rather than at ingest because each id is a subprocess. The
+    /// batch is capped by the resolver's own entity budget, so a burst of mentions is spread
+    /// over consecutive ticks instead of forking thirty CLIs at once.
+    /// Put subjects whose snooze has run out back on the board, and say so.
+    ///
+    /// The broadcast is the reason this is here rather than a bare store call in the
+    /// scheduler: a snooze that lapses while the operator is looking at the board should put
+    /// the work back in front of them, not wait for the next signal to trigger a redraw. An
+    /// idle tick sends nothing at all.
+    pub fn wake_lapsed_snoozes(&self) -> Result<usize> {
+        let woken = self.store.wake_lapsed_snoozes()?;
+        if woken.is_empty() {
+            return Ok(0);
+        }
+        debug!("woke {} subject(s) whose snooze expired", woken.len());
+        if let Ok(views) = self.attributor.board_views(true) {
+            let _ = self.events.send(Event::Board(views));
+        }
+        Ok(woken.len())
+    }
+
+    pub async fn resolve_cloud_entities(&self) -> Result<usize> {
+        if !self.cloud.enabled() {
+            return Ok(0);
+        }
+        let stale = self.cloud.stale_ids(&self.store)?;
+        if stale.is_empty() {
+            return Ok(0);
+        }
+        let resolved = self.cloud.resolve_closure(&stale).await;
+        debug!(
+            "cloud: resolved {} of {} queued",
+            resolved.len(),
+            stale.len()
+        );
+        // Only when there was work, and only when it went badly. `rcc whoami` is a second
+        // subprocess, so probing on every idle tick would cost more than the sweep it is
+        // checking on. A sweep where nothing resolved is exactly the shape an expired
+        // credential takes, and it is the shape worth spending a probe on.
+        if resolved.iter().all(|e| e.error.is_some()) || self.cloud.is_degraded() {
+            self.cloud.record_health().await;
+        }
+        Ok(resolved.len())
     }
 
     /// Investigations waiting to be read, as `(id, method)`. The workflow id is the claim
@@ -256,6 +319,11 @@ impl IngestOps {
         self.store
             .list_browser_investigations_pending()
             .unwrap_or_default()
+    }
+
+    /// Branch review passes waiting to run.
+    pub fn pending_branch_passes(&self) -> Vec<String> {
+        self.store.list_branch_passes_pending().unwrap_or_default()
     }
 
     /// Thread analyses waiting to run.
@@ -345,6 +413,11 @@ impl IngestOps {
             // triage that previously failed (or whose code has moved on) still
             // deserves another run, and the queue decides that for itself.
             crate::enrich::queue_issue_triage(&sig, &self.store);
+            // Scan-only, for the same reason: the ids go down now, the `rcc` reads happen on
+            // the scheduler's sweep.
+            if self.cloud.enabled() {
+                crate::enrich::cloud_ids(&sig, &self.store);
+            }
 
             match self.store.insert_signal(&sig) {
                 Ok(true) => {

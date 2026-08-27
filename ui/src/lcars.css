@@ -27,6 +27,14 @@
   --dim: #8195a8; /* secondary text — carries most of the board */
   --faint: #62748a; /* tertiary: refs, timestamps */
   --slate: #35485f; /* muted structural */
+  --bg-lift: #0b1524; /* the top-right lift in the body gradient */
+
+  /* Tracking for uppercase micro type. One value, because there was no reason for the
+     eight that were in use (0.04 → 0.14em across 23 labels that all do the same job) and
+     at 11px the difference between them is the difference between a row of labels that
+     line up and one that does not. 0.1em is what `.badge` and `.section-label` — the
+     documented chrome treatment — already used. */
+  --track: 0.1em;
 
   --sev-info: #5aa9e6;
   --sev-notice: #8195a8; /* the common case is not a warning: keep it neutral */
@@ -47,7 +55,12 @@
      start of the next one. */
   --measure: 68ch;
 
-  --radius: 16px;
+  --radius: 16px; /* panels and other large boxes */
+  /* Insets: list items, wells, code blocks, anything sitting *inside* a panel. There were
+     five values doing this job — 4, 5, 8, 10, 12px and 0.6rem — which is five different
+     corners on boxes the eye reads as one kind of thing. */
+  --radius-sm: 10px;
+  --radius-xs: 4px; /* chips-sized: inline code, facet pills */
   --pill: 999px;
   --gap: 10px;
   --glow: 0 0 0 1px rgba(90, 169, 230, 0.15), 0 6px 20px rgba(0, 0, 0, 0.45);
@@ -67,14 +80,13 @@ body,
 body {
   background: radial-gradient(
     1200px 800px at 70% -10%,
-    #0b1524 0%,
+    var(--bg-lift) 0%,
     var(--bg) 60%
   );
   color: var(--text);
   font-family: system-ui, "Helvetica Neue", Arial, sans-serif;
   -webkit-font-smoothing: antialiased;
 }
-
 /* The LCARS chrome treatment — uppercase, tracked — kept to the frame and to
    labels that name a region or a state.
 
@@ -86,11 +98,10 @@ body {
 .nav-pill,
 .rail-sep,
 .lane-head,
-.row-kind,
 .src,
 .state,
 .badge,
-.section-label {
+.section-label{
   text-transform: uppercase;
   letter-spacing: 0.1em;
 }
@@ -122,7 +133,7 @@ body {
   align-self: stretch;
   flex: 0 0 auto;
   background: var(--panel);
-  border-radius: var(--radius) 4px 4px 24px;
+  border-radius: var(--radius) var(--radius-xs) var(--radius-xs) 24px;
 }
 
 .title {
@@ -179,7 +190,7 @@ body {
   flex: 0 0 auto;
   margin-right: auto;
   background: var(--slate);
-  border-radius: 4px 4px 4px 14px;
+  border-radius: var(--radius-xs) var(--radius-xs) var(--radius-xs) var(--radius-sm);
 }
 
 .zone {
@@ -208,7 +219,7 @@ body {
   color: var(--lilac);
   font-size: var(--t-micro);
   text-transform: uppercase;
-  letter-spacing: 0.14em;
+  letter-spacing: var(--track);
 }
 
 .zone-time {
@@ -233,11 +244,6 @@ body {
 /* Shown only when the date there isn't the date here — the answer to "is it
    already tomorrow in Berlin", which is what makes a same-looking hour mean two
    different things. */
-.zone-day {
-  color: var(--faint);
-  font-size: var(--t-micro);
-  font-variant-numeric: tabular-nums;
-}
 
 /* ---- body ---- */
 .lcars-body {
@@ -378,58 +384,506 @@ body {
   gap: var(--gap);
   padding-right: 6px;
 }
+/* ---- the primitive layer -------------------------------------------------------
+   The composition vocabulary every screen is built from — see `components/ui.tsx`
+   for why it is a component layer and not just these classes. Nothing below is
+   reachable except through those components, which is the point: `.card` used to be
+   a board item that two screens drew their section headings with, and no amount of
+   CSS could stop that. A `Panel` can only be a panel.
 
+   These rules deliberately do not redefine tokens, `button`, `input`, `.chip` or
+   `.badge`. Those were already consistent app-wide; the breakage was all above them. */
+
+/* The page header. One title treatment, replacing four: `h2.panel-title` (Incidents),
+   `.card > .card-head > h2` (Threads, Review), `.panel > h3` (Memory, Context, Config,
+   Personas) and the board's own bespoke strip. */
+.page-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 2px 2px 6px;
+  border-bottom: 1px solid var(--line);
+}
+.page-head-text {
+  min-width: 0;
+}
+.page-title {
+  margin: 0;
+  font-size: var(--t-head);
+  font-weight: 700;
+  color: var(--text);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+/* One sentence on what the screen is for. Held to `--measure` because these are prose,
+   and a 200-character line of explanation across a wide window is not read. */
+.page-sub {
+  margin: 4px 0 0;
+  color: var(--dim);
+  font-size: var(--t-meta);
+  line-height: 1.5;
+  max-width: var(--measure);
+}
+.page-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 0 0 auto;
+}
+
+/* Title left, meta and controls right — the one rule that replaces thirteen. */
+.sec-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 12px;
+}
+/* A head nested inside a panel, above a subsection. Quieter, and no bottom margin
+   collapse to fight with — it separates, it doesn't announce. */
+.sec-head-sub {
+  margin: 14px 0 8px;
+}
+.sec-title {
+  margin: 0;
+  font-size: var(--t-body);
+  font-weight: 700;
+  color: var(--blue);
+}
+.sec-head-sub .sec-title {
+  font-size: var(--t-meta);
+  color: var(--dim);
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+}
+.sec-spacer {
+  flex: 1;
+}
+.sec-meta {
+  font-size: var(--t-meta);
+  color: var(--faint);
+  font-variant-numeric: tabular-nums;
+  flex: 0 0 auto;
+}
+.sec-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 0 0 auto;
+}
+
+/* A row of controls — the input-and-button strip most screens open with. */
+.toolbar input,
+.toolbar select {
+  flex: 1;
+  min-width: 180px;
+}
+
+/* Three row shapes, and every screen that needed one had written its own copy.
+
+   Seventeen rules expressed these three, and the gap between them (6px, 8px or 10px) tracked
+   nothing but which screen was written first — `.finding-head` and `.rc-head` are the same
+   control row on two screens and differed by 2px. One gap per shape now. */
+
+/* A row of controls: label, chips, buttons, all on one line. */
+.row,
+.toolbar,
+.rc-head,
+.patch-head,
+.modal-head,
+.tl-row,
+.thread-actions,
+.browser-investigation-head,
+.pm-actions,
+.finding-head,
+.pass-head {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+/* The same row, aligned on the text baseline rather than the box — for a heading followed by
+   a count or a timestamp, where centring makes the small text sit visibly high. */
+.series-head,
+.edge-line,
+.cloud-entity-head {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+/* A strip of chips. Tighter than a control row because chips already carry their own padding. */
+.chips,
+.review-history,
+.cloud-kinds,
+.modal-options,
+.board-filter {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+/* Nothing to show, and which nothing. The left rule carries the distinction without
+   adding a second colour to a screen that is, by definition, empty. */
 .empty {
   color: var(--dim);
   font-size: var(--t-body);
-  padding: 60px;
-  text-align: center;
+  line-height: 1.6;
+  padding: 28px 22px;
+  margin: 0;
+  text-align: left;
+  border-left: 2px solid var(--line-strong);
+  background: var(--surface-2);
+  border-radius: 0 var(--radius) var(--radius) 0;
+  max-width: var(--measure);
+}
+/* Clear is good news, so it reads as good news rather than as an absence. */
+.empty-clear {
+  border-left-color: var(--ok);
+}
+.empty-waiting {
+  border-left-color: var(--line-strong);
+  font-style: italic;
+}
+/* Not empty — *unconfigured*. The one the operator must be able to tell from `clear`,
+   because it is the state where a source has been silently dead for a week. */
+.empty-unset {
+  border-left-color: var(--amber);
+}
+.empty-error {
+  border-left-color: var(--sev-critical);
+}
+
+/* Forms. A labelled control, because a placeholder is not a label — it vanishes the
+   moment there is a value, leaving a filled-in form as four unlabelled boxes. */
+.form {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+.field-label {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  font-size: var(--t-micro);
+  color: var(--dim);
+  letter-spacing: var(--track);
+  text-transform: uppercase;
+}
+/* The qualification that was being crammed into the placeholder string. Not uppercase:
+   it is a sentence, not a label. */
+.field-hint {
+  text-transform: none;
+  letter-spacing: 0;
+  font-size: var(--t-micro);
+  color: var(--faint);
+}
+.form-actions {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  margin-top: 2px;
+}
+
+/* A panel's opening sentence — what this section is, before its contents. Sits under the
+   `sec-head` rather than floating as a loose `.muted` paragraph at whatever position each
+   screen happened to put it. */
+.panel-lede {
+  margin: -4px 0 14px;
+}
+
+/* A meta value that is a warning rather than a count — "3 missing", "unsaved changes".
+   The panel head's normal meta is `--faint`, which is right for a number and wrong for a
+   state the operator is supposed to act on. */
+.meta-warn {
+  color: var(--amber);
+  font-weight: 700;
+}
+
+/* A past run of something you pointed at — a thread analysis, a branch review. Expandable,
+   stacking up under the input that produced it.
+
+   It used to be `.card`, the board's *subject* shape: inset surface, coloured left rank
+   spine, `cursor: pointer`. A history of completed analyses rendered as a board you could
+   not act on. This is a raised surface like a panel, because that is what it is — a record,
+   not an item competing for attention. */
+.run {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 12px 14px;
+}
+.run + .run {
+  margin-top: 8px;
+}
+.run.open {
+  border-color: var(--line-strong);
+}
+.run-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  cursor: pointer;
+}
+/* The disclosure marker, so a collapsed run reads as openable rather than as a dead row. */
+.run-head::before {
+  content: "▸";
+  color: var(--faint);
+  font-size: var(--t-micro);
+  flex: 0 0 auto;
+}
+.run.open .run-head::before {
+  content: "▾";
+  color: var(--blue);
+}
+
+/* A plain vertical run of items where a `For` needs a container. */
+.stack {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+/* A semantic-recall score. Tabular so a column of them compares, and quiet because it
+   qualifies the hit rather than being the hit. */
+/* A small figure that qualifies rather than leads. */
+.score,
+.zone-day {
+  font-variant-numeric: tabular-nums;
+  font-size: var(--t-micro);
+  color: var(--faint);
+}
+
+/* A URL or path in an item title. Monospace and allowed to break: these are long, and
+   ellipsing one hides the part that distinguishes it from its neighbour. */
+.item-loc {
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: var(--t-meta);
+  font-weight: 400;
+  overflow-wrap: anywhere;
+  min-width: 0;
+}
+
+/* One entry in a list inside a panel. Replaces `.mem-item` (Memory, Context, Tags) and
+   `.cred-row` (Config), which were the same thing built twice. */
+.item {
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  padding: 10px 12px;
+  background: var(--surface-2);
+}
+.item + .item {
+  margin-top: 8px;
+}
+.item-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+.item-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  min-width: 0;
+  font-weight: 700;
+  color: var(--text);
+  font-size: var(--t-body);
+}
+/* Inline against the title, not `width: 100%` on a new line — which is what `.tl-actions`
+   did, so every list item reserved a full row for two small buttons. */
+.item-actions {
+  display: flex;
+  gap: 6px;
+  flex: 0 0 auto;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+.item-body {
+  margin-top: 6px;
+  color: var(--dim);
+  font-size: var(--t-meta);
+  line-height: 1.55;
+  max-width: var(--measure);
+}
+.item-body textarea {
+  width: 100%;
+  min-height: 90px;
+}
+/* Provenance and timestamps. Monospace because these are ids and dates being compared
+   down a column, not prose. */
+.item-foot {
+  margin-top: 8px;
+  font-size: var(--t-micro);
+  color: var(--faint);
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+/* A number worth reading, with the word for what it counts. Tabular figures so a row
+   of them lines up rather than jittering as the values change. */
+.stats {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 22px;
+}
+.stat {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+.stat-value {
+  font-size: var(--t-head);
+  font-weight: 700;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+  line-height: 1.1;
+}
+.stat-label {
+  font-size: var(--t-micro);
+  color: var(--faint);
+  text-transform: uppercase;
+  letter-spacing: var(--track);
+}
+.stat-ok .stat-value {
+  color: var(--ok);
+}
+.stat-warn .stat-value {
+  color: var(--amber);
+}
+.stat-bad .stat-value {
+  color: var(--sev-critical);
+}
+
+/* Tabs within a destination. The navigation rework folded several one-slot screens
+   into shared destinations, and this is what switches between them. */
+.tabs {
+  display: flex;
+  gap: 4px;
+  border-bottom: 1px solid var(--line);
+  margin-bottom: var(--gap);
+  flex-wrap: wrap;
+}
+.tab {
+  background: transparent;
+  border: none;
+  border-bottom: 2px solid transparent;
+  border-radius: 0;
+  padding: 8px 14px;
+  color: var(--dim);
+  font-size: var(--t-meta);
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+.tab:hover:not(:disabled) {
+  background: transparent;
+  color: var(--text);
+  border-color: transparent;
+  border-bottom-color: var(--line-strong);
+}
+.tab.active {
+  color: var(--blue);
+  border-bottom-color: var(--blue);
+}
+.tab-count {
+  font-size: var(--t-micro);
+  font-weight: 700;
+  color: var(--faint);
+  background: var(--surface-2);
+  border-radius: var(--pill);
+  padding: 0 6px;
+  font-variant-numeric: tabular-nums;
+}
+.tab.active .tab-count {
+  color: var(--blue);
 }
 
 /* ---- board header ----
-   The counts live here rather than in the rail, because this is where they are
-   acted on: "12 open · 2 to decide" is the sentence the board exists to say. */
-.board-head {
-  display: flex;
-  align-items: baseline;
-  gap: 10px;
-  flex: 0 0 auto;
-  padding: 0 2px 8px;
-  border-bottom: 1px solid var(--line);
-}
-.board-title {
-  font-size: var(--t-title);
-  font-weight: 600;
-  margin: 0;
-  letter-spacing: -0.01em;
-}
-.board-counts {
-  font-size: var(--t-meta);
-  color: var(--dim);
-  font-variant-numeric: tabular-nums;
-}
-.board-counts b {
+   The counts are the page subtitle now — "12 open · 2 to decide" is the sentence the board
+   exists to say, and `Page` is where a screen says what it is. `.board-head`, `.board-title`,
+   `.board-counts` and `.board-spacer` are gone with it: they were a fourth page-header idiom
+   built because there was no shared one. */
+
+/* The count that gets acted on. Amber, which in this file means "this wants you". */
+.board-decide {
   color: var(--amber);
-  font-weight: 600;
+  font-weight: 700;
 }
-.board-spacer {
-  flex: 1;
+
+/* Which sources the board is showing. Moved off the navigation rail, where clicking one
+   both filtered the board and navigated you to it — see the comment in `App.tsx`. */
+.board-filter {
+  align-items: center;
+  padding: 2px 2px 4px;
 }
-.board-head button.on {
+/* A source with nothing behind it is still listed, but it should not look like a live
+   choice — the count is the tell, so it stays legible while the chip recedes. */
+.board-filter .chip:not(.active) {
+  opacity: 0.75;
+}
+.board-filter .chip:hover {
+  opacity: 1;
+}
+
+/* The bulk action on the filter strip. Pushed to the far end, because it is the one control
+   there that is not a filter: everything to its left changes what you are looking at, and
+   this changes what is on the board. Sharing the row is deliberate — the filter is what
+   scopes it — but sharing the *group* would read as a fifth source. */
+.board-filter .bulk-snooze {
+  margin-left: auto;
+  border-color: transparent;
+}
+.board-filter .bulk-snooze:hover {
+  border-color: var(--amber);
+  color: var(--amber);
+}
+
+/* A toggle button that is currently on. Was `.board-head button.on`, so the same `on`
+   state elsewhere in the app rendered as an ordinary button. */
+button.on {
   background: var(--blue);
   color: var(--ink);
   border-color: var(--blue);
 }
-.board-head button.danger {
-  color: var(--sev-critical);
-  border-color: transparent;
+
+/* A selected chip. Defined three times before this — `.cloud-kinds .chip.active`,
+   `.modal-options .chip.active` and nowhere for anyone else — so a chip filter on a new
+   screen silently had no selected state. */
+.chip.active {
+  background: var(--blue);
+  border-color: var(--blue);
+  color: var(--ink);
 }
-.board-head button.danger:hover:not(:disabled) {
+.chip.active .chip-count {
+  color: var(--ink);
+  opacity: 0.7;
+}
+
+/* A chip that selects a *destructive* option rather than a filter — "snooze the criticals
+   too". `.chip.active` paints the chosen one blue, which is right for narrowing a list and
+   wrong for a choice whose entire content is that it silences an outage. Same red the rest
+   of the file uses for a thing that has gone wrong, and it only applies once chosen: an
+   unselected option should not be shouting. */
+.chip.destructive.active {
+  background: var(--sev-critical);
   border-color: var(--sev-critical);
-}
-.board-head button.danger:disabled {
-  opacity: 0.6;
-  cursor: default;
+  color: var(--ink);
 }
 
 .muted {
@@ -470,30 +924,10 @@ body {
   font-weight: 600;
   color: var(--faint);
 }
-/* Decide is the lane you are meant to look at first, so it is the only one that
-   gets a colour. */
-.lane-decide .lane-head {
-  color: var(--amber);
-}
 .lane-count {
   color: var(--dim);
   font-variant-numeric: tabular-nums;
   letter-spacing: 0;
-}
-/* The type split inside a lane. Quieter than the lane head — the lane is the
-   judgement ("decide this"), the type is only what doing it involves. */
-.type-head {
-  display: flex;
-  align-items: baseline;
-  gap: 6px;
-  margin: 0;
-  padding: 10px 2px 3px;
-  font-size: var(--t-micro);
-  font-weight: 500;
-  color: var(--faint);
-}
-.type-head .lane-count {
-  color: var(--faint);
 }
 .lane-empty {
   margin: 0;
@@ -501,115 +935,13 @@ body {
   font-size: var(--t-meta);
   color: var(--faint);
 }
-
-/* Named `.lane-row`, not `.row`: `.row` is this app's generic form-row (a flex
-   line in the chat composer and every editor panel), declared later in this file,
-   so a board row called `.row` silently lost its grid to it. */
-.lane-row {
-  display: grid;
-  /* Fixed side columns so the kind, the actor and the age line up down the page —
-     a column that re-sizes per row is a column you have to read rather than scan.
-     The kind column is 6.4rem because `GITHUB ISSUE` measures 90.3px at this type style
-     (11px, uppercase, 0.1em tracking) — measured in the browser, not guessed. At the 3.2rem
-     that fitted `PR` it wrapped onto two lines and took the row's height with it. The ~12px
-     of slack is deliberate: a font that resolves differently on another machine only has to
-     be a few percent wider to wrap, and the cost of the margin is title width nobody misses. */
-  grid-template-columns: 6.4rem minmax(0, 1fr) 10.5rem 3rem 8.4rem;
-  gap: 0 12px;
-  align-items: start;
-  padding: 8px 8px 8px 0;
-  border-bottom: 1px solid var(--line);
-  cursor: pointer;
-  text-align: left;
-  border-left: 2px solid transparent;
-}
-.lane-row:hover {
-  background: var(--surface);
-}
-.lane-row:focus-visible {
-  outline: none;
-  border-left-color: var(--blue);
-  background: var(--surface);
-}
-/* Acknowledged: triaged, still listed, visibly settled. */
-.lane-row.acked {
-  opacity: 0.62;
-}
-.lane-row.dim {
-  opacity: 0.5;
-}
-.lane-row.live {
-  border-left-color: var(--lilac);
-}
-
-/* Right-aligned so the kinds share an edge and every title starts at the same x —
-   left-aligned, the wider word pushed its row's title 20px out.
-
-   `--dim`, not `--faint`: at 11px on `--bg` faint measures 3.99:1, under the 4.5:1 AA
-   floor for normal text, and it was the *issue* rows that suffered — pull requests are
-   overridden to `--blue` below (7.50:1) and read fine, which is why only half the column
-   looked broken. `--dim` is 6.18:1.
-
-   Tracking is dropped too. The 0.1em that makes a two-letter `PR` legible turns a
-   twelve-character `GITHUB ISSUE` into something you spell out rather than recognise; the
-   longer the string, the more letter-spacing costs. The uppercase house style stays. */
-.row-kind {
-  font-size: var(--t-micro);
-  color: var(--dim);
-  letter-spacing: 0.02em;
-  padding-top: 3px;
-  text-align: right;
-}
-.lane-row.rank-pull_request .row-kind {
-  color: var(--blue);
-}
-
-.row-mid {
-  min-width: 0;
-}
-.row-titleline {
-  display: flex;
-  align-items: baseline;
-  gap: 8px;
-  min-width: 0;
-}
-.row-title {
-  font-size: var(--t-body);
-  line-height: 1.35;
-  color: var(--text);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-.lane-row:hover .row-title {
-  color: var(--blue);
-}
-/* The upstream reference, promoted out of the title string — GitHub sends it as a
-   parenthetical, which put the same fact in the row twice. */
-.row-ref {
-  flex: 0 0 auto;
-  font-size: var(--t-micro);
-  color: var(--faint);
-  font-variant-numeric: tabular-nums;
-}
-.row-headline {
-  display: block;
-  margin-top: 2px;
-  font-size: var(--t-meta);
-  line-height: 1.45;
-  color: var(--dim);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
 /* No usable summary yet. Said out loud, because the alternative — truncating the
    newest event body — reads as a conclusion the board has not actually reached. */
-.row-headline.none {
+.card-headline.none {
   color: var(--faint);
   font-style: italic;
 }
-.row-who,
-.row-when {
+.row-when{
   font-size: var(--t-micro);
   color: var(--faint);
   padding-top: 3px;
@@ -619,25 +951,6 @@ body {
   text-overflow: ellipsis;
   text-align: right;
 }
-
-/* Triage without travelling to a menu. The column is always reserved, so revealing
-   the buttons cannot reflow the row under the pointer. */
-.row-actions {
-  display: flex;
-  gap: 6px;
-  justify-content: flex-end;
-  visibility: hidden;
-}
-.lane-row:hover .row-actions,
-.lane-row:focus-visible .row-actions,
-.row-actions:focus-within {
-  visibility: visible;
-}
-.row-actions button {
-  padding: 2px 9px;
-  font-size: var(--t-micro);
-}
-
 /* In-flight AI work, as one glyph. The board's half of the dispatch indicator: the
    detail view carries the full strip, and a failure the operator cannot see is
    worse than a row that is one glyph busier. */
@@ -652,15 +965,6 @@ body {
 .badge-live {
   background: var(--lilac);
 }
-/* The incidents board. Rows reuse `.lane-row`, so they line up and behave like the main
-   board's — the difference between the two boards is what is on them, not how they look. */
-.lane-row.rank-incident .row-kind {
-  color: var(--sev-warning);
-}
-.inc-list {
-  margin-bottom: 12px;
-}
-
 /* Cleared every gate. Solid green: this is the one badge that says "you can stop
    reading here", so it gets the strongest positive weight on the row. */
 .badge-cleared {
@@ -710,9 +1014,6 @@ body {
 
 /* ---- chips / state / badges ---- */
 .chips {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
   margin-top: 12px;
 }
 .chip {
@@ -750,12 +1051,6 @@ body {
 .detail .thread-actions {
   margin-top: 10px;
 }
-.thread-actions {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  flex-wrap: wrap;
-}
 .state {
   border-radius: var(--pill);
   padding: 1px 9px;
@@ -774,11 +1069,24 @@ body {
 }
 
 /* ---- panels / detail ---- */
+/* The one section container — drawn only by `Panel` (`components/ui.tsx`). */
 .panel {
   background: var(--surface);
   border: 1px solid var(--line);
   border-radius: var(--radius);
   padding: 16px 18px;
+}
+/* Subordinate to the panel above it: an inset well rather than a second raised box.
+   Two stacked `--surface` panels read as siblings even when one belongs to the other. */
+.panel-quiet {
+  background: var(--surface-2);
+  border-color: var(--line);
+}
+/* A section reporting a failure. The only tone that changes the border colour, because
+   it is the only one making a claim about the system rather than about hierarchy. */
+.panel-alert {
+  border-color: var(--sev-critical);
+  background: rgba(224, 87, 79, 0.06);
 }
 .panel h3 {
   margin: 0 0 12px;
@@ -836,7 +1144,7 @@ body {
   color: var(--dim);
   font-size: var(--t-micro);
   font-weight: 700;
-  letter-spacing: 0.04em;
+  letter-spacing: var(--track);
   line-height: 1;
   text-transform: uppercase;
   vertical-align: super;
@@ -871,11 +1179,6 @@ body {
   border-left: 2px solid var(--line-strong);
   padding: 8px 0 10px 14px;
 }
-.tl-row {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
 .tl-outcome {
   flex: 0 0 auto;
   min-width: 82px;
@@ -888,7 +1191,7 @@ body {
   border-radius: var(--pill);
   font-size: var(--t-micro);
   font-weight: 800;
-  letter-spacing: 0.09em;
+  letter-spacing: var(--track);
   text-transform: uppercase;
 }
 .outcome-success,
@@ -917,7 +1220,7 @@ body {
   margin-top: 9px;
   padding: 8px 11px;
   border-left: 3px solid var(--sev-warning);
-  border-radius: 0 8px 8px 0;
+  border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
   background: rgba(224, 138, 70, 0.08);
   color: var(--text);
 }
@@ -961,17 +1264,12 @@ body {
 .modal {
   background: var(--surface, var(--surface-2));
   border: 1px solid var(--line-strong);
-  border-radius: 14px;
+  border-radius: var(--radius-sm);
   width: min(760px, 100%);
   max-height: 84vh;
   overflow: auto;
   padding: 16px 18px;
   box-shadow: 0 12px 40px rgba(0, 0, 0, 0.5);
-}
-.modal-head {
-  display: flex;
-  align-items: center;
-  gap: 8px;
 }
 .modal-close {
   margin-left: auto;
@@ -985,7 +1283,7 @@ body {
   gap: 12px;
   align-items: center;
   font-size: var(--t-meta);
-  color: var(--muted, #8aa);
+  color: var(--dim);
   margin-bottom: 10px;
 }
 .modal-meta a {
@@ -994,7 +1292,7 @@ body {
 .modal-body {
   background: var(--surface-2);
   border: 1px solid var(--line);
-  border-radius: 8px;
+  border-radius: var(--radius-sm);
   padding: 10px 12px;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
@@ -1035,17 +1333,12 @@ body {
 }
 .browser-investigation {
   border: 1px solid var(--line);
-  border-radius: 10px;
+  border-radius: var(--radius-sm);
   padding: 12px;
   background: var(--surface-2);
 }
 .browser-investigation + .browser-investigation {
   margin-top: 10px;
-}
-.browser-investigation-head {
-  display: flex;
-  align-items: center;
-  gap: 10px;
 }
 .browser-investigation-head a {
   color: var(--blue);
@@ -1065,7 +1358,7 @@ body {
   color: var(--faint);
   font-size: var(--t-micro);
   text-transform: uppercase;
-  letter-spacing: 0.1em;
+  letter-spacing: var(--track);
 }
 .read-via.verified {
   border-color: var(--lilac);
@@ -1109,12 +1402,6 @@ details.grafana-evidence[open] > summary::before {
 .series.breached {
   border-left-color: var(--amber);
 }
-.series-head {
-  display: flex;
-  align-items: baseline;
-  gap: 8px;
-  flex-wrap: wrap;
-}
 .series-ref {
   color: var(--faint);
   font-size: var(--t-micro);
@@ -1129,11 +1416,13 @@ details.grafana-evidence[open] > summary::before {
     monospace;
   overflow-wrap: anywhere;
 }
-.series-breach {
+/* The same label, when what it names is a problem. */
+.series-breach,
+.pass-stale {
   color: var(--amber);
   font-size: var(--t-micro);
   text-transform: uppercase;
-  letter-spacing: 0.08em;
+  letter-spacing: var(--track);
 }
 /* Tabular figures so min/max/mean line up down a column of series — comparing them is
    the whole reason several are listed. */
@@ -1153,7 +1442,7 @@ details.grafana-evidence[open] > summary::before {
   overflow-x: auto;
   white-space: pre-wrap;
   border: 1px solid var(--line);
-  border-radius: 8px;
+  border-radius: var(--radius-sm);
   color: var(--dim);
   font:
     12px/1.45 ui-monospace,
@@ -1183,15 +1472,7 @@ details.grafana-evidence[open] > summary::before {
 
 /* Root cause. Candidates are hypotheses: the relation pill carries the claim and
    the confidence is always shown next to it, so nothing reads as a verdict. */
-.panel-head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-}
-.panel-head h3 {
-  margin: 0;
-}
+
 .rc-meta {
   display: flex;
   flex-wrap: wrap;
@@ -1199,10 +1480,13 @@ details.grafana-evidence[open] > summary::before {
   gap: 6px;
   margin-top: 8px;
 }
-.rc-label {
+/* A micro label naming what the value beside it is. */
+.rc-label,
+.finding-sev,
+.stance {
   color: var(--dim);
   font-size: var(--t-micro);
-  letter-spacing: 0.08em;
+  letter-spacing: var(--track);
   text-transform: uppercase;
 }
 .chip.repo {
@@ -1214,14 +1498,14 @@ details.grafana-evidence[open] > summary::before {
   padding: 10px 12px;
   border-left: 3px solid var(--lilac);
   background: var(--surface-2);
-  border-radius: 0 8px 8px 0;
+  border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
 }
 .rc-candidate {
   margin-top: 10px;
   padding: 10px 12px;
   border: 1px solid var(--line);
   border-left: 3px solid var(--slate);
-  border-radius: 0 10px 10px 0;
+  border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
   background: var(--surface-2);
 }
 .rc-candidate.rc-cause {
@@ -1233,19 +1517,13 @@ details.grafana-evidence[open] > summary::before {
 .rc-candidate.rc-duplicate {
   border-left-color: var(--amber);
 }
-.rc-head {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 8px;
-}
 .rc-relation {
   padding: 1px 8px;
   border-radius: var(--pill);
   background: var(--slate);
   color: var(--text);
   font-size: var(--t-micro);
-  letter-spacing: 0.08em;
+  letter-spacing: var(--track);
   text-transform: uppercase;
 }
 .rc-relation-cause {
@@ -1303,7 +1581,7 @@ details.grafana-evidence[open] > summary::before {
 .rc-fragment {
   padding: 8px;
   border: 1px solid var(--line);
-  border-radius: 8px;
+  border-radius: var(--radius-sm);
   white-space: pre-wrap;
 }
 
@@ -1314,7 +1592,7 @@ details.grafana-evidence[open] > summary::before {
   margin-top: 10px;
   padding: 10px 12px;
   border-left: 3px solid var(--blue);
-  border-radius: 0 8px 8px 0;
+  border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
   background: var(--surface-2);
   font-size: var(--t-body);
   line-height: 1.55;
@@ -1341,14 +1619,8 @@ details.grafana-evidence[open] > summary::before {
   margin-top: 8px;
   padding: 10px 12px;
   border: 1px solid var(--line);
-  border-radius: 10px;
+  border-radius: var(--radius-sm);
   background: var(--surface-2);
-}
-.patch-head {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 8px;
 }
 .patch-index {
   display: inline-flex;
@@ -1408,7 +1680,7 @@ details.grafana-evidence[open] > summary::before {
 .hint {
   border: 1px solid var(--line);
   border-left: 3px solid var(--blue);
-  border-radius: 12px;
+  border-radius: var(--radius-sm);
   padding: 10px 12px;
   margin-bottom: 8px;
   background: var(--surface-2);
@@ -1455,7 +1727,7 @@ details.grafana-evidence[open] > summary::before {
   margin: 0 0 12px;
   padding: 8px 12px;
   border: 1px solid var(--blue);
-  border-radius: 10px;
+  border-radius: var(--radius-sm);
   background: rgba(87, 183, 224, 0.1);
   color: var(--blue);
   font-size: var(--t-meta);
@@ -1500,23 +1772,17 @@ details.grafana-evidence[open] > summary::before {
 .edge,
 .ctx-item {
   border: 1px solid var(--line);
-  border-radius: 12px;
+  border-radius: var(--radius-sm);
   padding: 10px 12px;
   margin-bottom: 8px;
   background: var(--surface-2);
-}
-.edge-line {
-  display: flex;
-  align-items: baseline;
-  gap: 8px;
-  flex-wrap: wrap;
 }
 .edge-kind {
   font-weight: 700;
   color: var(--dim);
   font-size: var(--t-micro);
   text-transform: uppercase;
-  letter-spacing: 0.1em;
+  letter-spacing: var(--track);
   flex: 0 0 auto;
 }
 /* `same` is the only edge kind that changes what you do — it says these are one
@@ -1551,7 +1817,7 @@ details.grafana-evidence[open] > summary::before {
   flex: 0 0 auto;
   padding: 8px 14px;
   border: 1px dashed var(--line);
-  border-radius: 12px;
+  border-radius: var(--radius-sm);
 }
 .not-run .muted {
   flex: 1;
@@ -1601,7 +1867,7 @@ details.grafana-evidence[open] > summary::before {
   padding: 8px;
   background: var(--surface);
   border: 1px solid var(--line-strong);
-  border-radius: 12px;
+  border-radius: var(--radius-sm);
   box-shadow: var(--glow);
 }
 .menu-body button {
@@ -1611,7 +1877,7 @@ details.grafana-evidence[open] > summary::before {
   gap: 12px;
   width: 100%;
   border-color: transparent;
-  border-radius: 8px;
+  border-radius: var(--radius-sm);
   text-align: left;
 }
 .menu-body button:hover:not(:disabled) .cost {
@@ -1659,25 +1925,8 @@ details.grafana-evidence[open] > summary::before {
   padding: 5px 8px;
 }
 
-/* ---- forms & controls ---- */
-.form {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-  margin-top: 10px;
-}
-.form label {
-  font-size: var(--t-micro);
-  color: var(--dim);
-  letter-spacing: 0.12em;
-  text-transform: uppercase;
-}
-.row {
-  display: flex;
-  gap: 8px;
-  align-items: center;
-  flex-wrap: wrap;
-}
+/* ---- forms & controls ----
+   `.form` and its labels now live in the primitive layer above, drawn by `Form`/`Field`. */
 .grow {
   flex: 1;
 }
@@ -1687,7 +1936,7 @@ select {
   background: var(--surface-2);
   color: var(--text);
   border: 1px solid var(--line-strong);
-  border-radius: 10px;
+  border-radius: var(--radius-sm);
   padding: 8px 11px;
   font-family: inherit;
   font-size: var(--t-body);
@@ -1747,6 +1996,46 @@ button.primary {
 button.primary:hover:not(:disabled) {
   filter: brightness(1.12);
 }
+/* Two kinds of consequence, which `danger` was being used for both of.
+
+   It was defined three times — once scoped to the board header (critical red), once to the
+   cloud actions (amber) and once to the kube actions — so the same class meant "this destroys
+   something" on one screen and "this changes the world" on another, and none of them worked
+   outside its parent. They are genuinely different claims and now have different names,
+   both global.
+
+   `destructive` — this removes something that was here. Critical red, the colour this file
+   already uses for a thing that has gone wrong. */
+button.destructive{
+  color: var(--sev-critical);
+  border-color: transparent;
+}
+button.destructive:hover:not(:disabled) {
+  background: transparent;
+  color: var(--sev-critical);
+  border-color: var(--sev-critical);
+}
+button.destructive:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+/* `mutating` — this reaches outside MuggleBot and changes something real: rewrites a
+   control-plane document, applies to a live cluster, mints a token, or spends money on a
+   cloud model. Amber, which in this file means warning, because that is what it is. It
+   should never look like `view json`.
+
+   The second-opinion button used to carry its own `.cloud-btn` rule — six `!important`
+   declarations in an off-palette tan — to say "this one costs something". That is this
+   class's whole job, so it says it the same way everything else does. */
+button.mutating {
+  color: var(--amber);
+  border-color: var(--amber);
+}
+button.mutating:hover:not(:disabled) {
+  background: var(--amber);
+  color: var(--ink);
+  border-color: var(--amber);
+}
 .back {
   color: var(--lilac);
   border-color: var(--lilac);
@@ -1767,21 +2056,6 @@ button.primary:hover:not(:disabled) {
 .attach-btn:hover {
   border-color: var(--blue);
 }
-
-/* memory / context / config items */
-.mem-item {
-  border: 1px solid var(--line);
-  border-radius: 12px;
-  padding: 10px 12px;
-  margin-bottom: 8px;
-  background: var(--surface-2);
-}
-.mem-head {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  gap: 8px;
-}
 .cred-row {
   display: flex;
   align-items: center;
@@ -1796,7 +2070,7 @@ button.primary:hover:not(:disabled) {
 .config {
   background: var(--surface-2);
   border: 1px solid var(--line);
-  border-radius: 10px;
+  border-radius: var(--radius-sm);
   padding: 12px;
   font-size: var(--t-meta);
   overflow-x: auto;
@@ -1821,7 +2095,7 @@ code {
   font-family: ui-monospace, "SF Mono", Menlo, monospace;
   background: var(--surface-2);
   border: 1px solid var(--line);
-  border-radius: 5px;
+  border-radius: var(--radius-xs);
   padding: 0 5px;
   color: var(--blue);
   font-size: 0.92em;
@@ -1866,7 +2140,7 @@ code {
   gap: 6px;
   padding: 8px 10px;
   border: 1px solid var(--line);
-  border-radius: 10px;
+  border-radius: var(--radius-sm);
   background: var(--surface);
   cursor: pointer;
 }
@@ -1915,7 +2189,7 @@ code {
 }
 .bubble {
   max-width: 78%;
-  border-radius: 16px;
+  border-radius: var(--radius);
   padding: 11px 15px;
   line-height: 1.55;
   white-space: pre-wrap;
@@ -1951,7 +2225,7 @@ code {
 .thumbs img {
   max-width: 120px;
   max-height: 120px;
-  border-radius: 10px;
+  border-radius: var(--radius-sm);
   border: 1px solid var(--line-strong);
 }
 .chat-input {
@@ -1993,7 +2267,7 @@ code {
 }
 .tag-toggle.on {
   opacity: 1;
-  background: rgba(217, 169, 78, 0.16);
+  background: rgba(224, 145, 60, 0.16);
 }
 
 /* confirmation strip after distilling a thread into a one-sentence memory */
@@ -2005,7 +2279,7 @@ code {
   margin-top: 10px;
   padding: 8px 12px;
   border: 1px solid var(--amber);
-  border-radius: 10px;
+  border-radius: var(--radius-sm);
   background: rgba(217, 169, 78, 0.1);
   color: var(--text);
   font-size: var(--t-meta);
@@ -2016,7 +2290,7 @@ code {
 .postmortem {
   margin-top: 10px;
   border: 1px solid var(--line);
-  border-radius: 12px;
+  border-radius: var(--radius-sm);
   padding: 12px;
   background: var(--surface-2);
 }
@@ -2026,11 +2300,6 @@ code {
   justify-content: space-between;
   gap: 8px;
   margin-bottom: 10px;
-}
-.pm-actions {
-  display: flex;
-  align-items: center;
-  gap: 10px;
 }
 .icon-btn {
   padding: 4px 10px;
@@ -2068,18 +2337,8 @@ code {
 .md p {
   margin: 0 0 9px;
 }
-/* Board cards keep their muted body tone even with Markdown rendering. */
-.card-body.md {
-  color: var(--dim);
-}
 /* The full Slack message text — brighter than the summary, accented in the
-   Slack source colour so it reads as the raw message, not the reasoner's note. */
-.card-body.slack-msg {
-  color: var(--text);
-  border-left: 2px solid var(--lilac);
-  padding-left: 10px;
-}
-.md h1,
+   Slack source colour so it reads as the raw message, not the reasoner's note. */.md h1,
 .md h2,
 .md h3,
 .md h4,
@@ -2118,7 +2377,7 @@ code {
 .md code {
   background: var(--bg);
   border: 1px solid var(--line);
-  border-radius: 5px;
+  border-radius: var(--radius-xs);
   padding: 1px 5px;
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   font-size: var(--t-meta);
@@ -2126,7 +2385,7 @@ code {
 .md pre {
   background: var(--bg);
   border: 1px solid var(--line);
-  border-radius: 8px;
+  border-radius: var(--radius-sm);
   padding: 10px 12px;
   overflow-x: auto;
   margin: 0 0 9px;
@@ -2154,7 +2413,7 @@ code {
   background: rgba(224, 90, 82, 0.12);
   border: 1px solid var(--sev-critical);
   color: var(--sev-critical);
-  border-radius: 10px;
+  border-radius: var(--radius-sm);
   padding: 9px 13px;
   margin-bottom: var(--gap);
   font-weight: 700;
@@ -2185,8 +2444,7 @@ code {
   text-overflow: ellipsis;
 }
 .lcars.red-alert .elbow,
-.lcars.red-alert .count,
-.lcars.red-alert .count-label {
+.lcars.red-alert .count{
   background: var(--sev-critical);
   border-color: var(--sev-critical);
   color: #fff;
@@ -2205,7 +2463,7 @@ code {
 }
 ::-webkit-scrollbar-thumb {
   background: var(--line-strong);
-  border-radius: 8px;
+  border-radius: var(--radius-sm);
 }
 ::-webkit-scrollbar-thumb:hover {
   background: var(--slate);
@@ -2222,7 +2480,7 @@ code {
   padding: 10px 12px;
   border: 1px solid var(--line);
   border-left: 3px solid var(--slate);
-  border-radius: 0 10px 10px 0;
+  border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
   background: var(--surface-2);
 }
 .pr-fix.pr-fixes {
@@ -2246,7 +2504,7 @@ code {
 .pr-critique {
   margin-top: 6px;
   padding: 8px 10px;
-  border-radius: 8px;
+  border-radius: var(--radius-sm);
   background: color-mix(in srgb, var(--amber) 8%, transparent);
   line-height: 1.5;
 }
@@ -2306,7 +2564,7 @@ code {
 }
 .facet {
   padding: 1px 5px;
-  border-radius: 4px;
+  border-radius: var(--radius-xs);
   font:
     9px/1.6 ui-monospace,
     "SF Mono",
@@ -2336,7 +2594,7 @@ code {
 }
 .pass {
   padding: 1px 5px;
-  border-radius: 4px;
+  border-radius: var(--radius-xs);
   cursor: help;
 }
 .pass-local {
@@ -2358,7 +2616,7 @@ code {
   margin-top: 6px;
   padding: 3px 8px;
   display: inline-block;
-  border-radius: 6px;
+  border-radius: var(--radius-xs);
   background: color-mix(in srgb, var(--sev-warning) 14%, transparent);
   color: var(--sev-warning);
   font-size: var(--t-meta);
@@ -2374,14 +2632,14 @@ code {
 .attempts {
   margin: 0.5rem 0 0.35rem 0;
   padding-left: 0.85rem;
-  border-left: 3px solid var(--lcars-tan, #d69a78);
+  border-left: 3px solid var(--blue);
 }
 
 .attempts-label,
 .explain-label {
   font-size: var(--t-micro);
   letter-spacing: 0.14em;
-  color: var(--lcars-tan, #d69a78);
+  color: var(--blue);
   margin-bottom: 0.3rem;
 }
 
@@ -2389,49 +2647,43 @@ code {
   margin-bottom: 0.5rem;
   padding: 0.4rem 0.55rem;
   background: rgba(255, 255, 255, 0.035);
-  border-radius: 0 0.6rem 0.6rem 0;
+  border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
   border-left: 3px solid transparent;
 }
 
 /* Verdict drives the accent, so scanning a stack of attempts is scanning for the one
    that actually fixes it. */
 .attempt.verdict-fixes {
-  border-left-color: #7ddf8f;
+  border-left-color: var(--ok);
 }
 .attempt.verdict-partial {
-  border-left-color: #f0c674;
+  border-left-color: var(--amber);
 }
 .attempt.verdict-related {
-  border-left-color: #8ab4f8;
+  border-left-color: var(--blue);
 }
 .attempt.verdict-unrelated {
-  border-left-color: #6b6b6b;
+  border-left-color: var(--slate);
 }
 
-.attempt-head {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: baseline;
-  gap: 0.4rem;
-  margin-bottom: 0.25rem;
-}
+
 
 .verdict {
   font-size: var(--t-micro);
   letter-spacing: 0.1em;
   padding: 0.05rem 0.35rem;
-  border-radius: 0.5rem;
-  color: #10100f;
-  background: #6b6b6b;
+  border-radius: var(--radius-sm);
+  color: var(--ink);
+  background: var(--slate);
 }
 .verdict.verdict-fixes {
-  background: #7ddf8f;
+  background: var(--ok);
 }
 .verdict.verdict-partial {
-  background: #f0c674;
+  background: var(--amber);
 }
 .verdict.verdict-related {
-  background: #8ab4f8;
+  background: var(--blue);
 }
 
 .attempt-conf {
@@ -2470,7 +2722,7 @@ code {
 /* A reviewer's objection is better evidence than the model's own reading of the same
    diff, so it gets the emphasis rather than being folded into the critique. */
 .attempt-conversation {
-  color: #ffd9a0;
+  color: var(--amber);
 }
 .attempt-conversation .attempt-key {
   opacity: 0.9;
@@ -2486,8 +2738,8 @@ code {
   margin: 0.5rem 0;
   padding: 0.5rem 0.7rem;
   background: rgba(138, 180, 248, 0.07);
-  border-left: 3px solid #8ab4f8;
-  border-radius: 0 0.6rem 0.6rem 0;
+  border-left: 3px solid var(--blue);
+  border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
 }
 
 .explain-head {
@@ -2499,8 +2751,8 @@ code {
 }
 
 .chip-stale {
-  background: #f0c674;
-  color: #10100f;
+  background: var(--amber);
+  color: var(--ink);
 }
 
 .explain-btn {
@@ -2512,7 +2764,7 @@ code {
    is labelled: two answers to one question are only useful if you can tell them apart. */
 .explain-cloud {
   background: rgba(214, 154, 120, 0.09);
-  border-left-color: var(--lcars-tan, #d69a78);
+  border-left-color: var(--blue);
 }
 
 .model-chip {
@@ -2521,8 +2773,8 @@ code {
 }
 
 .explain-cloud .model-chip {
-  background: var(--lcars-tan, #d69a78);
-  color: #10100f;
+  background: var(--blue);
+  color: var(--ink);
 }
 
 /* What the dossier check removed. Quiet — it is a footnote on the explanation, not a
@@ -2533,26 +2785,12 @@ code {
   padding-top: 0.35rem;
   border-top: 1px dashed rgba(255, 255, 255, 0.14);
   font-size: var(--t-micro);
-  color: #f0c674;
+  color: var(--amber);
   opacity: 0.85;
 }
 
 /* The one control in MuggleBot that spends money. Marked so it can't be pressed by
    accident while reaching for EXPLAIN next to it. */
-.cloud-btn {
-  border-color: var(--lcars-tan, #d69a78) !important;
-  color: var(--lcars-tan, #d69a78) !important;
-}
-
-.cloud-btn:hover:not(:disabled) {
-  background: var(--lcars-tan, #d69a78) !important;
-  color: #10100f !important;
-}
-
-.board-note {
-  font-size: var(--t-micro);
-}
-
 /* ---- Issue scoring ----------------------------------------------------------
    Where should I start? Ranked repo / component / commit, each with the passes that
    found it. The evidence lines are not decoration: a score without them can't be
@@ -2562,8 +2800,8 @@ code {
   margin: 0.5rem 0;
   padding: 0.5rem 0.7rem;
   background: rgba(214, 154, 120, 0.07);
-  border-left: 3px solid var(--lcars-tan, #d69a78);
-  border-radius: 0 0.6rem 0.6rem 0;
+  border-left: 3px solid var(--blue);
+  border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
 }
 
 .score-row {
@@ -2586,14 +2824,14 @@ code {
   font-size: var(--t-body);
   font-weight: 600;
   text-align: right;
-  color: var(--lcars-tan, #d69a78);
+  color: var(--blue);
 }
 
 .score-target {
   font-size: var(--t-body);
 }
 .score-component {
-  color: #ffd9a0;
+  color: var(--amber);
   font-weight: 600;
 }
 .score-commit {
@@ -2613,16 +2851,16 @@ code {
 /* One colour per pass, so "two different passes agreed" is visible at a glance —
    which is the distinction the compounding score is built on. */
 .pass-semantic {
-  background: #8ab4f8;
-  color: #10100f;
+  background: var(--blue);
+  color: var(--ink);
 }
 .pass-lexical {
-  background: #7ddf8f;
-  color: #10100f;
+  background: var(--ok);
+  color: var(--ink);
 }
 .pass-dependency {
-  background: #f0c674;
-  color: #10100f;
+  background: var(--amber);
+  color: var(--ink);
 }
 
 .score-caveat {
@@ -2640,13 +2878,13 @@ code {
   padding: 0.5rem 0.7rem;
   margin-bottom: 0.5rem;
   background: rgba(255, 255, 255, 0.04);
-  border-left: 3px solid var(--lcars-tan, #d69a78);
-  border-radius: 0 0.6rem 0.6rem 0;
+  border-left: 3px solid var(--blue);
+  border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
   font-size: var(--t-meta);
 }
 
 .index-totals b {
-  color: var(--lcars-tan, #d69a78);
+  color: var(--blue);
   font-size: var(--t-body);
 }
 
@@ -2659,8 +2897,8 @@ code {
   padding: 0.45rem 0.7rem;
   margin-bottom: 0.7rem;
   background: rgba(138, 180, 248, 0.07);
-  border-left: 3px solid #8ab4f8;
-  border-radius: 0 0.6rem 0.6rem 0;
+  border-left: 3px solid var(--blue);
+  border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
   font-size: var(--t-micro);
 }
 
@@ -2672,7 +2910,7 @@ code {
 }
 
 .inv-failed .inv-why {
-  color: #f28b82;
+  color: var(--sev-critical);
 }
 
 .inv-repo {
@@ -2687,7 +2925,7 @@ code {
 
 .repo-row {
   background: rgba(255, 255, 255, 0.03);
-  border-radius: 0.4rem;
+  border-radius: var(--radius-xs);
 }
 
 /* The row is a link to the repo's own screen; this is the affordance saying so. */
@@ -2695,11 +2933,11 @@ code {
 .repo-open-spacer {
   flex: 0 0 0.8rem;
   text-align: right;
-  color: #9aa0a6;
+  color: var(--dim);
 }
 
 .repo-line:hover .repo-open {
-  color: var(--lcars-tan, #d69a78);
+  color: var(--blue);
 }
 
 .repo-line {
@@ -2724,7 +2962,7 @@ code {
 .repo-facts {
   display: flex;
   gap: 0.75rem;
-  color: #9aa0a6;
+  color: var(--dim);
   font-variant-numeric: tabular-nums;
 }
 
@@ -2734,24 +2972,24 @@ code {
   width: 5rem;
   height: 0.35rem;
   background: rgba(255, 255, 255, 0.12);
-  border-radius: 0.2rem;
+  border-radius: var(--radius-xs);
   overflow: hidden;
 }
 
 .mini-fill {
   display: block;
   height: 100%;
-  background: var(--lcars-tan, #d69a78);
+  background: var(--blue);
 }
 
 .ph-done {
-  background: #81c995;
-  color: #10100f;
+  background: var(--ok);
+  color: var(--ink);
 }
 
 .ph-work {
-  background: #8ab4f8;
-  color: #10100f;
+  background: var(--blue);
+  color: var(--ink);
 }
 
 .ph-idle {
@@ -2796,13 +3034,13 @@ code {
   align-items: center;
   padding: 0.45rem 0.7rem;
   background: rgba(255, 255, 255, 0.04);
-  border-left: 3px solid var(--lcars-tan, #d69a78);
-  border-radius: 0 0.6rem 0.6rem 0;
+  border-left: 3px solid var(--blue);
+  border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
   font-size: var(--t-micro);
 }
 
 .rd-facts b {
-  color: var(--lcars-tan, #d69a78);
+  color: var(--blue);
   font-size: var(--t-body);
 }
 
@@ -2816,7 +3054,7 @@ code {
   background: transparent;
   border: none;
   border-bottom: 2px solid transparent;
-  color: #9aa0a6;
+  color: var(--dim);
   font-family: inherit;
   font-size: var(--t-micro);
   letter-spacing: 0.12em;
@@ -2825,12 +3063,12 @@ code {
 }
 
 .rd-tab:hover {
-  color: var(--lcars-tan, #d69a78);
+  color: var(--blue);
 }
 
 .rd-tab.active {
-  color: var(--lcars-tan, #d69a78);
-  border-bottom-color: var(--lcars-tan, #d69a78);
+  color: var(--blue);
+  border-bottom-color: var(--blue);
 }
 
 .rd-tab-n {
@@ -2849,14 +3087,14 @@ code {
 .rd-card {
   font-size: var(--t-meta);
   line-height: 1.5;
-  color: #c8ccd0;
+  color: var(--text);
   max-width: 62rem;
 }
 
 .rd-desc {
   margin: 0;
   font-size: var(--t-micro);
-  color: #9aa0a6;
+  color: var(--dim);
   max-width: 62rem;
 }
 
@@ -2865,7 +3103,7 @@ code {
   margin-top: 0.5rem;
   font-size: var(--t-micro);
   letter-spacing: 0.14em;
-  color: #9aa0a6;
+  color: var(--dim);
 }
 
 .rd-deps {
@@ -2889,7 +3127,7 @@ code {
 }
 
 .rd-recent-row:hover .commit-subject {
-  color: var(--lcars-tan, #d69a78);
+  color: var(--blue);
 }
 
 /* Components as a grid of cards rather than a column: they are peers, and a single column of
@@ -2903,7 +3141,7 @@ code {
 .rd-comp {
   padding: 0.45rem 0.6rem;
   background: rgba(255, 255, 255, 0.035);
-  border-radius: 0.4rem;
+  border-radius: var(--radius-xs);
   min-width: 0;
 }
 
@@ -2914,13 +3152,13 @@ code {
 
 .comp-purpose {
   font-size: var(--t-micro);
-  color: #c8ccd0;
+  color: var(--text);
 }
 
 /* The routing key: what an incident's words are actually matched against. */
 .comp-symptoms {
   font-size: var(--t-micro);
-  color: var(--lcars-tan, #d69a78);
+  color: var(--blue);
 }
 
 .dep-row {
@@ -2962,7 +3200,7 @@ code {
 
 .rd-caret {
   flex: 0 0 0.7rem;
-  color: #9aa0a6;
+  color: var(--dim);
   font-size: var(--t-micro);
 }
 
@@ -3012,15 +3250,15 @@ code {
 .commit-summary {
   font-size: var(--t-micro);
   line-height: 1.5;
-  color: #c8ccd0;
+  color: var(--text);
   margin-top: 0.15rem;
 }
 
 /* A repo the dependency graph raises as a candidate with nothing indexed inside it. Marked,
    because it is a lead that cannot be followed — not merely an absence. */
 .ph-gap {
-  background: #f0c674;
-  color: #10100f;
+  background: var(--amber);
+  color: var(--ink);
 }
 
 /* ---- code index: header + columns ---------------------------------------------- */
@@ -3038,7 +3276,7 @@ code {
   padding: 0.3rem 0.6rem;
   font-size: var(--t-micro);
   letter-spacing: 0.1em;
-  color: #9aa0a6;
+  color: var(--dim);
   border-bottom: 1px solid rgba(255, 255, 255, 0.12);
   user-select: none;
 }
@@ -3060,11 +3298,11 @@ code {
 }
 
 .repo-head .idx-th:hover {
-  color: var(--lcars-tan, #d69a78);
+  color: var(--blue);
 }
 
 .repo-head .idx-th.active {
-  color: var(--lcars-tan, #d69a78);
+  color: var(--blue);
 }
 
 /* Right-aligned and tabular so the digits form columns rather than a ragged edge. */
@@ -3097,7 +3335,7 @@ code {
   padding: 0.5rem 0.6rem 0.2rem;
   font-size: var(--t-micro);
   letter-spacing: 0.14em;
-  color: var(--lcars-tan, #d69a78);
+  color: var(--blue);
 }
 
 .repo-rows + .repo-rows .kind-head {
@@ -3114,17 +3352,17 @@ code {
 
 .kind-pick {
   background: rgba(255, 255, 255, 0.06);
-  color: #9aa0a6;
+  color: var(--dim);
   border: 1px solid rgba(255, 255, 255, 0.14);
-  border-radius: 0.3rem;
+  border-radius: var(--radius-xs);
   font-size: var(--t-micro);
   padding: 0.1rem 0.2rem;
   font-family: inherit;
 }
 
 .kind-pick.pinned {
-  color: var(--lcars-tan, #d69a78);
-  border-color: var(--lcars-tan, #d69a78);
+  color: var(--blue);
+  border-color: var(--blue);
 }
 
 /* ---- agent sessions ------------------------------------------------------------- */
@@ -3132,8 +3370,8 @@ code {
 .agent-session {
   margin: 0.5rem 0 0.8rem;
   background: rgba(138, 180, 248, 0.07);
-  border-left: 3px solid #8ab4f8;
-  border-radius: 0 0.6rem 0.6rem 0;
+  border-left: 3px solid var(--blue);
+  border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
 }
 
 .agent-head {
@@ -3170,7 +3408,7 @@ code {
   flex: 0 0 4.5rem;
   font-size: var(--t-micro);
   letter-spacing: 0.1em;
-  color: #9aa0a6;
+  color: var(--dim);
   text-align: right;
 }
 
@@ -3180,31 +3418,31 @@ code {
 }
 
 .ac-text .ac-body {
-  color: #e8eaed;
+  color: var(--text);
 }
 
 /* Thinking and tool calls are deliberately quieter than text: they are for judging whether the
    agent is on the right track, not for acting on. */
 .ac-thinking .ac-body {
-  color: #9aa0a6;
+  color: var(--dim);
   font-style: italic;
 }
 
 .ac-tool .ac-body {
-  color: #8ab4f8;
+  color: var(--blue);
   font-family: ui-monospace, monospace;
 }
 
 .ac-result .ac-body {
-  color: #81c995;
+  color: var(--ok);
 }
 
 .ac-error .ac-body {
-  color: #f28b82;
+  color: var(--sev-critical);
 }
 
 .ac-meta .ac-body {
-  color: #9aa0a6;
+  color: var(--dim);
 }
 
 /* ---- diff pane ------------------------------------------------------------------- */
@@ -3231,27 +3469,27 @@ code {
   margin: 0.25rem 0 0.35rem;
   padding: 0.35rem 0.5rem;
   background: rgba(255, 255, 255, 0.04);
-  border-left: 2px solid var(--lcars-tan, #d69a78);
+  border-left: 2px solid var(--blue);
   font-size: var(--t-micro);
-  color: #c8ccd0;
+  color: var(--text);
 }
 
 .diff-stat {
-  color: #9aa0a6;
+  color: var(--dim);
 }
 
 .diff-add {
-  color: #81c995;
+  color: var(--ok);
   font-variant-numeric: tabular-nums;
 }
 
 .diff-del {
-  color: #f28b82;
+  color: var(--sev-critical);
   font-variant-numeric: tabular-nums;
 }
 
 .diff-error {
-  color: #f28b82;
+  color: var(--sev-critical);
   font-size: var(--t-micro);
 }
 
@@ -3283,7 +3521,7 @@ code {
   max-height: 22rem;
   overflow: auto;
   background: rgba(0, 0, 0, 0.25);
-  border-radius: 0.3rem;
+  border-radius: var(--radius-xs);
   padding: 0.3rem 0.4rem;
   font-size: var(--t-micro);
   line-height: 1.35;
@@ -3292,23 +3530,23 @@ code {
 .dl {
   font-family: ui-monospace, monospace;
   white-space: pre;
-  color: #9aa0a6;
+  color: var(--dim);
 }
 
 /* Coloured by line kind — an uncoloured unified diff is the one presentation that makes a patch
    harder to read than the file it came from. */
 .dl-add {
-  color: #81c995;
+  color: var(--ok);
   background: rgba(129, 201, 149, 0.08);
 }
 
 .dl-del {
-  color: #f28b82;
+  color: var(--sev-critical);
   background: rgba(242, 139, 130, 0.08);
 }
 
 .dl-hunk {
-  color: #8ab4f8;
+  color: var(--blue);
 }
 
 /* A collapsed diff still shows its header, so a folded pane reports the size of what it is
@@ -3340,7 +3578,7 @@ code {
   padding: 7px 12px;
   border: 1px solid var(--line);
   border-left-width: 3px;
-  border-radius: 12px;
+  border-radius: var(--radius-sm);
   background: var(--surface-2);
   font-size: var(--t-meta);
 }
@@ -3503,7 +3741,7 @@ code {
   padding: 7px 10px;
   background: var(--surface);
   border: 1px solid var(--line-strong);
-  border-radius: 8px;
+  border-radius: var(--radius-sm);
   box-shadow: var(--glow);
   color: var(--text);
   font: 11px/1.45 inherit;
@@ -3565,20 +3803,20 @@ select[data-tip],
    coloured by severity so a reader who skips nits can skip them by colour. */
 .rec {
   padding: 0.05rem 0.4rem;
-  border-radius: 0.5rem;
+  border-radius: var(--radius-sm);
   font-size: var(--t-micro);
   font-weight: 700;
   letter-spacing: 0.08em;
-  color: #10100f;
+  color: var(--ink);
 }
 .rec-approve {
-  background: #7ddf8f;
+  background: var(--ok);
 }
 .rec-comment {
-  background: #8ab4f8;
+  background: var(--blue);
 }
 .rec-request_changes {
-  background: #f0a08a;
+  background: var(--sev-critical);
 }
 
 .review-rationale {
@@ -3588,18 +3826,18 @@ select[data-tip],
   padding: 0.4rem 0.6rem;
   background: rgba(255, 255, 255, 0.035);
   border-left: 3px solid var(--line-strong);
-  border-radius: 0 0.5rem 0.5rem 0;
+  border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
   font-size: var(--t-meta);
   line-height: 1.45;
 }
 .rec-border-approve {
-  border-left-color: #7ddf8f;
+  border-left-color: var(--ok);
 }
 .rec-border-comment {
-  border-left-color: #8ab4f8;
+  border-left-color: var(--blue);
 }
 .rec-border-request_changes {
-  border-left-color: #f0a08a;
+  border-left-color: var(--sev-critical);
 }
 
 .review-note {
@@ -3609,7 +3847,7 @@ select[data-tip],
   margin: 0.15rem 0;
   padding: 0.25rem 0.5rem;
   border-left: 2px solid var(--line-strong);
-  border-radius: 0 0.4rem 0.4rem 0;
+  border-radius: 0 var(--radius-xs) var(--radius-xs) 0;
   background: rgba(255, 255, 255, 0.04);
   font-size: var(--t-micro);
   line-height: 1.45;
@@ -3633,28 +3871,28 @@ select[data-tip],
   color: var(--text);
 }
 .note-blocker {
-  border-left-color: #f28b82;
+  border-left-color: var(--sev-critical);
 }
 .sev-blocker {
-  color: #f28b82;
+  color: var(--sev-critical);
 }
 .note-concern {
-  border-left-color: #f0c674;
+  border-left-color: var(--amber);
 }
 .sev-concern {
-  color: #f0c674;
+  color: var(--amber);
 }
 .note-nit {
-  border-left-color: #8ab4f8;
+  border-left-color: var(--blue);
 }
 .sev-nit {
-  color: #8ab4f8;
+  color: var(--blue);
 }
 .note-praise {
-  border-left-color: #7ddf8f;
+  border-left-color: var(--ok);
 }
 .sev-praise {
-  color: #7ddf8f;
+  color: var(--ok);
 }
 
 /* Click-in view: the review is prose to read, at the same size as the rest of it. */
@@ -3751,7 +3989,7 @@ select[data-tip],
 }
 .facet-name {
   font-size: var(--t-micro);
-  letter-spacing: 0.08em;
+  letter-spacing: var(--track);
   text-transform: uppercase;
   color: var(--faint);
   margin-bottom: 6px;
@@ -3796,7 +4034,7 @@ select[data-tip],
 .against-label {
   margin: 10px 0 4px;
   font-size: var(--t-micro);
-  letter-spacing: 0.06em;
+  letter-spacing: var(--track);
   text-transform: uppercase;
   color: var(--amber);
 }
@@ -3865,7 +4103,16 @@ select[data-tip],
   color: var(--lilac);
   border-color: var(--line-strong);
 }
-.persona-chip.on {
+/* Picked, where what you picked is a *person*.
+   Lilac rather than the blue every other selected control uses, and deliberately so: the
+   token is this file's identity hue, so "reviewing as Pavel" does not read as just another
+   filter being on. Four controls did this — the board's `review as`, the chat's persona
+   picker, the review panel's persona buttons and the persona chips — in three slightly
+   different ways, one of them missing its border. */
+.persona-chip.on,
+.persona-picker.on,
+.persona-pick.on,
+.review-as.on {
   color: var(--ink);
   background: var(--lilac);
   border-color: var(--lilac);
@@ -3919,7 +4166,7 @@ select[data-tip],
   margin: 6px 0 0;
   padding: 5px 8px;
   background: var(--bg);
-  border-radius: 6px;
+  border-radius: var(--radius-xs);
   font-size: var(--t-micro);
   color: var(--dim);
   overflow-x: auto;
@@ -3974,16 +4221,12 @@ select[data-tip],
 
 /* The chat's persona picker, and the label on a simulated reply. The label is not
    optional: an unlabelled simulated colleague reads as a quotation. */
-.persona-picker.on {
-  color: var(--ink);
-  background: var(--lilac);
-}
 .bubble.persona {
   border-left: 2px solid var(--lilac);
 }
 .bubble-persona {
   font-size: var(--t-micro);
-  letter-spacing: 0.06em;
+  letter-spacing: var(--track);
   text-transform: uppercase;
   color: var(--lilac);
   margin-bottom: 4px;
@@ -4124,11 +4367,6 @@ select[data-tip],
 .review-as {
   color: var(--lilac);
   border-color: var(--line-strong);
-}
-.review-as.on {
-  color: var(--ink);
-  background: var(--lilac);
-  border-color: var(--lilac);
 }
 
 /* One row's predicted verdict. A chip, not a card: the board is a scanning surface,
@@ -4314,7 +4552,9 @@ select[data-tip],
   border-top: 1px solid var(--line);
   font-size: var(--t-micro);
 }
-.card-ai {
+/* A tight inline run of indicator dots. */
+.card-ai,
+.facet-dots {
   display: inline-flex;
   align-items: center;
   gap: 3px;
@@ -4326,11 +4566,6 @@ select[data-tip],
    Dots rather than the labelled pills this started as: six 9px abbreviations on every
    card was a row of things to decode, which is the clutter the rework exists to
    remove. The signal is carried by fill, not by the word. */
-.facet-dots {
-  display: inline-flex;
-  align-items: center;
-  gap: 3px;
-}
 .facet-dot {
   width: 5px;
   height: 5px;
@@ -4390,14 +4625,8 @@ select[data-tip],
   padding: 5px 8px;
   background: var(--surface-2);
   border-left: 2px solid var(--slate);
-  border-radius: 0 6px 6px 0;
+  border-radius: 0 var(--radius-xs) var(--radius-xs) 0;
   font-size: var(--t-meta);
-}
-.finding-sev {
-  font-size: var(--t-micro);
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
-  color: var(--dim);
 }
 /* Only a blocker earns a colour. A praise and a nit rendered in amber would make
    every review look contested — the same mistake the persona "contested" badge made
@@ -4480,7 +4709,7 @@ details.patch[open] > summary.patch-head::before {
 .spine-item {
   padding: 2px 10px;
   font-size: var(--t-micro);
-  letter-spacing: 0.06em;
+  letter-spacing: var(--track);
   text-transform: uppercase;
   color: var(--dim);
   background: var(--surface-2);
@@ -4504,43 +4733,10 @@ details.patch[open] > summary.patch-head::before {
 .tl-count {
   color: var(--dim);
 }
-
 /* ---- Slack thread analysis ----
    The page's job is to make one distinction visible: did both models reach this, or only
    one. Everything else is subordinate to that, because a single model's confident opinion
    about a colleague is exactly the thing not to trust. */
-
-.thread-input {
-  display: flex;
-  gap: 8px;
-  margin-top: 10px;
-}
-.thread-input input {
-  flex: 1;
-  background: var(--surface-2);
-  border: 1px solid var(--line);
-  border-radius: var(--pill);
-  padding: 10px 14px;
-  color: var(--text);
-  font-family: inherit;
-  font-size: var(--t-body);
-}
-.thread-input input:focus {
-  outline: none;
-  border-color: var(--blue);
-}
-.thread-error {
-  margin: 8px 0 0;
-  color: var(--sev-critical);
-  font-size: var(--t-meta);
-}
-
-.thread-card-head {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  cursor: pointer;
-}
 .thread-title {
   flex: 1;
   min-width: 0;
@@ -4570,7 +4766,7 @@ details.patch[open] > summary.patch-head::before {
 }
 .model-summary {
   border: 1px solid var(--line);
-  border-radius: 10px;
+  border-radius: var(--radius-sm);
   padding: 10px 12px;
   background: var(--surface-2);
   max-width: var(--measure);
@@ -4579,7 +4775,7 @@ details.patch[open] > summary.patch-head::before {
   color: var(--lilac);
   font-size: var(--t-micro);
   text-transform: uppercase;
-  letter-spacing: 0.1em;
+  letter-spacing: var(--track);
   margin-bottom: 6px;
 }
 .model-summary .outcome {
@@ -4618,7 +4814,7 @@ details.dropped > summary {
   padding: 8px 12px;
   border-left: 3px solid var(--line-strong);
   background: var(--surface-2);
-  border-radius: 0 8px 8px 0;
+  border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
 }
 /* Criticism is red, not amber. Amber in this app means "a warning about the system"; this
    is a judgement about a person, and borrowing the system's warning colour would make an
@@ -4631,18 +4827,6 @@ details.dropped > summary {
 }
 .finding-card.stance-observation {
   border-left-color: var(--slate);
-}
-.finding-head {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  flex-wrap: wrap;
-}
-.stance {
-  font-size: var(--t-micro);
-  text-transform: uppercase;
-  letter-spacing: 0.1em;
-  color: var(--dim);
 }
 .stance-criticism .stance {
   color: var(--sev-critical);
@@ -4658,7 +4842,7 @@ details.dropped > summary {
   border: 1px solid var(--line-strong);
   font-size: var(--t-micro);
   text-transform: uppercase;
-  letter-spacing: 0.08em;
+  letter-spacing: var(--track);
 }
 .corroboration.both {
   border-color: var(--lilac);
@@ -4765,7 +4949,7 @@ details.thread-cast > summary {
   margin-top: 12px;
   padding: 10px 12px;
   border: 1px solid var(--sev-critical);
-  border-radius: 8px;
+  border-radius: var(--radius-sm);
   background: rgba(224, 87, 79, 0.08);
   color: var(--text);
   font-size: var(--t-meta);
@@ -4782,7 +4966,7 @@ details.thread-cast > summary {
   color: var(--sev-critical);
   font-size: var(--t-micro);
   text-transform: uppercase;
-  letter-spacing: 0.08em;
+  letter-spacing: var(--track);
 }
 
 /* A finding that leaned on a persona trait. Marked because it changes what is being
@@ -4793,4 +4977,641 @@ details.thread-cast > summary {
   color: var(--lilac);
   font-size: var(--t-micro);
   letter-spacing: 0.04em;
+}
+
+/* ---- source snoozes ----
+   A snoozed source is dimmed but never hidden, and always shows its remaining time. The
+   failure to design against is a rail that looks normal while Slack is silently held back —
+   at which point a snooze is indistinguishable from a source that has broken. */
+.source-row.snoozed .src {
+  opacity: 0.45;
+}
+.source-row.snoozed .dot {
+  opacity: 0.4;
+}
+.snooze-left {
+  margin-left: auto;
+  color: var(--lilac);
+  font-size: var(--t-micro);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.02em;
+}
+/* Its own target rather than a second meaning for the row: clicking the row filters the
+   board, and one control that both filters and silences is a click you have to think about. */
+.snooze-btn {
+  flex: 0 0 auto;
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  margin-left: 4px;
+  border: 1px solid transparent;
+  border-radius: 50%;
+  background: none;
+  color: var(--faint);
+  font-family: inherit;
+  font-size: var(--t-micro);
+  line-height: 1;
+  cursor: pointer;
+  opacity: 0;
+  transition:
+    opacity 0.12s,
+    color 0.12s;
+}
+.source-row:hover .snooze-btn {
+  opacity: 1;
+}
+.snooze-btn:hover {
+  color: var(--blue);
+  border-color: var(--line-strong);
+}
+/* While snoozed the control stays visible without hover — it is the way back, and hiding
+   the way out of a mode is how a mode becomes a trap. */
+.snooze-btn.on {
+  opacity: 1;
+  color: var(--lilac);
+  border-color: var(--lilac);
+}
+
+/* Total silence — nothing from this source is reaching you, outages included. Red, and not
+   the lilac a normal snooze uses: the difference between "quiet for a bit" and "you will not
+   be told if this catches fire" is the most important distinction in the rail. */
+.snooze-left.total {
+  color: var(--sev-critical);
+  font-weight: 700;
+}
+/* ---- branch review ----
+   Several reviewers over one diff. The distinction the whole view turns on is who said a
+   thing: "this swallows the error" reads identically whether a model wrote it or a colleague
+   is predicted to, so the attribution is never subtle and never optional. */
+/* Picking the panel. Personas are toggles rather than a multi-select: choosing three reviewers
+   is three clicks either way, and a list of chips shows the panel you have assembled. */
+.review-panel {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: 10px;
+}
+.review-generic {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--dim);
+  font-size: var(--t-meta);
+  cursor: pointer;
+}
+.persona-pick {
+  padding: 3px 10px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--pill);
+  background: none;
+  color: var(--dim);
+  font-family: inherit;
+  font-size: var(--t-micro);
+  cursor: pointer;
+}
+.persona-pick:hover {
+  border-color: var(--lilac);
+  color: var(--text);
+}
+
+.branch-chip {
+  padding: 3px 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--pill);
+  background: var(--surface-2);
+  color: var(--dim);
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: var(--t-micro);
+  cursor: pointer;
+}
+.branch-chip.on {
+  border-color: var(--blue);
+  color: var(--text);
+}
+
+/* One reviewer's verdict. */
+.pass-card {
+  margin-top: 8px;
+  padding: 8px 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+}
+/* Dismissed: still there, visibly set aside. Removing it would throw away the record of the
+   disagreement, which is the thing worth keeping. */
+.pass-card.dismissed {
+  opacity: 0.42;
+}
+.pass-spacer {
+  flex: 1;
+}
+.pass-head button {
+  padding: 2px 9px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--pill);
+  background: none;
+  color: var(--dim);
+  font-family: inherit;
+  font-size: var(--t-micro);
+  cursor: pointer;
+}
+.pass-head button:hover:not(:disabled) {
+  border-color: var(--blue);
+  color: var(--blue);
+}
+/* Who reviewed. A persona takes the identity hue everywhere it appears, so a prediction about a
+   colleague can never be mistaken for the model's own finding at a glance. */
+.pass-by {
+  font-weight: 700;
+  font-size: var(--t-meta);
+  color: var(--text);
+}
+.pass-by.persona {
+  color: var(--lilac);
+}
+.pass-model {
+  color: var(--faint);
+  font-size: var(--t-micro);
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+}
+.pass-rec {
+  padding: 1px 7px;
+  border-radius: var(--pill);
+  font-size: var(--t-micro);
+  text-transform: uppercase;
+  letter-spacing: var(--track);
+  border: 1px solid var(--line-strong);
+  color: var(--dim);
+}
+.pass-rec.rec-approve {
+  border-color: var(--ok);
+  color: var(--ok);
+}
+.pass-rec.rec-request_changes {
+  border-color: var(--sev-critical);
+  color: var(--sev-critical);
+}
+.pass-count {
+  color: var(--faint);
+  font-size: var(--t-micro);
+}
+/* The branch has moved since this was reviewed. Amber: a warning about the state of the
+   system, which is exactly what this is. */
+.pass-error {
+  margin: 6px 0 0;
+  color: var(--sev-critical);
+  font-size: var(--t-meta);
+}
+.pass-summary {
+  margin: 6px 0 0;
+  max-width: var(--measure);
+  font-size: var(--t-body);
+}
+/* Said out loud, next to the words themselves. A predicted review that looks like a review is
+   the one failure this feature must not have. */
+.rehearsal {
+  margin-right: 8px;
+  padding: 1px 7px;
+  border: 1px solid var(--lilac);
+  border-radius: var(--pill);
+  color: var(--lilac);
+  font-size: var(--t-micro);
+  text-transform: uppercase;
+  letter-spacing: var(--track);
+  white-space: nowrap;
+}
+
+details.review-file {
+  margin-top: 10px;
+  border-top: 1px solid var(--line);
+  padding-top: 8px;
+}
+details.review-file > summary {
+  cursor: pointer;
+  color: var(--dim);
+  font-size: var(--t-meta);
+}
+.file-comment-count {
+  margin-left: 8px;
+  color: var(--lilac);
+  font-size: var(--t-micro);
+}
+
+/* An inline comment, under the line it is about. */
+.note-by {
+  margin-right: 8px;
+  color: var(--dim);
+  font-size: var(--t-micro);
+  font-weight: 700;
+  white-space: nowrap;
+}
+.note-by.persona {
+  color: var(--lilac);
+}
+/* A predicted comment carries the identity hue on its edge as well as its label — on a patch
+   interleaving three reviewers, the eye finds the boundary before it reads the attribution. */
+.review-note.note-persona {
+  border-left-color: var(--lilac);
+}
+.note-because {
+  margin-left: 8px;
+  color: var(--lilac);
+  font-size: var(--t-micro);
+  opacity: 0.8;
+}
+
+/* ---- cloud context ----
+   The boxes that answer "whose environment is this, and where does it run" for a subject
+   that named a platform id. A grid rather than a list: the entities are peers of different
+   kinds — an environment, its account, its region — and reading them side by side is what
+   makes the hierarchy legible at a glance. */
+.cloud-entities {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+  gap: 10px;
+}
+.cloud-entity {
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  padding: 10px 12px;
+  background: var(--surface-2);
+}
+/* A box that exists because the id is real but could not be read. Amber is the file's one
+   warning colour and this is a warning: the panel is showing you a gap, not a fact. */
+.cloud-entity.failed {
+  border-color: var(--amber);
+}
+/* The kind, as a hairline chip. Deliberately unsaturated and uniform across kinds: which
+   kind a box is gets read once, and seven colours competing inside one panel would make the
+   *chips* the thing you see rather than the names and statuses they label. */
+.cloud-kind {
+  padding: 1px 7px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--pill);
+  color: var(--dim);
+  font-size: var(--t-micro);
+  text-transform: uppercase;
+  letter-spacing: var(--track);
+  white-space: nowrap;
+}
+/* The environment somebody actually pasted is what the eye should land on first, and its
+   name is the human-readable half of an otherwise opaque id. */
+.cloud-name {
+  font-weight: 700;
+}
+.cloud-status {
+  color: var(--dim);
+  font-size: var(--t-meta);
+}
+.cloud-id {
+  display: block;
+  margin-top: 4px;
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: var(--t-micro);
+  color: var(--faint);
+  overflow-wrap: anywhere;
+}
+.cloud-error {
+  margin-top: 6px;
+  color: var(--amber);
+  font-size: var(--t-micro);
+}
+/* An entity whose re-read failed but whose last good copy is still on screen. Dimmer than a
+   bare error, because the box below it is *usable* — the loud version reads as "this is
+   broken" when what it means is "this is from earlier". */
+.cloud-error.stale {
+  color: var(--dim);
+  border-left: 2px solid var(--amber);
+  padding-left: 8px;
+}
+/* Label/value pairs in two columns. The labels are short and fixed-vocabulary, so a narrow
+   auto column keeps the values aligned down the box without wrapping the labels. */
+.cloud-fields {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 2px 10px;
+  margin: 8px 0 0;
+  font-size: var(--t-meta);
+}
+.cloud-fields dt {
+  color: var(--faint);
+  white-space: nowrap;
+}
+.cloud-fields dd {
+  margin: 0;
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+
+/* ---- cloud explorer ----
+   Search on top, results and relationships side by side. Two panes rather than a drill-down:
+   exploring a graph is a run of small hops, and a full page transition per hop throws away
+   the search that got you there. */
+.cloud-search {
+  width: 100%;
+  margin-bottom: 10px;
+}
+/* A chip that is a control rather than a label — a filter, a mode, an option in a modal.
+   `.cloud-kinds` and `.modal-options` each had their own identical copy of this. */
+.cloud-kinds .chip,
+.modal-options .chip,
+.board-filter .chip {
+  cursor: pointer;
+  border: 1px solid var(--line-strong);
+  background: transparent;
+  color: var(--dim);
+}
+.chip-count {
+  color: var(--faint);
+  font-variant-numeric: tabular-nums;
+}
+
+/* Results left, relationships right. Collapses to one column on a narrow window, where the
+   two panes stack in the order you use them. */
+.cloud-split {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 12px;
+  align-items: start;
+}
+@media (max-width: 900px) {
+  .cloud-split {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+/* Both panes scroll independently: a 900-account list must not push the relationships pane
+   off the bottom of the page. */
+.cloud-results,
+.cloud-detail {
+  max-height: 70vh;
+  overflow-y: auto;
+}
+.cloud-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+/* A result row is two controls, not one: the tick selects it for a bulk reconcile, the row
+   itself navigates to it. Laid out as a flex line so the tick sits outside the button rather
+   than inside it — nesting them would make the commoner action (navigate) swallow the rarer
+   one, and a checkbox you cannot hit is worse than no checkbox. */
+.cloud-list li {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+/* Reserved whether or not this row has a tick, so names stay in one column down the list.
+   A ragged left edge on a list you are scanning for a *name* is worse than a little space. */
+.cloud-list li > .cloud-row:first-child {
+  margin-left: 20px;
+}
+.cloud-pick {
+  flex: 0 0 auto;
+  width: 14px;
+  height: 14px;
+  margin: 0;
+  accent-color: var(--blue);
+  cursor: pointer;
+}
+/* A picked row stays visible as you scroll past it — the selection is the thing you are
+   building, and it has to be legible without counting ticks. */
+.cloud-list li.picked .cloud-row {
+  background: color-mix(in srgb, var(--blue) 14%, transparent);
+}
+
+/* The bulk strip above the results. Only drawn when the filter is showing something
+   reconcilable, so it is never a control with nothing to act on. */
+.cloud-bulk {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 2px 8px;
+  border-bottom: 1px solid var(--line);
+  margin-bottom: 6px;
+  font-size: var(--t-micro);
+}
+.cloud-bulk-all {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--dim);
+  cursor: pointer;
+}
+.cloud-bulk-all input {
+  width: 14px;
+  height: 14px;
+  margin: 0;
+  accent-color: var(--blue);
+  cursor: pointer;
+}
+/* Pushed right, so the count and the action that consumes it read as one group and cannot be
+   mistaken for part of the "all showing" toggle they sit beside. */
+.cloud-bulk-count {
+  margin-left: auto;
+  color: var(--text);
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+.cloud-row {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  width: 100%;
+  padding: 6px 8px;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text);
+  text-align: left;
+  cursor: pointer;
+  flex-wrap: wrap;
+}
+.cloud-row:hover {
+  background: var(--surface);
+}
+.cloud-row.active {
+  background: var(--surface);
+  box-shadow: inset 2px 0 0 var(--blue);
+}
+/* The id is the least-read thing on a row that has a name — it earns its place as a
+   fallback and as something to copy, not as the thing the eye lands on. */
+.cloud-row .cloud-id {
+  margin-top: 0;
+  margin-left: auto;
+}
+/* Section headings inside the relationships pane: subordinate to the panel's own h3, so the
+   two directions read as parts of one answer rather than as two more panels. */
+.cloud-rel {
+  margin: 14px 0 4px;
+  font-size: var(--t-meta);
+  text-transform: uppercase;
+  letter-spacing: var(--track);
+  color: var(--dim);
+}
+
+/* ---- cloud actions, terminal, raw document ----
+   The line between reading and doing. Everything above `.cloud-actions` in the detail pane is
+   a read of the cache; everything this row starts runs against the live control plane. */
+.cloud-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin: 10px 0 0;
+  padding-top: 10px;
+  border-top: 1px solid var(--line);
+}
+/* The buttons that mutate. Amber is this file's warning colour and these are the two things
+   on the page that change the world — an edit rewrites a control-plane document, a reconcile
+   applies it to a live cluster. They should not look like `view json`. */
+.cloud-actions select {
+  padding: 2px 6px;
+}
+
+/* A control in the actions row that is a *link*, not a button — it leaves MuggleBot for
+   Grafana. Shaped like its neighbours so the row reads as one strip, but it stays an `<a>`
+   in the markup, because middle-click, copy-link-address and open-in-background-tab are
+   worth more here than the convenience of reusing `button`. Nothing in this row is styled by
+   element, so matching by hand is the price of that. */
+.cloud-action-link {
+  background: transparent;
+  color: var(--blue);
+  border: 1px solid var(--line-strong);
+  border-radius: var(--pill);
+  padding: 6px 15px;
+  font-weight: 700;
+  font-size: var(--t-micro);
+  text-decoration: none;
+  line-height: normal;
+  transition:
+    background 0.12s,
+    color 0.12s,
+    border-color 0.12s;
+}
+.cloud-action-link:hover {
+  background: var(--blue);
+  color: var(--ink);
+  border-color: var(--blue);
+}
+
+/* The state-written-but-not-applied notice. An edit that succeeded has changed the control
+   plane's copy and nothing on the cluster, and that gap is invisible everywhere else. */
+.cloud-followup {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-top: 10px;
+  padding: 8px 10px;
+  border: 1px solid var(--amber);
+  border-radius: var(--radius-sm);
+  font-size: var(--t-meta);
+}
+
+.pty-pane {
+  margin-top: 10px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+  background: var(--surface-2);
+}
+.pty-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  background: var(--surface);
+  border-bottom: 1px solid var(--line);
+  font-size: var(--t-micro);
+}
+/* The command as the server actually built it, not as the client asked for it — the pane
+   should say what is running, from the side that decided. */
+.pty-label {
+  color: var(--dim);
+  overflow-wrap: anywhere;
+}
+.pty-exit {
+  font-weight: 700;
+}
+.pty-exit.ok {
+  color: var(--ok);
+}
+.pty-exit.bad {
+  color: var(--amber);
+}
+.pty-error {
+  color: var(--amber);
+}
+.pty-close {
+  margin-left: auto;
+}
+.pty-term {
+  height: 340px;
+  padding: 6px;
+}
+
+
+/* Whether the keyboard is actually in the terminal. Worth showing: a focused and an unfocused
+   xterm look identical, so an editor that is running but ignoring you is indistinguishable
+   from one that has hung. */
+.pty-pane:focus-within {
+  border-color: var(--blue);
+}
+.pty-hint {
+  color: var(--faint);
+}
+.pty-pane:focus-within .pty-hint {
+  visibility: hidden;
+}
+
+/* ---- modal forms ----
+   A small form rather than more controls in the actions row, for the operations that take an
+   input and then do something real: minting a kubectl credential, resizing an environment.
+   Named for the shape rather than for the first screen that needed it — the kubectl modal
+   owned `.kube-field`, `.kube-label` and the rest until the resources modal wanted the same
+   thing and would otherwise have grown a second copy. */
+.kube-modal,
+.resources-modal {
+  width: min(520px, 100%);
+}
+.modal-field {
+  margin-top: 14px;
+}
+.modal-label {
+  display: block;
+  margin-bottom: 6px;
+  font-size: var(--t-meta);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--dim);
+}
+/* What the chosen option actually means. The two access levels differ in blast radius, and a
+   pair of words on a chip does not say that. */
+.modal-note {
+  margin: 6px 0 0;
+  font-size: var(--t-micro);
+}
+.modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 18px;
+}
+
+/* A size, in GiB. The unit is rendered beside the box rather than left to a placeholder that
+   disappears the moment there is a value — the difference between 8 and 8192 is the whole
+   question here, so the unit stays on screen while the number is typed. */
+.gib-input {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.gib-input input {
+  width: 8rem;
+  font-variant-numeric: tabular-nums;
+}
+.gib-unit {
+  font-size: var(--t-meta);
+  color: var(--dim);
 }

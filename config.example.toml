@@ -42,6 +42,8 @@ grafana = 3                    # Grafana HTTP reads — not the browser's 1, whi
                                # the single Chrome, not about concurrency being unsafe
 thread = 1                     # one thread analysis at a time: each is already two
                                # concurrent cloud calls
+review = 2                     # branch review passes — a panel of five personas should not
+                               # arrive as five concurrent bursts of model calls
 checkout = 2                   # disk-bound; per-repo limit keys prevent a corrupt tree
 repo_index = 1                 # one org crawl at a time: two would clone the same repo
                                # into the same directory
@@ -122,10 +124,10 @@ red_alert_min_confidence = 0.75
 # providers so a hosted model can't get routed at localhost (404) and vice versa.
 #
 # Pull the local models first:
-#   ollama pull deepseek-coder:33b
+#   ollama pull gemma4:31b
 #   ollama pull qwen2.5vl:7b        # only if you drop images into chat
 local = "ollama_local"        # claude | ollama | ollama_local | chatgpt
-local_model = "deepseek-coder:33b"
+local_model = "gemma4:31b"
 # Images dropped into chat go here. A separate setting because vision is a different
 # capability from reasoning: point this at a coder model and MuggleBot will answer
 # about a screenshot it never saw. Always built against the local Ollama endpoint.
@@ -165,7 +167,7 @@ ollama_url = "http://127.0.0.1:11434"
 # Ollama Cloud host (used by the "ollama" provider). Requires the API key stored
 # as the secret named "ollama"; hosted models are listed once it's set.
 ollama_cloud_url = "https://ollama.com"
-ollama_model = "deepseek-coder:33b"  # local_only_sources
+ollama_model = "gemma4:31b"  # local_only_sources
 # Embeddings are a DIFFERENT capability from chat: coder and chat models have no
 # embedding head and answer /api/embeddings with a 500. Keep this pointed at a real
 # embedding model — `ollama pull nomic-embed-text`. If it fails, recall silently
@@ -414,6 +416,189 @@ base_url = ""                  # e.g. "https://acme.grafana.net" — also used t
 lookback = "6h"                # window when the alert's own link carries no from/to
 timeout = "60s"                # per request; /api/ds/query over a wide range is the slow one
 fallback_to_browser = true     # hand the alert to [browser] when Grafana can't answer
+
+[cloud]
+# Restate Cloud entity resolution: an id in a ticket becomes a box of facts.
+#
+# A support thread says `env_201kpvffchrm1sq5p0qph42dqev is throwing 500s`. On its own that
+# is an opaque token — it does not say whose environment it is, which region it runs in, what
+# profile it is on, or which Nuon install to look at. Each of those is an `rcc get` away, and
+# it is the same four commands every time. MuggleBot runs them once, on ingest, and hangs the
+# answer off the subject: the detail view grows a "Cloud context" panel, and the summary and
+# live-assist prompts get the same facts so they reason about the real account and region
+# instead of guessing from the environment's name.
+#
+# RESOLUTION IS TRANSITIVE. An environment names its account and region, an account names its
+# organization, a region names its Nuon install — so one mention resolves the hierarchy. The
+# edges only point at parents, which is what keeps the closure small and terminating.
+#
+# PREFIXES: usr_ acc_ env_ rgn_ key_ org_ grp_ (the set `rcc` itself routes on). Matching is
+# strict — ten characters and at least one digit — so `env_vars` and `key_management` in a log
+# line are not mistaken for ids.
+#
+# GRAFANA DEEP LINKS: an environment and a region each get a link straight to their dashboard
+# with the entity already selected. Constructed, not looked up — the dashboards in
+# `restate-cloud/grafana` have stable string UIDs (`cloud-environment`, `cloud-region`) and key
+# on values already cached here: an environment's Kubernetes namespace and a region's Nuon
+# install id. No API call and no token. Kinds with no metrics of their own — an account, an
+# organization, a user — get no link rather than one to an empty dashboard.
+#
+# CREDENTIALS: none here, and none obtainable. This shells out to the `rcc` and `nuon` CLIs
+# you have already configured and inherits exactly what they can see; `nuon` is additionally
+# passed `--read-only`. If `rcc` is not logged in, lookups fail, the panel says so, and
+# nothing else changes.
+#
+# WHAT IS KEPT: a curated field list per kind, never raw virtual-object state. That state
+# carries credentials — `secretKeyHash` on an api key, `controlPlaneApiKeyFull` on an
+# environment — and this output is cached in SQLite and pasted into model prompts, so the
+# allowlist IS the redaction rather than something applied after the fact.
+#
+# NOT ON THE POLL PATH. Ingest only scans for ids; the lookups run on a 30s scheduler sweep,
+# because each one is a subprocess and the poll path must not pay for it.
+#
+# PRE-POPULATION: `mugglebot cloud-warm` fills the cache from the control plane rather than
+# waiting for a first mention, so the first person to paste an id gets a full box instead of
+# an empty one. It enumerates the estate through `rcc regions` / `rcc list-envs` and reads
+# each entity once — safe to interrupt, and cheap to re-run since anything still fresh is
+# served from the cache.
+#
+# PEOPLE ARE THE EXCEPTION. Nothing lists users: there is no `rcc list-users`, and a `usr_`
+# document names the accounts the person can reach rather than the reverse — so the only place
+# a user id exists is inside the account or organization that granted them access. The warm
+# discovers them from there, and ONLY the warm does: an organization has ~200 members, and a
+# thread mentioning one environment must not pull all of them into its context box.
+#
+# A USER'S NAME AND EMAIL ARE NOT IN THE STATE STORE. They live in a separate DynamoDB table
+# written by the WorkOS/Cognito integration, so a user is read with `rcc describe` (which
+# prints the virtual object and the profile together) rather than `rcc get`. That path goes
+# through `kubectl exec` rather than the admin gateway and needs AWS credentials for the
+# profile half. Both degrade gracefully: no AWS session means a user with accounts but no name,
+# which is still a resolved user — "we could not read the directory" and "this id is not real"
+# stay different answers.
+#
+# CREDENTIALS EXPIRE, AND THE FAILURE IS SILENT: an expired admin token does not make `rcc`
+# fail — it falls back to reading through `kubectl`, which is far slower and returns state the
+# gateway would have redacted. That fallback is detected and reported as an unhealthy `cloud`
+# source with the fix attached (`restate cloud login && rcc login -c <realm>`).
+enabled = false
+rcc_path = "~/bin/rcc"         # the rcc wrapper; a leading ~ is expanded
+nuon_path = "nuon"
+context = ""                   # rcc -c realm: "dev" | "us" | "eu"; empty leaves rcc's default (us)
+aws_profile = ""               # rcc --aws-profile, for the DynamoDB table holding user names and
+                               # emails; empty leaves rcc's default for the realm
+grafana_url = ""               # Grafana stack for the entity deep links; empty derives it from
+                               # `context` ("dev" → restate.grafana.net, else restateprod)
+ttl = "6h"                     # how long a successful lookup stays fresh
+timeout = "30s"                # hard cap on one rcc/nuon invocation
+max_entities = 12              # ceiling on the closure per sweep
+
+# THE OPERATIONS THAT ARE NOT READS. The Cloud page can run three interactive commands in an
+# embedded terminal: `rcc edit` (rewrites a control-plane document in $EDITOR), `rcc reconcile`
+# (diffs stored state against the live cluster and applies it after a confirmation), and the
+# BYOC kube-token script. An edit WRITES STATE BUT DOES NOT APPLY IT — the UI says so and
+# offers the reconcile, because a tip printed in a pane you just closed is a tip that gets
+# missed.
+#
+# The socket carrying these is allowlisted, not a shell: it accepts a command KIND plus an
+# entity id, validates the id against the cache, and builds the argv server-side. No free-form
+# command string ever crosses it, and `rcc reconcile --yes` is not reachable at all.
+kube_token_script = ""         # e.g. "~/src/nuon-byoc/scripts/refresh-kube-token.sh"; empty hides the button
+editor = "vim"                 # what `rcc edit` opens; must work in a terminal, not a GUI
+
+[context]
+# The context library: curated reference material — runbooks, design docs, on-call guides —
+# summarized, embedded, and recalled semantically when a subject looks related.
+refresh_default = "6h"         # re-fetch cadence for a source that sets no interval of its own
+
+# Extra directories to sync alongside the managed <data_dir>/contexts tree, for documentation
+# that lives in a checkout rather than being copied in. It stays current with `git pull`
+# instead of needing a re-copy, and it is READ-ONLY — nothing here is ever written to.
+#
+# Layout rule, same as the managed tree: each top-level SUBDIRECTORY is a pinned tag on the
+# files beneath it, so `docs/runbooks/foo.md` is tagged `runbooks`. Files at the top level are
+# ingested untagged rather than skipped, which is what keeps a repo's overview docs — the
+# orientation material — in the library alongside its runbooks.
+dirs = [
+  # "~/src/restate-cloud/docs",
+]
+
+[quiet]
+# Snooze a whole source — "not Slack, not now". Alongside the per-subject snooze, which
+# silences one thread; this silences the source.
+#
+# It does TWO things, and only the second makes it worth pressing: it takes subjects whose
+# signals come only from that source off the board, AND holds newly-arriving ones back until
+# it expires. Slack polls every 30s, so without the second half the board refills before you
+# have looked away.
+#
+# `floor` is the guard the feature turns on: severities BELOW it are held back, and this and
+# above land anyway. `critical` by default, which is the same rule general.quiet_hours
+# already follows — Slack is where a firing incident arrives, and a snooze must never be what
+# hides an outage.
+#
+# Set `floor = "everything"` (or pass it per-snooze via the `snooze_source` tool) for total
+# silence, criticals included. That is the literal reading of "snooze all notifications" and
+# it is askable on purpose — a safe default you cannot override is a tool arguing with its
+# operator — but it is never the default, and the rail marks it in red.
+#
+# A snooze is a row with an expiry that gets READ, never a timer that gets armed: nothing has
+# to survive a restart, and there is no scheduled cancellation that can fail to run and leave
+# a source silenced. 24h is the maximum — longer than that is a disabled source, and
+# `[sources.slack].enabled = false` is the honest way to say so.
+#
+# A pull request with Slack chatter on it is not a Slack notification: only subjects whose
+# signals ALL come from the snoozed source are taken.
+default = "2h"                 # what the one-click button in the SOURCES rail uses
+floor = "critical"             # lowest severity that still lands | "everything" for silence
+
+[tidy]
+# Clear the GitHub notifications that do not need you. THE ONLY THING MUGGLEBOT WRITES.
+#
+# This narrows the "nothing is ever written back to GitHub" invariant rather than dropping
+# it. Everything that invariant protects — a review, an approval, a label, a predicted
+# comment — is something a COLLEAGUE CAN SEE. Marking your own notification read is
+# invisible to everyone else and mutates no shared artifact. The rule is now: nothing is
+# written to anything anyone else can see.
+#
+# The write also cannot be aimed anywhere else. `src/tidy.rs` checks the thread id is digits
+# and builds `/notifications/threads/{id}` itself, so there is no input that reaches the
+# path — it cannot become a write against a pull request even by mistake. The GitHub client
+# still has no write methods at all.
+#
+# WHAT IT CLEARS: reason `ci_activity`, and merged pull requests.
+# WHAT IT WILL NOT, and why — both are things you would only notice after they were gone:
+#   * A FAILED CI run. Red on a branch you own is the thing that needs you most, and it
+#     arrives under `ci_activity` like every green one. `keep_failed_ci = false` for the
+#     literal "clear any ci_activity".
+#   * A merged PR where somebody ADDRESSED YOU — mention, team_mention, review_requested,
+#     assign. Merging it did not answer their question.
+#   * `security_alert`, ever. Not configurable.
+#
+# The merged rule needs [sources.github].enrich = true, which is what resolves whether a PR
+# was merged. With enrichment off it never fires rather than guessing.
+#
+# Every decision is recorded in `tidied_notifications` (see the `list_tidied_notifications`
+# tool) whether or not it was acted on, because "what did it take out of my inbox" is a
+# question you have exactly when the notification is no longer there to look at.
+#
+# It rides the existing GitHub notifications poll rather than adding a second one: a
+# separate poller would double the request cost, could not share the Last-Modified cursor
+# that makes most polls a 304, and would have to re-fetch each subject to learn what is
+# merged. Clearing a notification does NOT suppress its signal — the board is MuggleBot's
+# own attention model, and the CI signals it keeps are what correlate a failing run to its
+# pull request.
+#
+# TOKEN SCOPE: a classic PAT needs `notifications`; a fine-grained one needs read+write on
+# "Notifications". Read-only will 403 on the clear and the reason will say so.
+enabled = false
+dry_run = true                 # DEFAULT. Reports what it would clear and clears nothing.
+                               # Turn this off once the list looks right.
+mode = "read"                  # read = mark as read | done = GitHub's Done button (harder
+                               # to undo, hence not the default)
+clear_ci = true
+clear_merged = true
+keep_failed_ci = true          # see above — this is a judgement about the purpose rather
+                               # than the letter of the request
 
 [threads]
 # Slack thread analysis, asked for by hand. Paste a thread permalink; two models read it

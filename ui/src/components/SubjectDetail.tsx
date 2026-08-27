@@ -9,7 +9,7 @@ import {
   Show,
 } from "solid-js";
 import { api } from "../api";
-import { entityHref } from "../entities";
+import { cloudTip, entityHref } from "../entities";
 import { renderMarkdown } from "../markdown";
 import {
   hints,
@@ -36,6 +36,10 @@ import { displayTitle, KIND_LABEL, ref } from "./Board";
 import DiffPane from "./DiffPane";
 import DispatchStrip from "./DispatchStrip";
 import { SignalModal, signalHref } from "./SignalModal";
+import DashboardReadings from "./detail/DashboardReadings";
+import IssueTriagePanel from "./detail/IssueTriage";
+import RootCause from "./detail/RootCause";
+import { SectionHead } from "./ui";
 
 // UI-facing provider labels; the id is what the backend maps to a reasoner.
 // Local first, because it is the default. RECONSIDER used to default to Anthropic, which
@@ -47,14 +51,6 @@ const PROVIDERS = [
   { id: "ollama", label: "Ollama Cloud" },
 ] as const;
 
-// Reuse the signal-state pills so a browser investigation reads like the rest of
-// the board rather than inventing a second status vocabulary.
-const BROWSER_STATE: Record<BrowserInvestigation["status"], string> = {
-  pending: "unseen",
-  running: "seen",
-  completed: "resolved",
-  failed: "unseen",
-};
 
 /// The series behind a Grafana reading, folded.
 ///
@@ -133,12 +129,6 @@ function GrafanaSeries(props: { raw: string | null }) {
   );
 }
 
-const TRIAGE_STATE: Record<IssueTriage["status"], string> = {
-  pending: "unseen",
-  running: "seen",
-  complete: "resolved",
-  failed: "unseen",
-};
 
 function successfulCiOnly(signals: Signal[]) {
   if (
@@ -805,11 +795,19 @@ export default function SubjectDetail(props: {
                 <For each={t().keys}>
                   {(e) => {
                     const href = entityHref(e);
+                    // Who this environment belongs to, on hover. An alert chip is an opaque
+                    // id in the one place it matters most — the summary of a firing — and
+                    // the answer is already on the subject, so this costs no round trip.
+                    const tip = () => cloudTip(e.value, t().cloud);
+                    // An in-app hash is a route, not a destination: opening `#/cloud/…` in a
+                    // new tab loads a second copy of the app to get somewhere this one can
+                    // already go.
+                    const external = () => !!href && !href.startsWith("#");
                     return (
                       <Show
                         when={href}
                         fallback={
-                          <span class="chip">
+                          <span class="chip" data-tip={tip()}>
                             {e.kind}:{e.value}
                           </span>
                         }
@@ -817,8 +815,9 @@ export default function SubjectDetail(props: {
                         <a
                           class="chip chip-link"
                           href={href}
-                          target="_blank"
-                          rel="noreferrer"
+                          data-tip={tip()}
+                          target={external() ? "_blank" : undefined}
+                          rel={external() ? "noreferrer" : undefined}
                         >
                           {e.kind}:{e.value}
                         </a>
@@ -936,7 +935,7 @@ export default function SubjectDetail(props: {
                         says so. Same dossier, same rules, different model — so the
                         difference between the two answers is the model and nothing else. */}
                     <button
-                      class="cloud-btn"
+                      class="mutating"
                       disabled={busy() !== "" || awaitingSecond()}
                       data-tip={
                         cloudOpinion()
@@ -1135,6 +1134,51 @@ export default function SubjectDetail(props: {
               </Show>
             </section>
 
+            {/* Who and where, for a subject that named a platform id. A support thread saying
+                `env_201kp…` is opaque on its own; this is the account, organization, region
+                and Nuon install behind it, read from the control plane so it is looked up
+                rather than guessed. Above the timeline because it is orientation — the thing
+                you want before reading the history, not after. */}
+            <Show when={t().cloud.length}>
+              <section class="panel cloud-context">
+                <h3>Cloud context</h3>
+                <div class="cloud-entities">
+                  <For each={t().cloud}>
+                    {(e) => (
+                      <div class="cloud-entity" classList={{ failed: !!e.error }}>
+                        <div class="cloud-entity-head">
+                          <span class="cloud-kind">{e.kind}</span>
+                          <span class="cloud-name">{e.name ?? "—"}</span>
+                          <Show when={e.status}>
+                            <span class="cloud-status">{e.status}</span>
+                          </Show>
+                        </div>
+                        <code class="cloud-id">{e.id}</code>
+                        <Show when={e.error}>
+                          {/* An id that is real but unreadable is worth saying out loud: an
+                              expired `rcc` token looks exactly like "no such environment"
+                              if the box just stays empty. */}
+                          <div class="cloud-error">{e.error}</div>
+                        </Show>
+                        <Show when={e.fields.length}>
+                          <dl class="cloud-fields">
+                            <For each={e.fields}>
+                              {(f) => (
+                                <>
+                                  <dt>{f.label}</dt>
+                                  <dd>{f.value}</dd>
+                                </>
+                              )}
+                            </For>
+                          </dl>
+                        </Show>
+                      </div>
+                    )}
+                  </For>
+                </div>
+              </section>
+            </Show>
+
             <section class="panel timeline-panel">
               <h3>Timeline</h3>
               {/* Evidence, folded — the same rule the patches now follow. Two events cost 333px
@@ -1287,120 +1331,29 @@ export default function SubjectDetail(props: {
               </details>
             </section>
 
-            {/* What the browser read off any linked dashboard. MuggleBot drives
-                the operator's signed-in Chrome read-only; the manual paste box is
-                the fallback for when it can't reach it. */}
-            <Show when={browserInvestigations()?.length}>
-              <section class="panel browser-investigations">
-                <h3>Dashboard readings</h3>
-                <For each={browserInvestigations()}>
-                  {(inv) => (
-                    <div class="browser-investigation">
-                      <div class="browser-investigation-head">
-                        <span
-                          class={`state state-${BROWSER_STATE[inv.status]}`}
-                        >
-                          {inv.status}
-                        </span>
-                        {/* Which tier answered, because it changes how much the reading is
-                            worth: a `grafana` reading quotes series that were checked, a
-                            `browser` reading describes a rendered page and cannot be. */}
-                        <span
-                          class="read-via"
-                          classList={{ verified: inv.method === "grafana" }}
-                          data-tip={
-                            inv.method === "grafana"
-                              ? "Read from Grafana's API — every figure below was checked against the series"
-                              : "Read off the rendered page in your signed-in Chrome — figures are as the model saw them"
-                          }
-                        >
-                          {inv.method === "grafana" ? "series" : "page"}
-                        </span>
-                        <a href={inv.url} target="_blank" rel="noreferrer">
-                          open dashboard ↗
-                        </a>
-                        <Show when={inv.attempts > 1}>
-                          <span class="muted">attempt {inv.attempts}</span>
-                        </Show>
-                      </div>
-                      <Show when={inv.status === "running"}>
-                        <p class="muted">
-                          {inv.method === "grafana"
-                            ? "Querying the series behind this alert…"
-                            : "Reading the page in your authenticated Chrome…"}
-                        </p>
-                      </Show>
-                      <Show when={inv.status === "pending"}>
-                        <p class="muted">
-                          {inv.method === "grafana"
-                            ? "Queued — resolving the alert rule, then its queries."
-                            : "Queued — the browser worker takes one page at a time."}
-                        </p>
-                      </Show>
-                      <Show when={inv.error}>
-                        <p class="browser-error">{inv.error}</p>
-                      </Show>
-                      <Show
-                        when={inv.findings}
-                        fallback={
-                          <Show when={inv.status === "failed"}>
-                            <div class="browser-findings-entry">
-                              <textarea
-                                placeholder="Paste findings by hand if the browser can't reach the page…"
-                                value={browserFindings()[inv.id] ?? ""}
-                                onInput={(e) =>
-                                  setBrowserFindings((current) => ({
-                                    ...current,
-                                    [inv.id]: e.currentTarget.value,
-                                  }))
-                                }
-                              />
-                              <button
-                                disabled={
-                                  !browserFindings()[inv.id]?.trim() ||
-                                  busy() !== ""
-                                }
-                                onClick={() =>
-                                  run(
-                                    "browser findings",
-                                    async () => {
-                                      await api.tool(
-                                        "record_browser_investigation",
-                                        {
-                                          id: inv.id,
-                                          findings: browserFindings()[inv.id],
-                                        },
-                                      );
-                                      await refetchBrowserInvestigations();
-                                    },
-                                    true,
-                                  )
-                                }
-                              >
-                                RECORD FINDINGS
-                              </button>
-                            </div>
-                          </Show>
-                        }
-                      >
-                        <>
-                          <div
-                            class="browser-findings md"
-                            innerHTML={renderMarkdown(inv.findings!)}
-                          />
-                          {/* The series the conclusion was drawn from, folded. This is what
-                              makes the reading checkable rather than merely plausible — but
-                              the conclusion is the answer and the numbers are what back it,
-                              so the same rule as the diff applies: unfold the judgement,
-                              fold the evidence. */}
-                          <GrafanaSeries raw={inv.evidence} />
-                        </>
-                      </Show>
-                    </div>
-                  )}
-                </For>
-              </section>
-            </Show>
+            {/* What the browser read off any linked dashboard. */}
+            <DashboardReadings
+              investigations={browserInvestigations()}
+              drafts={browserFindings()}
+              onDraft={(id: string, text: string) =>
+                setBrowserFindings((current) => ({ ...current, [id]: text }))
+              }
+              busy={busy() !== ""}
+              onRecord={(id: string) =>
+                run(
+                  "browser findings",
+                  async () => {
+                    await api.tool("record_browser_investigation", {
+                      id,
+                      findings: browserFindings()[id],
+                    });
+                    await refetchBrowserInvestigations();
+                  },
+                  true,
+                )
+              }
+              series={(raw) => <GrafanaSeries raw={raw} />}
+            />
 
             {/* The change itself, when this subject *is* a pull request.
                 A PR subject has no attempt rows of its own — `pull_requests` is keyed by the
@@ -1456,408 +1409,29 @@ export default function SubjectDetail(props: {
 
             {/* Assigned to you: what the code says, and what your options are.
                 Patch options are proposals — nothing here has been applied. */}
-            <For each={triage()}>
-              {(t) => (
-                // Queued or running, this is one line: there is nothing to read yet,
-                // and a panel that says "queued" in a heading, a status pill and a
-                // paragraph says it three times.
-                <Show
-                  when={t.status !== "pending" && t.status !== "running"}
-                  fallback={
-                    <div class="not-run">
-                      <span class="muted" classList={{ thinking: t.status === "running" }}>
-                        {t.status === "running"
-                          ? "Reading the code for this issue…"
-                          : "Queued for code triage — one issue is read at a time."}
-                      </span>
-                    </div>
-                  }
-                >
-                <section class="panel issue-triage">
-                  <div class="panel-head">
-                    <h3>Assigned · {t.issue_key}</h3>
-                    <div class="row">
-                      <span class={`state state-${TRIAGE_STATE[t.status]}`}>
-                        {t.status}
-                      </span>
-                      <button
-                        disabled={busy() !== ""}
-                        onClick={() =>
-                          run("re-triage", async () => {
-                            await api.tool("retriage_issue", {
-                              issue_key: t.issue_key,
-                            });
-                            await refetchTriage();
-                          })
-                        }
-                      >
-                        Re-triage
-                      </button>
-                    </div>
-                  </div>
-
-                  <Show when={t.error}>
-                    <p class="browser-error">{t.error}</p>
-                  </Show>
-
-                  {/* The plain-English gloss leads: it's the part you read at a
-                      glance. The technical detail sits underneath it. */}
-                  <Show when={t.plain_summary}>
-                    <div class="triage-plain">{t.plain_summary}</div>
-                  </Show>
-                  <Show when={t.characterization}>
-                    <div
-                      class="triage-analysis md"
-                      innerHTML={renderMarkdown(t.characterization!)}
-                    />
-                  </Show>
-
-                  <Show when={t.patches.length}>
-                    <h4 class="triage-heading">
-                      {t.patches.length} possible approach
-                      {t.patches.length === 1 ? "" : "es"}
-                      <span class="muted"> — proposals, nothing applied</span>
-                    </h4>
-                    {/* Each approach folded to its own headline. Three unfolded proposals ran
-                        to 2,638px — 48% of the page once the patches were folded — and choosing
-                        between three options means comparing them, which you cannot do when the
-                        first fills the screen. The head carries what the comparison turns on:
-                        what it does, how much work, how confident, and the mechanism, which is
-                        the check on whether the answer is real or generic. The rest — files,
-                        sketch, risk — is what you read *after* picking one. */}
-                    <For each={t.patches}>
-                      {(p, i) => (
-                        <details class="patch">
-                          <summary class="patch-head">
-                            <span class="patch-index">{i() + 1}</span>
-                            <span class="patch-title">{p.title}</span>
-                            <span class={`chip effort-${p.effort}`}>{p.effort}</span>
-                            <span
-                              class="rc-confidence"
-                              data-tip="The model's confidence — a proposal, not a verdict"
-                            >
-                              {Math.round(p.confidence * 100)}%
-                            </span>
-                            <Show when={p.mechanism}>
-                              <span class="patch-via" data-tip={p.mechanism!}>
-                                via {p.mechanism}
-                              </span>
-                            </Show>
-                          </summary>
-                          <div class="patch-approach">{p.approach}</div>
-                          <Show when={p.new_dependency}>
-                            <div class="patch-dep">
-                              adds a new dependency: <code>{p.new_dependency}</code>
-                            </div>
-                          </Show>
-                          <Show when={p.files.length}>
-                            <div class="rc-files">{p.files.join(" · ")}</div>
-                          </Show>
-                          <Show when={p.sketch}>
-                            <pre class="rc-fragment">{p.sketch}</pre>
-                          </Show>
-                          <Show when={p.risk}>
-                            <div class="patch-risk">
-                              <span class="rc-label">risk</span> {p.risk}
-                            </div>
-                          </Show>
-                        </details>
-                      )}
-                    </For>
-                  </Show>
-
-                  {/* Somebody may already be fixing this. Shown after the options
-                      but before the provenance, because it can make the options
-                      moot — and the critique is the part that matters, not the
-                      PR's own claim to close the issue. */}
-                  <Show when={prFixes()?.[t.issue_key]?.length}>
-                    <h4 class="triage-heading">
-                      Already being fixed?
-                      <span class="muted">
-                        {" "}
-                        — open pull requests that may cover this; the diff and
-                        review for each are under Attempts above
-                      </span>
-                    </h4>
-                    <For each={prFixes()![t.issue_key]}>
-                      {(pr) => (
-                        <div class={`pr-fix pr-${pr.verdict}`}>
-                          <div class="patch-head">
-                            <span
-                              class={`rc-relation pr-verdict-${pr.verdict}`}
-                            >
-                              {pr.verdict}
-                            </span>
-                            <a
-                              class="rc-ref"
-                              href={pr.pr_url ?? "#"}
-                              target="_blank"
-                              rel="noreferrer"
-                            >
-                              {pr.pr_repo}#{pr.pr_number} ↗
-                            </a>
-                            <Show when={pr.pr_author}>
-                              <span class="muted">by {pr.pr_author}</span>
-                            </Show>
-                            <Show when={pr.pr_state === "draft"}>
-                              <span class="chip">draft</span>
-                            </Show>
-                            <span
-                              class="rc-confidence"
-                              data-tip="Confidence in this judgment"
-                            >
-                              {Math.round(pr.confidence * 100)}%
-                            </span>
-                          </div>
-                          <div class="patch-title">{pr.pr_title}</div>
-                          <Show when={pr.implementation}>
-                            <div class="patch-approach">
-                              <span class="rc-label">implements</span>{" "}
-                              {pr.implementation}
-                            </div>
-                          </Show>
-                          <Show when={pr.critique}>
-                            <div class="pr-critique">
-                              <span class="rc-label">critique</span>{" "}
-                              {pr.critique}
-                            </div>
-                          </Show>
-                          {/* What reviewers said, on its own line rather than folded
-                              into the critique: a human who read the change and pushed
-                              back is better evidence than a model's reading of the
-                              same diff. */}
-                          <Show when={pr.conversation}>
-                            <div class="attempt-conversation pr-critique">
-                              <span class="rc-label">reviewers</span>{" "}
-                              {pr.conversation}
-                            </div>
-                          </Show>
-                          {/* Each entry carries its own justification, so it reads
-                              as a claim you can check rather than a bare list. */}
-                          <Show when={pr.also_fixes.length}>
-                            <div class="pr-also">
-                              <span class="rc-label">also resolves</span>
-                              <For each={pr.also_fixes}>
-                                {(entry) => (
-                                  <div class="pr-also-entry">{entry}</div>
-                                )}
-                              </For>
-                            </div>
-                          </Show>
-                          <Show when={pr.files.length}>
-                            <div class="rc-files">
-                              {pr.files.slice(0, 8).join(" · ")}
-                            </div>
-                          </Show>
-                          <div class="muted pr-tier">
-                            <Show
-                              when={
-                                pr.analyzed_by && pr.analyzed_by !== "local"
-                              }
-                            >
-                              judged by the {pr.analyzed_by} tier ·{" "}
-                            </Show>
-                            {/* Worth stating where it's read: this critique is a note
-                                in MuggleBot's store. It is never posted to the PR. */}
-                            never posted to GitHub
-                          </div>
-                        </div>
-                      )}
-                    </For>
-                  </Show>
-
-                  {/* The citation for everything above: which commit, which files. */}
-                  <Show when={t.head_sha || t.files.length}>
-                    <div class="triage-provenance">
-                      <Show when={t.head_sha}>
-                        <span class="rc-label">read at</span>
-                        <code>{t.head_sha!.slice(0, 8)}</code>
-                      </Show>
-                      <Show when={t.files.length}>
-                        <span class="rc-label">from</span>
-                        <span>
-                          {t.files.length} file{t.files.length === 1 ? "" : "s"}
-                        </span>
-                        <details>
-                          <summary class="muted">show</summary>
-                          <div class="rc-files">{t.files.join("\n")}</div>
-                        </details>
-                      </Show>
-                    </div>
-                  </Show>
-                </section>
-                </Show>
-              )}
-            </For>
-
-            {/* Root cause: hypotheses with citations, never conclusions.
-
-                Un-run, this is one line rather than a panel. A heading, a paragraph
-                explaining what the feature would do and a button is a full panel's
-                worth of chrome around no content — and it sat between the diff and
-                the relations, pushing what the subject actually says off screen. */}
-            <Show
-              when={rootCause()}
-              fallback={
-                <div class="not-run">
-                  <span class="muted">
-                    No root-cause search yet — look for the issue, PR, or commit
-                    behind this across the indexed repositories.
-                  </span>
-                  <button
-                    disabled={busy() !== ""}
-                    onClick={() =>
-                      run("investigate", async () => {
-                        await api.tool("investigate_root_cause", {
-                          subject_key: props.id,
-                        });
-                        await refetchRootCause();
-                      })
-                    }
-                  >
-                    Investigate
-                  </button>
-                </div>
+            <IssueTriagePanel
+              triage={triage()}
+              prFixes={prFixes()}
+              busy={busy() !== ""}
+              onRetriage={(issueKey: string) =>
+                run("re-triage", async () => {
+                  await api.tool("retriage_issue", { issue_key: issueKey });
+                  await refetchTriage();
+                })
               }
-            >
-              <section class="panel root-cause">
-                <div class="panel-head">
-                  <h3>Root cause</h3>
-                  <button
-                    disabled={busy() !== "" || rootCause()?.status === "running"}
-                    onClick={() =>
-                      run("investigate", async () => {
-                        await api.tool("investigate_root_cause", {
-                          subject_key: props.id,
-                        });
-                        await refetchRootCause();
-                      })
-                    }
-                  >
-                    Re-investigate
-                  </button>
-                </div>
-                <Show when={rootCause()}>
-                  {(report) => (
-                    <>
-                    <Show when={report().status === "running"}>
-                      <p class="muted thinking">Investigating…</p>
-                    </Show>
-                    <Show when={report().symptoms.length}>
-                      <div class="rc-meta">
-                        <span class="rc-label">searched</span>
-                        <For each={report().symptoms}>
-                          {(term) => <span class="chip">{term}</span>}
-                        </For>
-                      </div>
-                    </Show>
-                    <Show when={report().repos.length}>
-                      <div class="rc-meta">
-                        <span class="rc-label">in</span>
-                        <For each={report().repos}>
-                          {(repo) => (
-                            <a
-                              class="chip repo"
-                              href={`https://github.com/${repo}`}
-                              target="_blank"
-                              rel="noreferrer"
-                            >
-                              {repo}
-                            </a>
-                          )}
-                        </For>
-                      </div>
-                    </Show>
-                    <Show when={report().verdict}>
-                      <div
-                        class="rc-verdict md"
-                        innerHTML={renderMarkdown(report().verdict!)}
-                      />
-                    </Show>
-                    <Show when={report().error}>
-                      <p class="browser-error">{report().error}</p>
-                    </Show>
-                    <For each={report().candidates}>
-                      {(c) => (
-                        <div class={`rc-candidate rc-${c.relation}`}>
-                          <div class="rc-head">
-                            <span
-                              class={`rc-relation rc-relation-${c.relation}`}
-                            >
-                              {c.relation}
-                            </span>
-                            <span class="rc-kind">
-                              {c.kind.replace("_", " ")}
-                            </span>
-                            <Show
-                              when={c.url}
-                              fallback={
-                                <span class="rc-ref">{c.reference}</span>
-                              }
-                            >
-                              <a
-                                class="rc-ref"
-                                href={c.url!}
-                                target="_blank"
-                                rel="noreferrer"
-                              >
-                                {c.reference} ↗
-                              </a>
-                            </Show>
-                            <span
-                              class="rc-confidence"
-                              data-tip="How confident the model is — a hypothesis, not a verdict"
-                            >
-                              {Math.round(c.confidence * 100)}%
-                            </span>
-                          </div>
-                          <div class="rc-title">{c.title}</div>
-                          <Show when={c.rationale}>
-                            <div class="muted">{c.rationale}</div>
-                          </Show>
-                          <div class="rc-facts">
-                            <Show when={c.state}>
-                              <span class="chip">{c.state}</span>
-                            </Show>
-                            <Show when={c.author}>
-                              <span class="muted">{c.author}</span>
-                            </Show>
-                            <Show when={c.when}>
-                              <span class="muted">{c.when!.slice(0, 10)}</span>
-                            </Show>
-                            <For each={c.labels}>
-                              {(l) => <span class="chip tag">{l}</span>}
-                            </For>
-                          </div>
-                          <Show when={c.files.length}>
-                            <div class="rc-files">
-                              {c.files.slice(0, 8).join(" · ")}
-                            </div>
-                          </Show>
-                          <Show when={c.fragments?.length}>
-                            <pre class="rc-fragment">
-                              {c.fragments!.join("\n")}
-                            </pre>
-                          </Show>
-                        </div>
-                      )}
-                    </For>
-                    <Show
-                      when={
-                        report().status === "complete" &&
-                        !report().candidates.length
-                      }
-                    >
-                      <p class="muted">
-                        Nothing in the searched repositories explains this — it
-                        looks unreported.
-                      </p>
-                      </Show>
-                    </>
-                  )}
-                </Show>
-              </section>
-            </Show>
+            />
+
+            {/* Root cause: hypotheses with citations, never conclusions. */}
+            <RootCause
+              report={rootCause()}
+              busy={busy() !== ""}
+              onInvestigate={() =>
+                run("investigate", async () => {
+                  await api.tool("investigate_root_cause", { subject_key: props.id });
+                  await refetchRootCause();
+                })
+              }
+            />
 
             {/* Who this work is with. Placed after the analysis panels and before live
                 assist: it is a question you ask once you know what the change *is*, and the
@@ -1923,8 +1497,7 @@ export default function SubjectDetail(props: {
 
             <Show when={relations().shown.length || relations().hidden.length}>
               <section class="panel">
-                <div class="panel-head">
-                  <h3>Related</h3>
+                <SectionHead title="Related">
                   <Show when={relations().hidden.length}>
                     <button
                       class="linkish"
@@ -1935,7 +1508,7 @@ export default function SubjectDetail(props: {
                         : `${relations().hidden.length} more`}
                     </button>
                   </Show>
-                </div>
+                </SectionHead>
                 <For each={relations().shown}>
                   {(e) => {
                     // The edge can point at a thread that's off the active board

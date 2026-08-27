@@ -79,6 +79,9 @@ pub struct WorkflowOps {
     pub grafana: Arc<crate::grafana::Reader>,
     /// Reads a hand-pasted Slack thread with two models. See [`crate::thread`].
     pub threads: Arc<crate::thread::Analyser>,
+    /// Reviews a GitHub branch — the model's read plus a pass per persona. See
+    /// [`crate::ghreview`].
+    pub reviews: Arc<crate::ghreview::Runner>,
     /// `[grafana].fallback_to_browser`. Held as a flag rather than re-read from config
     /// here so the decision is testable without a config file.
     pub grafana_fallback_enabled: bool,
@@ -135,6 +138,12 @@ impl WorkflowOps {
         let done = self
             .store
             .complete_browser_investigation(id, &findings.text)?;
+        Ok(serde_json::to_value(&done)?)
+    }
+
+    /// Run one branch review pass.
+    pub async fn branch_review(&self, id: &str) -> anyhow::Result<serde_json::Value> {
+        let done = self.reviews.run(id).await?;
         Ok(serde_json::to_value(&done)?)
     }
 

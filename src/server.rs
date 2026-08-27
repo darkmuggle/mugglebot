@@ -55,6 +55,8 @@ pub struct AppState {
     pub config_path: Arc<String>,
     /// Signal + artifact store. Credentials go through `tools.secrets`, never here.
     pub store: Arc<Store>,
+    /// Cloud settings, for the PTY endpoint's allowlist. See [`crate::pty`].
+    pub cloud: Arc<crate::config::Cloud>,
 }
 
 /// Origins allowed for CORS + the WS handshake, given the address we bound to.
@@ -99,6 +101,10 @@ pub async fn serve(addr: String, mut state: AppState) -> anyhow::Result<()> {
         .route("/health", get(|| async { "ok" }))
         .route("/api/signals", get(list_signals))
         .route("/api/subjects/{key}/handled", post(set_handled))
+        // Before the `{key}` route would ever be consulted for it, and distinct from it by
+        // having no key segment at all: this is "triage these many", not "triage the one
+        // called handled".
+        .route("/api/subjects/handled", post(set_handled_bulk))
         .route("/api/subjects", get(list_subjects))
         .route("/api/incidents", get(list_incidents))
         .route("/api/board/reset", post(reset_board))
@@ -115,7 +121,8 @@ pub async fn serve(addr: String, mut state: AppState) -> anyhow::Result<()> {
         .route("/api/tool/{name}", post(call_tool))
         .route("/api/secrets", get(list_secrets).post(set_secret))
         .route("/api/secrets/{name}", delete(delete_secret))
-        .route("/ws", get(ws_handler));
+        .route("/ws", get(ws_handler))
+        .route("/ws/pty", get(pty_handler));
 
     if serve_ui {
         app = app.fallback_service(ServeDir::new(ui));
@@ -251,6 +258,48 @@ async fn set_handled(
         let _ = st.events.send(Event::Board(views));
     }
     StatusCode::NO_CONTENT.into_response()
+}
+
+#[derive(serde::Deserialize)]
+struct BulkHandledBody {
+    keys: Vec<String>,
+    handled: Handled,
+    #[serde(default)]
+    until: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// Triage many subjects at once — the board's "snooze everything showing".
+///
+/// Its own route rather than the client looping over the single one, and the difference is
+/// not only the round trips. Each single call rebuilds the whole board and broadcasts it, so
+/// forty-one of them is forty-one full board projections and forty-one WebSocket frames, each
+/// rendering a board that is part-triaged. Here the writes are one transaction and the
+/// broadcast is one frame of the finished state.
+///
+/// No per-subject `Event::Subject`: a subject being triaged in bulk is one the operator is
+/// looking at *on the board*, and the authoritative board event is what reconciles it. The
+/// count comes back so the caller can say what it did rather than assume.
+async fn set_handled_bulk(
+    AxumState(st): AxumState<AppState>,
+    Json(body): Json<BulkHandledBody>,
+) -> impl IntoResponse {
+    let changed = match st
+        .tools
+        .store
+        .set_handled_bulk(&body.keys, body.handled, body.until)
+    {
+        Ok(n) => n,
+        Err(e) => return err_response(e),
+    };
+    // Same reset as the single route: triage clears notification dedup so genuinely new
+    // activity can notify again rather than being suppressed as already seen.
+    for key in &body.keys {
+        st.notifier.clear_notified(key);
+    }
+    if let Ok(views) = st.tools.attributor.board_views(true) {
+        let _ = st.events.send(Event::Board(views));
+    }
+    Json(json!({ "changed": changed })).into_response()
 }
 
 /// The incidents board. Separate from `/api/subjects` for the same reason the read is split:
@@ -524,6 +573,173 @@ async fn ws_handler(
     }
     ws.on_upgrade(move |socket| ws_loop(socket, st))
         .into_response()
+}
+
+/// The interactive-command socket. See [`crate::pty`] for why this is allowlisted rather
+/// than a terminal.
+///
+/// Same Origin check as the event socket, and for a sharper reason: this one spawns
+/// processes. A WebSocket upgrade is not covered by CORS, so without this a page on any
+/// origin the operator happened to have open could drive it.
+async fn pty_handler(
+    ws: WebSocketUpgrade,
+    AxumState(st): AxumState<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Some(origin) = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()) {
+        if !st.allowed_origins.iter().any(|o| o == origin) {
+            return (StatusCode::FORBIDDEN, "cross-origin websocket rejected").into_response();
+        }
+    }
+    if !st.cloud.enabled {
+        return (StatusCode::NOT_FOUND, "[cloud] is not enabled").into_response();
+    }
+    ws.on_upgrade(move |socket| pty_loop(socket, st))
+        .into_response()
+}
+
+/// One socket, one process, for the socket's whole life.
+///
+/// The first message must be `start`; everything before it is refused. After that the socket
+/// is a pipe — keystrokes down, output up — until the child exits or the browser goes away,
+/// and either of those ends the other.
+async fn pty_loop(mut socket: WebSocket, st: AppState) {
+    use crate::pty::{ClientMsg, ServerMsg, Session};
+
+    async fn send(socket: &mut WebSocket, msg: &ServerMsg) -> bool {
+        match serde_json::to_string(msg) {
+            Ok(txt) => socket.send(Message::Text(txt.into())).await.is_ok(),
+            Err(_) => false,
+        }
+    }
+
+    // Wait for `start`, and refuse to do anything else until it arrives.
+    let mut session = loop {
+        let Some(Ok(Message::Text(txt))) = socket.recv().await else {
+            return;
+        };
+        let msg: ClientMsg = match serde_json::from_str(&txt) {
+            Ok(m) => m,
+            Err(e) => {
+                send(
+                    &mut socket,
+                    &ServerMsg::Error {
+                        message: format!("bad message: {e}"),
+                    },
+                )
+                .await;
+                continue;
+            }
+        };
+        let ClientMsg::Start {
+            request,
+            rows,
+            cols,
+        } = msg
+        else {
+            send(
+                &mut socket,
+                &ServerMsg::Error {
+                    message: "the first message must be `start`".into(),
+                },
+            )
+            .await;
+            continue;
+        };
+        // Validation and argv construction, both in `pty`. Nothing from the wire reaches a
+        // command line; a refusal here is the end of it.
+        let spawn = match request.resolve(&st.cloud, &st.store) {
+            Ok(s) => s,
+            Err(e) => {
+                send(
+                    &mut socket,
+                    &ServerMsg::Error {
+                        message: format!("{e:#}"),
+                    },
+                )
+                .await;
+                return;
+            }
+        };
+        tracing::info!("pty: running {} {:?}", spawn.program, spawn.args);
+        match Session::start(&spawn, rows, cols) {
+            Ok(session) => {
+                if !send(&mut socket, &ServerMsg::Started { label: spawn.label }).await {
+                    return;
+                }
+                break session;
+            }
+            Err(e) => {
+                send(
+                    &mut socket,
+                    &ServerMsg::Error {
+                        message: format!("{e:#}"),
+                    },
+                )
+                .await;
+                return;
+            }
+        }
+    };
+
+    loop {
+        tokio::select! {
+            // `None` is the pty hitting EOF, and is deliberately not a `break`: the exit code
+            // is still coming and it is the thing the pane reports.
+            chunk = session.output.recv() => {
+                if let Some(bytes) = chunk {
+                    let data = String::from_utf8_lossy(&bytes).to_string();
+                    if !send(&mut socket, &ServerMsg::Output { data }).await {
+                        break;
+                    }
+                }
+            },
+            code = &mut session.exit => {
+                let code = code.unwrap_or(-1);
+                // Drain whatever the child wrote just before exiting, so a final error
+                // message is not lost to the race with its own exit.
+                while let Ok(bytes) = session.output.try_recv() {
+                    let data = String::from_utf8_lossy(&bytes).to_string();
+                    if !send(&mut socket, &ServerMsg::Output { data }).await {
+                        break;
+                    }
+                }
+                send(&mut socket, &ServerMsg::Exit { code }).await;
+                break;
+            }
+            incoming = socket.recv() => match incoming {
+                Some(Ok(Message::Text(txt))) => {
+                    match serde_json::from_str::<ClientMsg>(&txt) {
+                        Ok(ClientMsg::Input { data }) => {
+                            if let Err(e) = session.write(data.as_bytes()) {
+                                debug!("pty: write failed: {e}");
+                                break;
+                            }
+                        }
+                        Ok(ClientMsg::Resize { rows, cols }) => {
+                            if let Err(e) = session.resize(rows, cols) {
+                                debug!("pty: resize failed: {e}");
+                            }
+                        }
+                        // A second `start` is a bug in the client, not a request to run
+                        // something else on this socket.
+                        Ok(ClientMsg::Start { .. }) => {
+                            send(&mut socket, &ServerMsg::Error {
+                                message: "this session has already started".into(),
+                            })
+                            .await;
+                        }
+                        Err(e) => debug!("pty: bad message: {e}"),
+                    }
+                }
+                Some(Ok(Message::Close(_))) | None => break,
+                Some(Err(_)) => break,
+                _ => {}
+            },
+        }
+    }
+    // The browser going away must not leave an editor sitting on a control-plane document.
+    session.kill();
 }
 
 async fn ws_loop(mut socket: WebSocket, st: AppState) {

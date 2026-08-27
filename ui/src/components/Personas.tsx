@@ -12,6 +12,7 @@ import type {
   PersonaContextEntry,
   SmeArea,
 } from "../types";
+import { Empty, Page, Panel } from "./ui";
 
 /// The personas page — the people MuggleBot models, and what it believes about them.
 ///
@@ -39,39 +40,34 @@ export default function Personas(props: { onChat: (persona: string) => void }) {
   const open = (slug: string) => setSelected((s) => (s === slug ? null : slug));
 
   return (
-    <div class="page">
+    <Page
+      title="Personas"
+      subtitle="A candid behavioural model of one colleague, built from things they actually wrote. Select personas on an issue or pull request to predict how it will land — nothing here is ever posted anywhere."
+      actions={
+        <Show when={list()?.enabled !== false}>
+          <button disabled={list.loading} onClick={() => void refetch()}>
+            Refresh
+          </button>
+          <button class="primary" onClick={() => setAdding((a) => !a)}>
+            {adding() ? "Close" : "Model someone"}
+          </button>
+        </Show>
+      }
+    >
       <Show
         when={list()?.enabled !== false}
         fallback={
-          <section class="panel">
-            <h3>Personas</h3>
-            <p class="muted">
-              Personas are off. Set <code>enabled = true</code> under{" "}
-              <code>[personas]</code> in the config, then restart. It is off by default because
-              this is the one feature here that models <em>people</em> rather than work, and
-              that should be a decision rather than something the daemon starts doing.
-            </p>
-          </section>
+          /* Off by configuration, not empty. `unset` rather than `clear`, because "nobody is
+             modelled" and "this feature is switched off" are answers to different questions. */
+          <Empty kind="unset">
+            Personas are off. Set <code>enabled = true</code> under <code>[personas]</code> in
+            the config, then restart. It is off by default because this is the one feature here
+            that models <em>people</em> rather than work, and that should be a decision rather
+            than something the daemon starts doing.
+          </Empty>
         }
       >
-        <section class="panel">
-          <div class="panel-head">
-            <h3>PERSONAS ({list()?.personas?.length ?? 0})</h3>
-            <span class="tl-actions">
-              <button onClick={() => setAdding((a) => !a)}>
-                {adding() ? "close" : "+ model someone"}
-              </button>
-              <button disabled={list.loading} onClick={() => void refetch()}>
-                refresh
-              </button>
-            </span>
-          </div>
-          <p class="muted">
-            A candid behavioural model of one colleague, built from things they actually wrote.
-            Select personas on an issue or pull request to predict how it will land — nothing
-            here is ever posted anywhere.
-          </p>
-
+        <Panel title="Modelled" meta={`${list()?.personas?.length ?? 0} people`}>
           <Show when={adding()}>
             <AddPersona
               onDone={() => {
@@ -84,18 +80,19 @@ export default function Personas(props: { onChat: (persona: string) => void }) {
           <For
             each={list()?.personas}
             fallback={
-              <p class="lane-empty">
-                {list.loading
-                  ? "Reading…"
-                  : "Nobody modelled yet. Use “model someone” — the proposals are ranked by how much you actually deal with them."}
-              </p>
+              <Show when={!list.loading} fallback={<Empty kind="waiting">Reading…</Empty>}>
+                <Empty kind="clear">
+                  Nobody modelled yet. Use “model someone” — the proposals are ranked by how
+                  much you actually deal with them.
+                </Empty>
+              </Show>
             }
           >
             {(p) => (
               <PersonaRow p={p} open={selected() === p.slug} onToggle={() => open(p.slug)} />
             )}
           </For>
-        </section>
+        </Panel>
 
         <Show when={selected()}>
           <PersonaPanel
@@ -108,7 +105,7 @@ export default function Personas(props: { onChat: (persona: string) => void }) {
           />
         </Show>
       </Show>
-    </div>
+    </Page>
   );
 }
 
@@ -238,24 +235,30 @@ function PersonaPanel(props: {
   };
 
   return (
-    <section class="panel">
-      <div class="panel-head">
-        <h3>{detail()?.persona.display_name ?? props.slug}</h3>
-        <span class="tl-actions">
+    <Panel
+      title={detail()?.persona.display_name ?? props.slug}
+      actions={
+        <>
           <button disabled={!!busy()} onClick={harvest}>
-            {busy() === "harvest" ? "harvesting…" : "harvest"}
+            {busy() === "harvest" ? "Harvesting…" : "Harvest"}
           </button>
           <button disabled={!!busy()} onClick={profile}>
-            {busy() === "profile" ? "profiling…" : "re-profile"}
+            {busy() === "profile" ? "Profiling…" : "Re-profile"}
           </button>
-          <button disabled={!!busy()} data-tip="Re-run even if nothing new was harvested" onClick={forceProfile}>
-            force
+          <button
+            disabled={!!busy()}
+            data-tip="Re-run even if nothing new was harvested"
+            onClick={forceProfile}
+          >
+            Force
           </button>
-          <button onClick={() => props.onChat(props.slug)}>talk to them</button>
-          <button onClick={remove}>delete</button>
-        </span>
-      </div>
-
+          <button onClick={() => props.onChat(props.slug)}>Talk to them</button>
+          <button class="destructive" onClick={remove}>
+            Delete
+          </button>
+        </>
+      }
+    >
       <Show when={note()}>
         <p class="muted">{note()}</p>
       </Show>
@@ -364,7 +367,7 @@ function PersonaPanel(props: {
           <For each={detail()!.evidence}>{(e) => <Excerpt e={e} />}</For>
         </details>
       </Show>
-    </section>
+    </Panel>
   );
 }
 

@@ -1,6 +1,7 @@
 import { createResource, createSignal, For, Show } from "solid-js";
 import { api } from "../api";
 import type { Tag } from "../types";
+import { Empty, Item, Panel } from "./ui";
 
 export default function TagEditor() {
   const [tags, { refetch }] = createResource(() => api.tool<Tag[]>("list_tags"));
@@ -40,48 +41,62 @@ export default function TagEditor() {
   };
 
   return (
-    <div class="page">
-      <section class="panel">
-        <h3>TAG VOCABULARY ({tags()?.length ?? 0})</h3>
-        <p class="muted">
-          Each tag's summary is the description the classifier reads to decide which tags apply to
-          an incoming issue. Summaries for automatic tags are generated once, then edited here.
-        </p>
-        <For each={tags()} fallback={<p class="muted">No tags yet — add context or memory to build the vocabulary.</p>}>
-          {(t) => (
-            <div class="mem-item">
-              <div class="mem-head">
-                <strong>
-                  <span class="chip tag">{t.name}</span>
-                </strong>
-                <span class="tl-actions">
-                  <Show
-                    when={editing() === t.name}
-                    fallback={<button onClick={() => startEdit(t)}>edit</button>}
-                  >
-                    <button disabled={busy() === t.name} onClick={() => save(t.name)}>
-                      {busy() === t.name ? "…" : "save"}
-                    </button>
-                    <button onClick={() => setEditing(null)}>cancel</button>
-                  </Show>
-                  <button onClick={() => merge(t.name)}>merge</button>
-                  <button onClick={() => remove(t.name)}>delete</button>
-                </span>
-              </div>
-              <Show
-                when={editing() === t.name}
-                fallback={<div classList={{ muted: !t.summary }}>{t.summary || "(no summary yet)"}</div>}
-              >
-                <textarea
-                  placeholder="What does this tag cover? The classifier reads this."
-                  value={draft()}
-                  onInput={(e) => setDraft(e.currentTarget.value)}
-                />
-              </Show>
-            </div>
-          )}
-        </For>
-      </section>
-    </div>
+    <Panel
+      title="Vocabulary"
+      meta={`${tags()?.length ?? 0} tags`}
+    >
+      <p class="muted panel-lede">
+        A tag's summary is the description the classifier reads to decide which tags apply to
+        an incoming issue. Summaries for automatic tags are generated once, then edited here.
+      </p>
+      <For
+        each={tags()}
+        fallback={
+          <Empty kind="clear">
+            No tags yet — the vocabulary is built from what you add to Memory and Context.
+          </Empty>
+        }
+      >
+        {(t) => (
+          <Item
+            title={<span class="chip tag">{t.name}</span>}
+            actions={
+              <>
+                <Show
+                  when={editing() === t.name}
+                  fallback={<button onClick={() => startEdit(t)}>Edit</button>}
+                >
+                  <button disabled={busy() === t.name} onClick={() => save(t.name)}>
+                    {busy() === t.name ? "…" : "Save"}
+                  </button>
+                  <button onClick={() => setEditing(null)}>Cancel</button>
+                </Show>
+                <button onClick={() => merge(t.name)}>Merge</button>
+                <button class="destructive" onClick={() => remove(t.name)}>
+                  Delete
+                </button>
+              </>
+            }
+          >
+            <Show
+              when={editing() === t.name}
+              fallback={
+                /* An unsummarised tag is a tag the classifier cannot use, so it says so
+                   rather than rendering as an empty line. */
+                <Show when={t.summary} fallback={<span class="muted">No summary yet — the classifier has nothing to match on.</span>}>
+                  {t.summary}
+                </Show>
+              }
+            >
+              <textarea
+                placeholder="What does this tag cover? The classifier reads this."
+                value={draft()}
+                onInput={(e) => setDraft(e.currentTarget.value)}
+              />
+            </Show>
+          </Item>
+        )}
+      </For>
+    </Panel>
   );
 }

@@ -2,6 +2,7 @@ import { createMemo, createResource, createSignal, For, onCleanup, Show } from "
 import { api } from "../api";
 import type { Corroborated, ThreadAnalysis, ThreadVerdict } from "../types";
 import { renderMarkdown } from "../markdown";
+import { Empty, Panel, Toolbar } from "./ui";
 
 const POLL_MS = 3000;
 
@@ -210,11 +211,18 @@ function Verdict(props: { verdict: ThreadVerdict }) {
   );
 }
 
-export default function Threads() {
+/// Which analysis is expanded is a location, for the same reason it is on the branch review:
+/// leaving the screen unmounted this component and lost it, so you returned to a collapsed
+/// list with no sign of what you had been reading.
+export default function Threads(props: {
+  openId: string | null;
+  onOpenId: (id: string | null) => void;
+}) {
   const [link, setLink] = createSignal("");
   const [busy, setBusy] = createSignal(false);
   const [error, setError] = createSignal("");
-  const [openId, setOpenId] = createSignal<string | null>(null);
+  const openId = () => props.openId;
+  const setOpenId = (id: string | null) => props.onOpenId(id);
 
   const [analyses, { refetch }] = createResource(
     async () => await api.tool<ThreadAnalysis[]>("list_thread_analyses", { limit: 30 }),
@@ -259,16 +267,17 @@ export default function Threads() {
   };
 
   return (
-    <div class="page threads-page">
-      <div class="card">
-        <div class="card-head">
-          <h2>Thread analysis</h2>
-          <span class="muted">
-            Claude and ChatGPT read one Slack thread independently, using what the personas
-            know about the people in it. Every finding cites the messages it rests on.
-          </span>
-        </div>
-        <div class="thread-input">
+    <>
+      <Panel
+        title="Read a thread"
+        meta="Claude and ChatGPT, independently"
+      >
+        <p class="muted panel-lede">
+          Both models read the thread using what the personas know about the people in it, blind
+          to each other's answer. Every finding cites the messages it rests on. The thread is
+          read, never posted to.
+        </p>
+        <Toolbar>
           <input
             type="text"
             placeholder="Paste a Slack thread link (Slack → message → Copy link)…"
@@ -278,21 +287,28 @@ export default function Threads() {
               if (e.key === "Enter") void submit();
             }}
           />
-          <button disabled={!link().trim() || busy()} onClick={() => void submit()}>
-            {busy() ? "READING…" : "ANALYSE"}
+          <button
+            class="primary"
+            disabled={!link().trim() || busy()}
+            onClick={() => void submit()}
+          >
+            {busy() ? "Reading…" : "Analyse"}
           </button>
-        </div>
+        </Toolbar>
         <Show when={error()}>
-          <p class="thread-error">{error()}</p>
+          {/* The link parser and the Slack fetch write their messages for this box — "invite
+              the app to that channel" is an instruction, not a stack trace, so it gets the
+              treatment an instruction deserves. */}
+          <Empty kind="error">{error()}</Empty>
         </Show>
-      </div>
+      </Panel>
 
       <Show
         when={(analyses() ?? []).length}
         fallback={
-          <p class="empty">
-            Nothing analysed yet. Paste a thread link above — it is read, never posted to.
-          </p>
+          <Empty kind="clear">
+            Nothing analysed yet. Paste a thread link above.
+          </Empty>
         }
       >
         <For each={analyses()}>
@@ -300,9 +316,12 @@ export default function Threads() {
             const open = () => openId() === a.id;
             const v = createMemo(() => verdictOf(a));
             return (
-              <div class="card thread-card" classList={{ open: open() }}>
+              /* A past run, not a board card. It used to carry `.card`, which is the board's
+                 subject shape — left rank spine, `cursor: pointer`, inset surface — so the
+                 history list read as a board you could not act on. */
+              <div class="run thread-card" classList={{ open: open() }}>
                 <div
-                  class="thread-card-head"
+                  class="run-head"
                   onClick={() => setOpenId(open() ? null : a.id)}
                 >
                   <span class={`state state-${a.status === "completed" ? "resolved" : a.status === "failed" ? "unseen" : "seen"}`}>
@@ -339,7 +358,7 @@ export default function Threads() {
                   </a>
                 </div>
                 <Show when={a.error}>
-                  <p class="thread-error">{a.error}</p>
+                  <Empty kind="error">{a.error}</Empty>
                 </Show>
                 <Show when={a.status === "pending" || a.status === "running"}>
                   <p class="muted">
@@ -355,6 +374,6 @@ export default function Threads() {
           }}
         </For>
       </Show>
-    </div>
+    </>
   );
 }

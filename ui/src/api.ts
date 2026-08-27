@@ -32,6 +32,8 @@ const BACKEND =
   (import.meta.env.DEV ? `${location.hostname}:8080` : location.host);
 const WS_SCHEME = location.protocol === "https:" ? "wss" : "ws";
 export const WS_URL = `${WS_SCHEME}://${BACKEND}/ws`;
+/// The interactive-command socket. One process per connection — see `src/pty.rs`.
+export const PTY_WS_URL = `${WS_SCHEME}://${BACKEND}/ws/pty`;
 const API = `${location.protocol === "https:" ? "https" : "http"}://${BACKEND}`;
 const JSON_HEADERS = { "content-type": "application/json" };
 
@@ -180,6 +182,26 @@ export const api = {
       method: "POST",
       headers: JSON_HEADERS,
       body: JSON.stringify({ handled, until }),
+    }).then(unwrap);
+  },
+
+  /**
+   * Triage many subjects in one call — the board's bulk snooze.
+   *
+   * Not a loop over `setHandled`: each of those rebuilds and rebroadcasts the whole board,
+   * so forty-one of them is forty-one redraws of a board that is part-triaged. Returns how
+   * many rows actually changed, which can be fewer than asked for if one was merged away
+   * between the render and the click.
+   */
+  setHandledBulk(
+    keys: string[],
+    handled: Handled,
+    until?: string,
+  ): Promise<{ changed: number }> {
+    return fetch(`${API}/api/subjects/handled`, {
+      method: "POST",
+      headers: JSON_HEADERS,
+      body: JSON.stringify({ keys, handled, until }),
     }).then(unwrap);
   },
 

@@ -811,6 +811,147 @@ impl GithubClient {
             .collect())
     }
 
+    /// Percent-encode a git ref for a URL path.
+    ///
+    /// Branch names legitimately contain `/` (`bh/otel1`), and GitHub's branch endpoint wants
+    /// it left alone while `compare` wants the ref intact too — so only the characters that
+    /// would actually break a path or query are escaped. Encoding the slash would 404 every
+    /// namespaced branch, which is most of them.
+    fn ref_for_url(r: &str) -> String {
+        r.chars()
+            .map(|c| match c {
+                ' ' => "%20".to_string(),
+                '#' => "%23".to_string(),
+                '?' => "%3F".to_string(),
+                '%' => "%25".to_string(),
+                other => other.to_string(),
+            })
+            .collect()
+    }
+
+    /// A branch's head sha, and the default branch it should be compared against.
+    ///
+    /// Two calls rather than one, because a branch review needs both and the repo endpoint is
+    /// the only thing that knows which branch is the base. Cheap and cached upstream by ETag.
+    pub async fn branch_head(&self, full_name: &str, branch: &str) -> Result<(String, String)> {
+        #[derive(serde::Deserialize)]
+        struct Branch {
+            commit: Commit,
+        }
+        #[derive(serde::Deserialize)]
+        struct Commit {
+            sha: String,
+        }
+        #[derive(serde::Deserialize)]
+        struct Repo {
+            default_branch: String,
+        }
+        let b: Branch = self
+            .get_json(&format!(
+                "{API}/repos/{full_name}/branches/{}",
+                Self::ref_for_url(branch)
+            ))
+            .await
+            .with_context(|| format!("no branch `{branch}` in {full_name}"))?;
+        let r: Repo = self.get_json(&format!("{API}/repos/{full_name}")).await?;
+        Ok((b.commit.sha, r.default_branch))
+    }
+
+    /// The files changed between two refs — `base...head`, GitHub's three-dot compare.
+    ///
+    /// Three dots, not two: it compares `head` against the **merge base**, which is the
+    /// question a review asks ("what does this branch add?"). Two dots would include
+    /// everything that landed on `base` since the branch left it, and present other people's
+    /// commits as part of the change under review.
+    ///
+    /// Same shape as [`Self::pull_files`] on purpose, so a branch and a pull request produce
+    /// the same report and one reviewer reads both.
+    pub async fn compare_files(
+        &self,
+        full_name: &str,
+        base: &str,
+        head: &str,
+        max_files: usize,
+        max_patch_chars: usize,
+    ) -> Result<Vec<PullFile>> {
+        #[derive(serde::Deserialize)]
+        struct Compare {
+            #[serde(default)]
+            files: Vec<GhPullFile>,
+        }
+        let url = format!(
+            "{API}/repos/{full_name}/compare/{}...{}?per_page={}",
+            Self::ref_for_url(base),
+            Self::ref_for_url(head),
+            max_files.min(PAGE_SIZE)
+        );
+        let cmp: Compare = self
+            .get_json(&url)
+            .await
+            .with_context(|| format!("comparing {base}...{head} in {full_name}"))?;
+        Ok(cmp
+            .files
+            .into_iter()
+            .take(max_files)
+            .map(|f| PullFile {
+                path: f.filename,
+                additions: f.additions,
+                deletions: f.deletions,
+                patch: f.patch.map(|p| truncate(&p, max_patch_chars)),
+            })
+            .collect())
+    }
+
+    /// The head branch and base of one pull request — for when the operator pasted a PR link
+    /// rather than a branch.
+    ///
+    /// A PR is the likeliest thing in the clipboard, and resolving it to its branch means
+    /// pasting the PR link and pasting the branch link land on the *same* review rather than
+    /// two rows describing the same code.
+    pub async fn pull_branches(&self, full_name: &str, number: u64) -> Result<(String, String)> {
+        #[derive(serde::Deserialize)]
+        struct Pr {
+            head: Option<Side>,
+            base: Option<Side>,
+        }
+        /// Only the `ref`, which `GhRef` does not carry — it is shaped for the head *sha*.
+        #[derive(serde::Deserialize)]
+        struct Side {
+            #[serde(rename = "ref", default)]
+            r#ref: Option<String>,
+        }
+        let pr: Pr = self
+            .get_json(&format!("{API}/repos/{full_name}/pulls/{number}"))
+            .await
+            .with_context(|| format!("no pull request #{number} in {full_name}"))?;
+        let head = pr
+            .head
+            .and_then(|h| h.r#ref)
+            .with_context(|| format!("{full_name}#{number} has no head branch"))?;
+        let base = pr
+            .base
+            .and_then(|b| b.r#ref)
+            .unwrap_or_else(|| "main".to_string());
+        Ok((head, base))
+    }
+
+    /// The open pull request for a branch, if there is one — so a branch review can say so
+    /// rather than looking like it invented a review of something already under review.
+    pub async fn pull_for_branch(&self, full_name: &str, branch: &str) -> Result<Option<u64>> {
+        #[derive(serde::Deserialize)]
+        struct Pr {
+            number: u64,
+        }
+        let owner = full_name.split('/').next().unwrap_or_default();
+        let url = format!(
+            "{API}/repos/{full_name}/pulls?state=open&head={}:{}&per_page=1",
+            owner,
+            Self::ref_for_url(branch)
+        );
+        let prs: Vec<Pr> = self.get_json(&url).await.unwrap_or_default();
+        Ok(prs.first().map(|p| p.number))
+    }
+
     /// The paths one commit touched — the strongest signal that a commit relates
     /// to a symptom naming a component.
     pub async fn commit_files(&self, full_name: &str, sha: &str) -> Result<Vec<String>> {

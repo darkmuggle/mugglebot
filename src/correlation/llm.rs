@@ -949,12 +949,26 @@ impl Analyst {
         } else {
             format!("\n\nGrounding (runbooks, memory):\n{grounding}")
         };
+        // Looked-up fact, not recalled fact, and so it sits with the operator notes rather
+        // than in the signal feed: `env_…` belongs to the account and region the platform
+        // says it does, and a summary should not be inferring that from the environment's
+        // name. Not *trusted* in the operator-notes sense — nobody wrote it — but it is not
+        // attacker-controlled either: the ids come from the signal, everything else comes
+        // from the control plane.
+        let cloud = crate::cloud::prompt_block(&view.cloud);
+        let cloud_block = if cloud.is_empty() {
+            String::new()
+        } else {
+            format!("\n\nPlatform lookup (read from the Restate Cloud control plane):\n{cloud}")
+        };
         // The discussion, merit-scored. Fetched here rather than passed in because it is
         // evidence for the summary and nothing else reads it.
         let conversation = self.conversation_evidence(view, fresh).await;
         let conversation_block = &conversation.block;
         let system = SUMMARY_SYSTEM;
-        let prompt = format!("Signals:\n{ev}{conversation_block}{notes_block}{grounding_block}");
+        let prompt = format!(
+            "Signals:\n{ev}{conversation_block}{notes_block}{cloud_block}{grounding_block}"
+        );
         // Session chat per topic: continue this thread's ongoing conversation.
         // Raised from 512 when the Conversation section arrived: a thread with four
         // participants needs four calls plus the other three sections, and a summary
